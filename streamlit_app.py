@@ -161,20 +161,57 @@ def calcular_totales(productos, lleva_envio, descuento=0.0):
 # Generación del ticket PNG (en memoria, sin escribir a disco)
 # ============================
 def generar_ticket_png(pedido):
-    """Genera la imagen del ticket y devuelve los bytes PNG."""
+    """Genera la imagen del ticket y devuelve los bytes PNG.
+    Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
+    totales abajo a la derecha.
+    """
     productos = pedido["productos"]
     totales = calcular_totales(productos, pedido["lleva_envio"], pedido["descuento"])
 
-    ancho = 420
-    alto = (
-        310
-        + (len(productos) * 40)
-        + (50 if totales["costo_envio"] > 0 else 0)
-        + (40 if pedido["descuento"] > 0 else 0)
-    )
-    margen = 30
-    linea = 30
+    # ---- Configuración de fuentes ----
+    try:
+        if FUENTE_REG and FUENTE_BOLD:
+            f_titulo = ImageFont.truetype(FUENTE_BOLD, 16)
+            f_header = ImageFont.truetype(FUENTE_BOLD, 13)
+            f_reg = ImageFont.truetype(FUENTE_REG, 13)
+            f_total_bold = ImageFont.truetype(FUENTE_BOLD, 14)
+        else:
+            raise IOError("Fuentes no encontradas")
+    except (IOError, OSError):
+        default = ImageFont.load_default()
+        f_titulo = default
+        f_header = default
+        f_reg = default
+        f_total_bold = default
 
+    # ---- Dimensiones ----
+    ancho = 440
+    margen_x = 20
+    interlinea = 26
+    interlinea_pequena = 22
+
+    # Calcular altura dinámicamente
+    alto = 50  # margen superior + título
+    alto += interlinea  # fecha
+    alto += interlinea  # PEDIDO
+    alto += interlinea + 12  # CONTACTO + espacio antes de la línea
+    alto += interlinea  # línea separadora
+    alto += interlinea  # header columnas
+    alto += 10  # espacio
+    alto += len(productos) * interlinea  # productos
+    alto += 18  # línea separadora
+    alto += interlinea_pequena  # COSTO
+    alto += interlinea_pequena  # DIF
+    alto += interlinea  # Subtotal venta
+    if totales["costo_envio"] > 0:
+        alto += interlinea
+    if pedido["descuento"] > 0:
+        alto += interlinea
+    alto += interlinea  # línea + total
+    alto += 30  # GRACIAS
+    alto += 20  # margen inferior
+
+    # ---- Colores ----
     c_fondo = (255, 255, 255)
     c_titulo = (0, 0, 0)
     c_venta = (0, 102, 204)
@@ -184,84 +221,113 @@ def generar_ticket_png(pedido):
     img = Image.new("RGB", (ancho, alto), c_fondo)
     draw = ImageDraw.Draw(img)
 
-    try:
-        if FUENTE_REG and FUENTE_BOLD:
-            f_reg = ImageFont.truetype(FUENTE_REG, 32)
-            f_bold = ImageFont.truetype(FUENTE_BOLD, 39)
-            f_peq = ImageFont.truetype(FUENTE_REG, 39)
-        else:
-            raise IOError("Fuentes no encontradas en el sistema")
-    except (IOError, OSError):
-        f_reg = ImageFont.load_default()
-        f_bold = f_reg
-        f_peq = f_reg
+    # Helper: medir ancho de texto (compatible con varias versiones de PIL)
+    def text_width(texto, fuente):
+        try:
+            bbox = draw.textbbox((0, 0), texto, font=fuente)
+            return bbox[2] - bbox[0]
+        except AttributeError:
+            return draw.textlength(texto, font=fuente)
 
-    y = margen
-    draw.text((margen + 170, y), "FRUTIVERDURA A DOMICILIO", font=f_bold, fill=c_titulo)
-    y += linea
+    # ---- Posiciones de columnas ----
+    col_costo_x = margen_x  # alineado izquierda
+    col_producto_x = 130  # alineado izquierda, cabe a partir de aquí
+    col_venta_x = ancho - margen_x  # alineado derecha
+
+    # ---- Encabezado ----
+    y = 18
+    titulo = "FRUTIVERDURA A DOMICILIO"
+    tw = text_width(titulo, f_titulo)
+    draw.text(((ancho - tw) // 2, y), titulo, font=f_titulo, fill=c_titulo)
+    y += interlinea + 4
 
     mx_time = datetime.now(pytz.timezone(ZONA_HORARIA))
-    draw.text((margen + 120, y), mx_time.strftime("%d/%m/%Y"), font=f_reg, fill=c_titulo)
-    y += linea
+    fecha = mx_time.strftime("%d/%m/%Y")
+    tw = text_width(fecha, f_reg)
+    draw.text(((ancho - tw) // 2, y), fecha, font=f_reg, fill=c_titulo)
+    y += interlinea + 4
 
-    draw.text((ancho - 150, y), f"PEDIDO : {pedido['cliente'].upper()}", font=f_reg, fill=c_titulo)
-    y += linea
-    draw.text(
-        (ancho - 220, y),
-        f"CONTACTO : {pedido['contacto']} ({pedido['telefono']})",
-        font=f_reg, fill=c_titulo,
-    )
-    y += linea + 10
+    pedido_txt = f"PEDIDO : {pedido['cliente'].upper()}"
+    tw = text_width(pedido_txt, f_reg)
+    draw.text((ancho - margen_x - tw, y), pedido_txt, font=f_reg, fill=c_titulo)
+    y += interlinea
 
-    draw.text((margen, y), "-" * 96, font=f_reg, fill=c_titulo)
-    y += linea
-    draw.text((margen, y), "COSTO", font=f_peq, fill=c_sec)
-    draw.text((margen + 120, y), "PRODUCTO", font=f_reg, fill=c_titulo)
-    draw.text((ancho - 100, y), "VENTA", font=f_reg, fill=c_titulo)
-    y += linea
+    contacto_txt = f"CONTACTO : {pedido['contacto']} ({pedido['telefono']})"
+    tw = text_width(contacto_txt, f_reg)
+    draw.text((ancho - margen_x - tw, y), contacto_txt, font=f_reg, fill=c_titulo)
+    y += interlinea + 4
 
-    # Ordenar por precio de venta descendente
+    # Línea separadora
+    draw.line([(margen_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
+    y += 12
+
+    # Headers de columna
+    draw.text((col_costo_x, y), "COSTO", font=f_header, fill=c_sec)
+    draw.text((col_producto_x, y), "PRODUCTO", font=f_header, fill=c_titulo)
+    venta_h = "VENTA"
+    tw = text_width(venta_h, f_header)
+    draw.text((col_venta_x - tw, y), venta_h, font=f_header, fill=c_titulo)
+    y += interlinea
+
+    # ---- Productos (ordenados por venta descendente) ----
     productos_ord = sorted(productos, key=lambda p: p[3], reverse=True)
     for nombre, gramos, costo, venta in productos_ord:
-        draw.text((margen, y), f"${costo:,.2f}", font=f_peq, fill=c_costo)
-        draw.text((margen + 120, y), f"{nombre} {int(gramos):>4}g", font=f_reg, fill=c_titulo)
-        draw.text((ancho - 100, y), f"${venta:,.2f}", font=f_reg, fill=c_venta)
-        y += linea
+        # Costo (rojo, izquierda)
+        draw.text((col_costo_x, y), f"${costo:,.2f}", font=f_reg, fill=c_costo)
+        # Producto (negro, centro)
+        draw.text(
+            (col_producto_x, y),
+            f"{nombre} {int(gramos)}g",
+            font=f_reg,
+            fill=c_titulo,
+        )
+        # Venta (azul, derecha)
+        venta_txt = f"${venta:,.2f}"
+        tw = text_width(venta_txt, f_reg)
+        draw.text((col_venta_x - tw, y), venta_txt, font=f_reg, fill=c_venta)
+        y += interlinea
 
-    draw.text((margen, y), "-" * 96, font=f_reg, fill=c_titulo)
-    y += int(linea - 2.5)
-    draw.text((margen, y), f"COSTO : ${totales['subtotal_costo']:,.2f}", font=f_peq, fill=c_sec)
-    y += int(linea - 2.5)
-    draw.text(
-        (margen, y),
-        f"DIF : ${totales['utilidad']:,.2f} ({totales['utilidad_pct']:.2f}%)",
-        font=f_peq, fill=c_sec,
-    )
-    y += int(linea - 2.5)
-    draw.text(
-        (ancho - 150, y),
-        f"Subtotal Venta : ${totales['subtotal_venta']:,.2f}",
-        font=f_bold, fill=c_venta,
-    )
-    y += int(linea - 2.5)
+    y += 4
+    draw.line([(margen_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
+    y += 10
+
+    # ---- Totales (izquierda: COSTO/DIF; derecha: Subtotal/Envio/Total) ----
+    draw.text((col_costo_x, y), f"COSTO : ${totales['subtotal_costo']:,.2f}", font=f_reg, fill=c_sec)
+    y += interlinea_pequena
+
+    dif_txt = f"DIF : ${totales['utilidad']:,.2f} ({totales['utilidad_pct']:.2f}%)"
+    draw.text((col_costo_x, y), dif_txt, font=f_reg, fill=c_sec)
+    y += interlinea_pequena + 4
+
+    sub_txt = f"Subtotal Venta : ${totales['subtotal_venta']:,.2f}"
+    tw = text_width(sub_txt, f_total_bold)
+    draw.text((col_venta_x - tw, y), sub_txt, font=f_total_bold, fill=c_venta)
+    y += interlinea
 
     if totales["costo_envio"] > 0:
-        draw.text((ancho - 150, y), f"Envio : ${totales['costo_envio']:,.2f}", font=f_reg, fill=c_titulo)
-        y += int(linea - 2.5)
+        env_txt = f"Envio : ${totales['costo_envio']:,.2f}"
+        tw = text_width(env_txt, f_reg)
+        draw.text((col_venta_x - tw, y), env_txt, font=f_reg, fill=c_titulo)
+        y += interlinea
 
     if pedido["descuento"] > 0:
-        draw.text((ancho - 255, y), "Descuento aplicado", font=f_reg, fill=c_sec)
-        draw.text((ancho - 150, y), f"-${pedido['descuento']:,.2f}", font=f_reg, fill=c_sec)
-        y += int(linea - 2.5)
+        desc_txt = f"Descuento : -${pedido['descuento']:,.2f}"
+        tw = text_width(desc_txt, f_reg)
+        draw.text((col_venta_x - tw, y), desc_txt, font=f_reg, fill=c_sec)
+        y += interlinea
 
-    draw.text((margen, y), "--------------------------------", font=f_reg, fill=c_titulo)
-    draw.text(
-        (ancho - 150, y),
-        f"TOTAL : ${totales['nuevo_total']:,.2f}",
-        font=f_bold, fill=c_venta,
-    )
-    y += linea + 9
-    draw.text((ancho - 250, y), "GRACIAS POR TU COMPRA", font=f_bold, fill=c_titulo)
+    # Línea fina antes del total
+    draw.line([(col_producto_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
+    y += 8
+
+    total_txt = f"TOTAL : ${totales['nuevo_total']:,.2f}"
+    tw = text_width(total_txt, f_total_bold)
+    draw.text((col_venta_x - tw, y), total_txt, font=f_total_bold, fill=c_venta)
+    y += interlinea + 8
+
+    gracias = "GRACIAS POR TU COMPRA"
+    tw = text_width(gracias, f_total_bold)
+    draw.text(((ancho - tw) // 2, y), gracias, font=f_total_bold, fill=c_titulo)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -483,41 +549,76 @@ import difflib
 
 
 def parsear_bloque_pedido(texto):
-    """Parsea un bloque tipo:
-        Abue Lucero
-        * 1k dominico (1130)
-        * 6 manzanas golden (772)
-    Devuelve: (nombre_cliente, [(descripcion_original, gramos), ...])
+    """Parsea un bloque de texto y extrae (nombre_cliente, [(descripcion, gramos), ...]).
+
+    Soporta formatos variados:
+      Abue Lucero
+      * 1k dominico (1130)
+      * 6 manzanas golden (772)
+
+    También:
+      Tienda Tamp
+      - [x] Caja huevo 17,100
+      - [ ] Pollo 2,500
+
+    Y mezclas. Las viñetas válidas son: *, -, •, [x], [ ], 1., 1), etc.
+    Los gramos pueden venir entre () o como número final, con o sin coma de miles.
     """
     lineas = [l.strip() for l in texto.strip().split("\n") if l.strip()]
     if not lineas:
         return None, []
 
-    # Primera línea no-viñeta = nombre del cliente
+    # Regex para detectar viñetas, incluyendo checkboxes tipo Markdown [x] [ ] [X]
+    patron_viñeta = r"^(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX\s]?\s*\]\s*)?"
+
     cliente = None
     productos_raw = []
     for linea in lineas:
-        # Detectar viñetas: *, -, •, números, etc.
-        es_viñeta = bool(re.match(r"^[\*\-\u2022\d\.\)]+\s+", linea))
+        es_viñeta = bool(re.match(patron_viñeta, linea))
         if not es_viñeta and cliente is None:
             cliente = linea
             continue
-
-        # Extraer gramos del paréntesis al final
-        m = re.search(r"\((\d+)\s*\)?\s*$", linea)
-        if not m:
+        if not es_viñeta:
+            # Línea sin viñeta después del cliente: la ignoramos
             continue
-        gramos = int(m.group(1))
 
-        # Limpiar la descripción: quitar viñeta inicial y paréntesis final
-        desc = re.sub(r"^[\*\-\u2022\d\.\)]+\s*", "", linea)
-        desc = re.sub(r"\s*\(\d+\)\s*$", "", desc)
-        # Quitar emojis comunes y precios
-        desc = re.sub(r"\$\s*\d+", "", desc)
+        # Quitar la viñeta y el checkbox
+        contenido = re.sub(patron_viñeta, "", linea).strip()
+        if not contenido:
+            continue
+
+        # Estrategia 1: gramos entre paréntesis al final, ej: "tomate (1500)"
+        gramos = None
+        m = re.search(r"\(\s*([\d.,]+)\s*\)\s*$", contenido)
+        if m:
+            num_str = m.group(1).replace(",", "").replace(".", "")
+            if num_str.isdigit():
+                gramos = int(num_str)
+                contenido = re.sub(r"\s*\([\d.,\s]+\)\s*$", "", contenido)
+
+        # Estrategia 2: gramos como número final sin paréntesis, ej: "Caja huevo 17,100"
+        if gramos is None:
+            m = re.search(r"([\d]{1,3}(?:[,.]\d{3})+|\d{3,6})\s*g?\s*$", contenido)
+            if m:
+                num_str = m.group(1).replace(",", "").replace(".", "")
+                if num_str.isdigit():
+                    posibles_gramos = int(num_str)
+                    # Validar que sea un número razonable (10g a 100kg)
+                    if 10 <= posibles_gramos <= 100000:
+                        gramos = posibles_gramos
+                        contenido = contenido[: m.start()].strip()
+
+        if gramos is None or gramos <= 0:
+            continue
+
+        # Limpiar descripción: quitar precios ($X), emojis, normalizar espacios
+        desc = re.sub(r"\$\s*[\d.,]+", "", contenido)
         desc = "".join(c for c in desc if c.isascii() or c.isalpha() or c.isspace() or c in "/.")
         desc = re.sub(r"\s+", " ", desc).strip()
+        # Quitar puntos sueltos al final
+        desc = re.sub(r"[\.\,]+$", "", desc).strip()
 
-        if desc and gramos > 0:
+        if desc:
             productos_raw.append((desc, gramos))
 
     return cliente, productos_raw
@@ -645,83 +746,139 @@ def buscar_match_catalogo(descripcion, catalogo_keys, umbral=0.4):
 
 
 with tab_pegar:
-    st.subheader("Pegar pedidos masivamente")
+    st.subheader("Pegar pedido")
     st.caption(
-        "Pega uno o varios pedidos. Separa cada cliente con una línea en blanco. "
-        "El primer renglón sin viñeta es el nombre del cliente. "
-        "Los gramos van en paréntesis al final de cada producto."
+        "Pega solo la lista de productos. El nombre del cliente y el contacto los pones aquí arriba. "
+        "Si pegas varios clientes, sepáralos con línea en blanco y pon el nombre arriba de cada lista."
     )
 
-    ejemplo = """Abue Lucero
+    # Campos rápidos arriba
+    col_n, col_c, col_e = st.columns([2, 1, 1])
+    with col_n:
+        nombre_rapido = st.text_input(
+            "Nombre del cliente (si pegas un solo pedido)",
+            key="rapido_cliente",
+            placeholder="ej: Abue Lucero",
+        )
+    with col_c:
+        contacto_default = st.selectbox(
+            "Contacto",
+            list(CONTACTOS.keys()),
+            key="pegar_contacto",
+        )
+    with col_e:
+        envio_rapido = st.checkbox("Lleva envío", key="rapido_envio", value=False)
+
+    ejemplo_simple = """* 1k dominico 🍏 (1130)
+* 6 manzanas golden 🍏 (772)
+* 4 zanahorias 🧑🏿‍🌾 (529)"""
+
+    ejemplo_multi = """Abue Lucero
 * 1k dominico (1130)
-* 6 manzanas golden (772)
 * 4 zanahorias (529)
 
 Laura Canales
 * 2 Kg Limón (2029)
 * 1 Kg Jitomate (1025)"""
 
-    with st.expander("Ver formato esperado"):
-        st.code(ejemplo, language="text")
+    with st.expander("Ver formatos aceptados"):
+        st.markdown("**Un solo pedido (escribe el nombre arriba):**")
+        st.code(ejemplo_simple, language="text")
+        st.markdown("**Varios pedidos (nombres dentro del texto):**")
+        st.code(ejemplo_multi, language="text")
 
     texto_pegado = st.text_area(
-        "Pega los pedidos aquí",
+        "Pega aquí",
         height=300,
-        placeholder=ejemplo,
+        placeholder=ejemplo_simple,
         key="texto_pegado",
     )
 
-    col_c1, col_c2 = st.columns([1, 2])
-    with col_c1:
-        contacto_default = st.selectbox(
-            "Contacto asignado",
-            list(CONTACTOS.keys()),
-            key="pegar_contacto",
-        )
-    with col_c2:
-        clientes_con_envio = st.text_input(
-            "Clientes que llevan envío (separa con coma, opcional)",
-            placeholder="ej: Laura, Macry Funez",
-            key="pegar_envio",
-        )
+    clientes_con_envio = st.text_input(
+        "Si pegaste varios pedidos, lista aquí los clientes con envío (separados por coma)",
+        placeholder="ej: Laura, Macry",
+        key="pegar_envio_multi",
+    )
 
-    if st.button("🔍 Procesar pedidos", type="primary"):
+    # Auto-procesar en cuanto haya texto suficiente
+    procesar = st.button("🔍 Procesar pedido(s)", type="primary")
+
+    if procesar:
         if not texto_pegado.strip():
             st.warning("Pega al menos un pedido.")
         else:
-            # Separar por bloques (línea en blanco)
-            bloques = [b for b in re.split(r"\n\s*\n", texto_pegado.strip()) if b.strip()]
+            texto = texto_pegado.strip()
             envios_set = {
                 e.strip().lower() for e in clientes_con_envio.split(",") if e.strip()
             }
-
-            preview = []
             catalogo_keys = list(st.session_state.precios_dict.keys())
+            preview = []
 
-            for bloque in bloques:
+            # Detectar formato: ¿empieza con viñeta? -> es un solo cliente y el nombre está arriba
+            primera_linea = texto.split("\n", 1)[0].strip()
+            es_pedido_unico = bool(re.match(r"^(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX\s]?\s*\]\s*)?", primera_linea))
+
+            if es_pedido_unico:
+                # Modo simple: un solo cliente, nombre del campo de arriba
+                cliente_final = nombre_rapido.strip() or "Cliente"
+                # Inyectar el nombre al inicio para que el parser funcione igual
+                bloque = f"{cliente_final}\n{texto}"
                 cliente, productos_raw = parsear_bloque_pedido(bloque)
-                if not cliente or not productos_raw:
-                    continue
-
-                # Marcar envío si el nombre del cliente contiene alguna palabra de la lista
-                lleva_envio = any(e in cliente.lower() for e in envios_set)
-
-                productos_match = []
-                for desc, gramos in productos_raw:
-                    match = buscar_match_catalogo(desc, catalogo_keys)
-                    productos_match.append({
-                        "descripcion_original": desc,
-                        "gramos": gramos,
-                        "match": match,
+                if cliente and productos_raw:
+                    productos_match = []
+                    for desc, gramos in productos_raw:
+                        match = buscar_match_catalogo(desc, catalogo_keys)
+                        productos_match.append({
+                            "descripcion_original": desc,
+                            "gramos": gramos,
+                            "match": match,
+                        })
+                    preview.append({
+                        "cliente": cliente,
+                        "lleva_envio": envio_rapido,
+                        "productos": productos_match,
+                    })
+            else:
+                # Modo multi: separar por línea en blanco, primera línea de cada bloque es el nombre
+                bloques = [b for b in re.split(r"\n\s*\n", texto) if b.strip()]
+                for bloque in bloques:
+                    cliente, productos_raw = parsear_bloque_pedido(bloque)
+                    if not cliente or not productos_raw:
+                        continue
+                    lleva_envio = any(e in cliente.lower() for e in envios_set)
+                    productos_match = []
+                    for desc, gramos in productos_raw:
+                        match = buscar_match_catalogo(desc, catalogo_keys)
+                        productos_match.append({
+                            "descripcion_original": desc,
+                            "gramos": gramos,
+                            "match": match,
+                        })
+                    preview.append({
+                        "cliente": cliente,
+                        "lleva_envio": lleva_envio,
+                        "productos": productos_match,
                     })
 
-                preview.append({
-                    "cliente": cliente,
-                    "lleva_envio": lleva_envio,
-                    "productos": productos_match,
-                })
-
-            st.session_state["preview_pedidos"] = preview
+            if not preview:
+                st.error("No se pudieron detectar productos. Revisa que cada línea termine con (gramos).")
+            else:
+                st.session_state["preview_pedidos"] = preview
+                # Si TODO matcheó perfecto, mostrar mensaje verde
+                total_prods = sum(len(p["productos"]) for p in preview)
+                no_match = sum(
+                    1 for p in preview for prod in p["productos"] if not prod["match"]
+                )
+                if no_match == 0:
+                    st.success(
+                        f"✅ {total_prods} productos detectados, todos con match. "
+                        "Revisa abajo y dale 'Generar' si todo está bien."
+                    )
+                else:
+                    st.warning(
+                        f"⚠️ {total_prods - no_match}/{total_prods} productos con match. "
+                        f"Faltan {no_match} por asignar (corrige abajo)."
+                    )
 
     # Mostrar y editar preview
     if "preview_pedidos" in st.session_state and st.session_state["preview_pedidos"]:
