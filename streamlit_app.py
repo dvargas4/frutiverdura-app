@@ -82,6 +82,9 @@ if "costos_dict" not in st.session_state:
 if "gastos_sesion" not in st.session_state:
     # Lista de dicts: {"contacto": "IVAN", "concepto": "...", "monto": 0.0}
     st.session_state.gastos_sesion = []
+if "pegar_reset_count" not in st.session_state:
+    # Contador que se incrementa para forzar reset de los widgets del tab Pegar
+    st.session_state.pegar_reset_count = 0
 
 # ============================
 # Carga del catálogo (Google Sheets o CSV local)
@@ -928,7 +931,12 @@ def tiene_indicador_empaque(descripcion):
 
 
 def aplicar_alias(descripcion, catalogo_keys):
-    """Si la descripción contiene un alias, devuelve el match directo."""
+    """Si la descripción contiene un alias, devuelve el match directo.
+    Si un alias multi-palabra coincide con la descripción pero su target NO está
+    en el catálogo, devuelve None en vez de caer a aliases de una sola palabra
+    (esto evita que 'papas fritas' caiga a 'papas'→'papa blanca' cuando el
+    catálogo no tiene 'papas fritas' registrado: mejor que aparezca sin match
+    para que el usuario lo cree como producto nuevo)."""
     desc = descripcion.lower().strip()
     palabras = set(desc.split())
 
@@ -937,8 +945,11 @@ def aplicar_alias(descripcion, catalogo_keys):
         if " " in alias and alias in desc:
             if target in catalogo_keys:
                 return target
+            # El alias coincidió pero el target no está en catálogo:
+            # NO caigas a aliases de una sola palabra que darían resultado erróneo.
+            return None
 
-    # 2. DESPUÉS: aliases de una sola palabra
+    # 2. DESPUÉS: aliases de una sola palabra (solo si ningún alias multi-palabra coincidió)
     for alias, target in ALIASES_PRODUCTOS.items():
         if " " not in alias and alias in palabras:
             if target in catalogo_keys:
@@ -1031,13 +1042,9 @@ def buscar_match_catalogo(descripcion, catalogo_keys, umbral=0.4):
 
 
 with tab_pegar:
-    # Si se marcó limpiar después de generar tickets, lo hacemos ahora
-    # ANTES de crear los widgets (Streamlit no permite modificarlos después).
-    if st.session_state.get("limpiar_pegado_flag", False):
-        for k in ("texto_pegado", "rapido_cliente", "pegar_envio_multi", "rapido_envio"):
-            if k in st.session_state:
-                del st.session_state[k]
-        st.session_state["limpiar_pegado_flag"] = False
+    # Sufijo dinámico para los keys de los widgets. Al incrementar el contador
+    # (después de generar tickets), los widgets se reinstancian vacíos.
+    rk = st.session_state.pegar_reset_count
 
     st.subheader("Pegar pedido")
     st.caption(
@@ -1050,7 +1057,7 @@ with tab_pegar:
     with col_n:
         nombre_rapido = st.text_input(
             "Nombre del cliente (si pegas un solo pedido)",
-            key="rapido_cliente",
+            key=f"rapido_cliente_{rk}",
             placeholder="ej: Abue Lucero",
         )
     with col_c:
@@ -1060,7 +1067,7 @@ with tab_pegar:
             key="pegar_contacto",
         )
     with col_e:
-        envio_rapido = st.checkbox("Lleva envío", key="rapido_envio", value=False)
+        envio_rapido = st.checkbox("Lleva envío", key=f"rapido_envio_{rk}", value=False)
 
     ejemplo_simple = """* 1k dominico 🍏 (1130)
 * 6 manzanas golden 🍏 (772)
@@ -1084,13 +1091,13 @@ Laura Canales
         "Pega aquí",
         height=300,
         placeholder=ejemplo_simple,
-        key="texto_pegado",
+        key=f"texto_pegado_{rk}",
     )
 
     clientes_con_envio = st.text_input(
         "Si pegaste varios pedidos, lista aquí los clientes con envío (separados por coma)",
         placeholder="ej: Laura, Macry",
-        key="pegar_envio_multi",
+        key=f"pegar_envio_multi_{rk}",
     )
 
     # Auto-procesar en cuanto haya texto suficiente
@@ -1400,11 +1407,10 @@ Laura Canales
                     generados += 1
 
                 del st.session_state["preview_pedidos"]
-                # Marcar que se debe limpiar el textarea en el próximo ciclo
-                # (no se puede modificar st.session_state[key] de un widget ya creado
-                # en este mismo ciclo; Streamlit lo prohíbe).
+                # Forzar reset de los widgets del tab Pegar incrementando el contador.
+                # Esto cambia los keys de los widgets, así que se recrean vacíos.
                 if generados > 0:
-                    st.session_state["limpiar_pegado_flag"] = True
+                    st.session_state.pegar_reset_count += 1
                 msg = f"✅ Se generaron {generados} tickets."
                 if productos_sin_asignar:
                     msg += f" ⚠️ {len(productos_sin_asignar)} productos quedaron sin cobrar."
@@ -1502,10 +1508,11 @@ with tab_modificar:
             st.markdown("**Agregar producto**")
             col_np, col_ng, col_nb = st.columns([3, 1, 1])
             with col_np:
+                opciones_prod = [""] + ["➕ Crear nuevo producto"] + sorted(st.session_state.precios_dict.keys())
                 nuevo_prod = st.selectbox(
                     "Producto",
-                    [""] + sorted(st.session_state.precios_dict.keys()),
-                    format_func=lambda x: x.title() if x else "-- selecciona --",
+                    opciones_prod,
+                    format_func=lambda x: x.title() if x and not x.startswith("➕") else (x or "-- selecciona --"),
                     key=f"nuevo_prod_{idx_sel}",
                     label_visibility="collapsed",
                 )
@@ -1520,7 +1527,7 @@ with tab_modificar:
                 )
             with col_nb:
                 if st.button("➕", key=f"add_{idx_sel}"):
-                    if nuevo_prod and nuevos_g > 0:
+                    if nuevo_prod and nuevo_prod != "➕ Crear nuevo producto" and nuevos_g > 0:
                         precio_kg = st.session_state.precios_dict[nuevo_prod]["precio_venta_kg"]
                         costo_kg = st.session_state.costos_dict[nuevo_prod]["costo_kg"]
                         pedido["productos"].append(
@@ -1535,6 +1542,63 @@ with tab_modificar:
                         pedido.update(totales)
                         pedido["descuento"] = 0.0
                         st.rerun()
+
+            # Si eligió "Crear nuevo producto", mostrar formulario inline
+            if nuevo_prod == "➕ Crear nuevo producto":
+                st.markdown("**Crear producto nuevo y agregarlo al ticket:**")
+                sub_n, sub_c, sub_v, sub_g, sub_btn = st.columns([2, 1, 1, 1, 1])
+                with sub_n:
+                    nuevo_nombre = st.text_input(
+                        "Nombre",
+                        key=f"new_name_mod_{idx_sel}",
+                        placeholder="ej: papas fritas",
+                    )
+                with sub_c:
+                    nuevo_costo_kg = st.number_input(
+                        "Costo/kg",
+                        min_value=0.0,
+                        step=1.0,
+                        key=f"new_costo_mod_{idx_sel}",
+                    )
+                with sub_v:
+                    nuevo_precio_kg = st.number_input(
+                        "Precio/kg",
+                        min_value=0.0,
+                        step=1.0,
+                        key=f"new_precio_mod_{idx_sel}",
+                    )
+                with sub_g:
+                    nuevo_g_mod = st.number_input(
+                        "Gramos",
+                        min_value=0,
+                        value=500,
+                        step=50,
+                        key=f"new_g_mod_{idx_sel}",
+                    )
+                with sub_btn:
+                    st.write("")
+                    st.write("")
+                    if st.button("Guardar", key=f"save_new_mod_{idx_sel}", use_container_width=True):
+                        if (nuevo_nombre.strip() and nuevo_costo_kg > 0
+                                and nuevo_precio_kg > 0 and nuevo_g_mod > 0):
+                            key = nuevo_nombre.strip().lower()
+                            # Agregar al catálogo en sesión
+                            st.session_state.precios_dict[key] = {"precio_venta_kg": nuevo_precio_kg}
+                            st.session_state.costos_dict[key] = {"costo_kg": nuevo_costo_kg}
+                            # Agregar al ticket
+                            pedido["productos"].append((
+                                key.title(),
+                                float(nuevo_g_mod),
+                                round(nuevo_g_mod * nuevo_costo_kg / 1000, 2),
+                                round(nuevo_g_mod * nuevo_precio_kg / 1000, 2),
+                            ))
+                            totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
+                            pedido.update(totales)
+                            pedido["descuento"] = 0.0
+                            st.success(f"✅ {key.title()} creado y agregado al ticket")
+                            st.rerun()
+                        else:
+                            st.error("Completa todos los campos (nombre, costo, precio, gramos)")
 
             st.divider()
             if st.button("🗑️ Eliminar ticket completo", key=f"del_ticket_{idx_sel}"):
