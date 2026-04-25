@@ -324,8 +324,8 @@ if not st.session_state.precios_dict:
     st.warning("⚠️ Primero carga el catálogo desde el panel lateral.")
     st.stop()
 
-tab_capturar, tab_modificar, tab_resumen = st.tabs(
-    ["📝 Capturar", "✏️ Modificar", "📊 Resumen y Descarga"]
+tab_capturar, tab_pegar, tab_modificar, tab_resumen = st.tabs(
+    ["📝 Capturar", "📋 Pegar pedido", "✏️ Modificar", "📊 Resumen y Descarga"]
 )
 
 
@@ -476,7 +476,404 @@ with tab_capturar:
 
 
 # ============================
-# Tab 2: Modificar
+# Tab 2: Pegar pedido (parseo masivo)
+# ============================
+import re
+import difflib
+
+
+def parsear_bloque_pedido(texto):
+    """Parsea un bloque tipo:
+        Abue Lucero
+        * 1k dominico (1130)
+        * 6 manzanas golden (772)
+    Devuelve: (nombre_cliente, [(descripcion_original, gramos), ...])
+    """
+    lineas = [l.strip() for l in texto.strip().split("\n") if l.strip()]
+    if not lineas:
+        return None, []
+
+    # Primera línea no-viñeta = nombre del cliente
+    cliente = None
+    productos_raw = []
+    for linea in lineas:
+        # Detectar viñetas: *, -, •, números, etc.
+        es_viñeta = bool(re.match(r"^[\*\-\u2022\d\.\)]+\s+", linea))
+        if not es_viñeta and cliente is None:
+            cliente = linea
+            continue
+
+        # Extraer gramos del paréntesis al final
+        m = re.search(r"\((\d+)\s*\)?\s*$", linea)
+        if not m:
+            continue
+        gramos = int(m.group(1))
+
+        # Limpiar la descripción: quitar viñeta inicial y paréntesis final
+        desc = re.sub(r"^[\*\-\u2022\d\.\)]+\s*", "", linea)
+        desc = re.sub(r"\s*\(\d+\)\s*$", "", desc)
+        # Quitar emojis comunes y precios
+        desc = re.sub(r"\$\s*\d+", "", desc)
+        desc = "".join(c for c in desc if c.isascii() or c.isalpha() or c.isspace() or c in "/.")
+        desc = re.sub(r"\s+", " ", desc).strip()
+
+        if desc and gramos > 0:
+            productos_raw.append((desc, gramos))
+
+    return cliente, productos_raw
+
+
+# Aliases manuales: descripción literal o palabra clave -> nombre exacto en catálogo.
+# Se aplican ANTES del matcher general. Las claves se buscan como palabra completa
+# o como substring si tienen 4+ caracteres.
+ALIASES_PRODUCTOS = {
+    "papa": "papa blanca",
+    "papas": "papa blanca",
+    "tomate": "tomate",
+    "tomates": "tomate",
+    "jito": "jitomate",
+    "jitos": "jitomate",
+    "jitomate": "jitomate",
+    "jitomates": "jitomate",
+    "gouda": "queso gouda",
+    "panela": "queso panela",
+    "oaxaca": "queso oaxaca",
+    "manchego": "queso manchego",
+    "huevo": "huevo",
+    "huevos": "huevo",
+    "cartón de huevo": "huevo",
+    "cartones de huevo": "huevo",
+    "papas fritas": "papas fritas",
+}
+
+
+def aplicar_alias(descripcion, catalogo_keys):
+    """Si la descripción contiene un alias, devuelve el match directo."""
+    desc = descripcion.lower().strip()
+    palabras = set(desc.split())
+
+    # 1. PRIMERO: aliases multi-palabra (más específicos)
+    for alias, target in ALIASES_PRODUCTOS.items():
+        if " " in alias and alias in desc:
+            if target in catalogo_keys:
+                return target
+
+    # 2. DESPUÉS: aliases de una sola palabra
+    for alias, target in ALIASES_PRODUCTOS.items():
+        if " " not in alias and alias in palabras:
+            if target in catalogo_keys:
+                return target
+
+    return None
+
+
+def buscar_match_catalogo(descripcion, catalogo_keys, umbral=0.4):
+    """Busca el mejor match. Prioriza coincidencia de la PRIMERA palabra significativa."""
+    # 0. Primero intentar con aliases manuales
+    alias_match = aplicar_alias(descripcion, catalogo_keys)
+    if alias_match:
+        return alias_match
+
+    desc = descripcion.lower().strip()
+    desc = re.sub(r"^[\d\.\,/]+\s*(kg|kilo|kilos|k|gr|gramos|g|pz|pza|piezas|pieza|domo|domos|cabeza|manojo|ramo|ramos|penca|cartón|cartones|carton|bolsa|de)\s*", "", desc)
+    desc = re.sub(r"^[\d\.\,/]+\s+", "", desc)
+    desc = re.sub(r"^de\s+", "", desc)  # "de plátano" -> "plátano"
+
+    palabras = desc.split()
+    palabras_norm = []
+    for p in palabras:
+        if p.endswith("es") and len(p) > 4:
+            palabras_norm.append(p[:-2])
+        elif p.endswith("s") and len(p) > 3:
+            palabras_norm.append(p[:-1])
+        else:
+            palabras_norm.append(p)
+
+    # La primera palabra significativa es la más importante (define qué es)
+    primera = palabras_norm[0] if palabras_norm else ""
+
+    mejor = None
+    mejor_score = 0
+    for key in catalogo_keys:
+        key_palabras = key.lower().split()
+        key_primera = key_palabras[0]
+
+        # Score base: cuántas palabras del catálogo aparecen
+        compartidas = 0
+        for kp in key_palabras:
+            for p in palabras_norm:
+                if kp == p:
+                    compartidas += 2  # match exacto pesa más
+                    break
+                elif (len(kp) > 3 and kp in p) or (len(p) > 3 and p in kp):
+                    compartidas += 1
+                    break
+
+        if compartidas == 0:
+            continue
+
+        score = compartidas / len(key_palabras)
+
+        # BONO grande si la primera palabra del catálogo coincide con la primera significativa de la descripción
+        if primera and (primera == key_primera or
+                        (len(primera) > 3 and primera in key_primera) or
+                        (len(key_primera) > 3 and key_primera in primera)):
+            score += 2.0
+
+        # BONO si TODAS las palabras del catálogo aparecen
+        if compartidas >= len(key_palabras) * 2:
+            score += 0.5
+
+        if score > mejor_score:
+            mejor_score = score
+            mejor = key
+
+    if mejor and mejor_score >= 0.8:
+        return mejor
+
+    matches = difflib.get_close_matches(desc, catalogo_keys, n=1, cutoff=umbral)
+    if matches:
+        return matches[0]
+
+    for p in palabras_norm:
+        if len(p) < 3:
+            continue
+        matches = difflib.get_close_matches(p, catalogo_keys, n=1, cutoff=0.6)
+        if matches:
+            return matches[0]
+    return None
+
+
+with tab_pegar:
+    st.subheader("Pegar pedidos masivamente")
+    st.caption(
+        "Pega uno o varios pedidos. Separa cada cliente con una línea en blanco. "
+        "El primer renglón sin viñeta es el nombre del cliente. "
+        "Los gramos van en paréntesis al final de cada producto."
+    )
+
+    ejemplo = """Abue Lucero
+* 1k dominico (1130)
+* 6 manzanas golden (772)
+* 4 zanahorias (529)
+
+Laura Canales
+* 2 Kg Limón (2029)
+* 1 Kg Jitomate (1025)"""
+
+    with st.expander("Ver formato esperado"):
+        st.code(ejemplo, language="text")
+
+    texto_pegado = st.text_area(
+        "Pega los pedidos aquí",
+        height=300,
+        placeholder=ejemplo,
+        key="texto_pegado",
+    )
+
+    col_c1, col_c2 = st.columns([1, 2])
+    with col_c1:
+        contacto_default = st.selectbox(
+            "Contacto asignado",
+            list(CONTACTOS.keys()),
+            key="pegar_contacto",
+        )
+    with col_c2:
+        clientes_con_envio = st.text_input(
+            "Clientes que llevan envío (separa con coma, opcional)",
+            placeholder="ej: Laura, Macry Funez",
+            key="pegar_envio",
+        )
+
+    if st.button("🔍 Procesar pedidos", type="primary"):
+        if not texto_pegado.strip():
+            st.warning("Pega al menos un pedido.")
+        else:
+            # Separar por bloques (línea en blanco)
+            bloques = [b for b in re.split(r"\n\s*\n", texto_pegado.strip()) if b.strip()]
+            envios_set = {
+                e.strip().lower() for e in clientes_con_envio.split(",") if e.strip()
+            }
+
+            preview = []
+            catalogo_keys = list(st.session_state.precios_dict.keys())
+
+            for bloque in bloques:
+                cliente, productos_raw = parsear_bloque_pedido(bloque)
+                if not cliente or not productos_raw:
+                    continue
+
+                # Marcar envío si el nombre del cliente contiene alguna palabra de la lista
+                lleva_envio = any(e in cliente.lower() for e in envios_set)
+
+                productos_match = []
+                for desc, gramos in productos_raw:
+                    match = buscar_match_catalogo(desc, catalogo_keys)
+                    productos_match.append({
+                        "descripcion_original": desc,
+                        "gramos": gramos,
+                        "match": match,
+                    })
+
+                preview.append({
+                    "cliente": cliente,
+                    "lleva_envio": lleva_envio,
+                    "productos": productos_match,
+                })
+
+            st.session_state["preview_pedidos"] = preview
+
+    # Mostrar y editar preview
+    if "preview_pedidos" in st.session_state and st.session_state["preview_pedidos"]:
+        st.divider()
+        st.markdown("### Vista previa - corrige los matches incorrectos")
+        st.caption(
+            "Si algún producto quedó mal asignado, cámbialo del dropdown. "
+            "Los productos sin match (rojo) se omitirán al generar el ticket."
+        )
+
+        catalogo_keys = sorted(st.session_state.precios_dict.keys())
+
+        for i, ped in enumerate(st.session_state["preview_pedidos"]):
+            no_match = sum(1 for p in ped["productos"] if not p["match"])
+            con_match = len(ped["productos"]) - no_match
+
+            label = f"**{ped['cliente']}** — {con_match} productos OK"
+            if no_match > 0:
+                label += f", ⚠️ {no_match} sin match"
+            if ped["lleva_envio"]:
+                label += " 🚚 envío"
+
+            with st.expander(label, expanded=(no_match > 0)):
+                # Toggle de envío
+                ped["lleva_envio"] = st.checkbox(
+                    "Lleva envío",
+                    value=ped["lleva_envio"],
+                    key=f"prev_envio_{i}",
+                )
+
+                for j, prod in enumerate(ped["productos"]):
+                    col1, col2, col3 = st.columns([3, 3, 1])
+                    with col1:
+                        st.text(f"{prod['descripcion_original']} ({int(prod['gramos'])}g)")
+                    with col2:
+                        opciones = ["(omitir)", "➕ Crear nuevo producto"] + catalogo_keys
+                        idx_default = (
+                            opciones.index(prod["match"])
+                            if prod["match"] in opciones
+                            else 0
+                        )
+                        nuevo_match = st.selectbox(
+                            "Mapear a",
+                            opciones,
+                            index=idx_default,
+                            key=f"prev_match_{i}_{j}",
+                            label_visibility="collapsed",
+                        )
+                        if nuevo_match == "(omitir)":
+                            prod["match"] = None
+                        elif nuevo_match == "➕ Crear nuevo producto":
+                            prod["match"] = "__nuevo__"
+                        else:
+                            prod["match"] = nuevo_match
+                    with col3:
+                        nuevos_g = st.number_input(
+                            "g",
+                            min_value=0,
+                            value=int(prod["gramos"]),
+                            step=10,
+                            key=f"prev_gr_{i}_{j}",
+                            label_visibility="collapsed",
+                        )
+                        prod["gramos"] = nuevos_g
+
+                    # Si el usuario eligió "Crear nuevo producto", mostrar formulario
+                    if prod["match"] == "__nuevo__":
+                        sub1, sub2, sub3 = st.columns([2, 1, 1])
+                        with sub1:
+                            sugerencia = re.sub(
+                                r"^[\d\.\,/]+\s*\w*\s*", "", prod["descripcion_original"].lower()
+                            ).strip()
+                            nuevo_nombre = st.text_input(
+                                "Nombre del producto",
+                                value=sugerencia,
+                                key=f"new_name_{i}_{j}",
+                            )
+                        with sub2:
+                            nuevo_costo = st.number_input(
+                                "Costo/kg",
+                                min_value=0.0,
+                                step=1.0,
+                                key=f"new_costo_{i}_{j}",
+                            )
+                        with sub3:
+                            nuevo_precio = st.number_input(
+                                "Precio/kg",
+                                min_value=0.0,
+                                step=1.0,
+                                key=f"new_precio_{i}_{j}",
+                            )
+                        if st.button("Guardar nuevo", key=f"save_new_{i}_{j}"):
+                            if nuevo_nombre.strip() and nuevo_costo > 0 and nuevo_precio > 0:
+                                key = nuevo_nombre.strip().lower()
+                                st.session_state.precios_dict[key] = {"precio_venta_kg": nuevo_precio}
+                                st.session_state.costos_dict[key] = {"costo_kg": nuevo_costo}
+                                prod["match"] = key
+                                st.success(f"✅ {key.title()} agregado al catálogo")
+                                st.rerun()
+                            else:
+                                st.error("Completa nombre, costo y precio")
+
+        st.divider()
+        col_g1, col_g2 = st.columns(2)
+        with col_g1:
+            if st.button("✅ Generar todos los tickets", type="primary", use_container_width=True):
+                generados = 0
+                for ped in st.session_state["preview_pedidos"]:
+                    productos_finales = []
+                    for prod in ped["productos"]:
+                        if not prod["match"] or prod["match"] == "__nuevo__" or prod["gramos"] <= 0:
+                            continue
+                        if prod["match"] not in st.session_state.precios_dict:
+                            continue
+                        precio_kg = st.session_state.precios_dict[prod["match"]]["precio_venta_kg"]
+                        costo_kg = st.session_state.costos_dict[prod["match"]]["costo_kg"]
+                        precio_final = (prod["gramos"] * precio_kg) / 1000
+                        costo_final = (prod["gramos"] * costo_kg) / 1000
+                        productos_finales.append((
+                            prod["match"].title(),
+                            float(prod["gramos"]),
+                            round(costo_final, 2),
+                            round(precio_final, 2),
+                        ))
+
+                    if not productos_finales:
+                        continue
+
+                    totales = calcular_totales(productos_finales, ped["lleva_envio"], 0.0)
+                    pedido = {
+                        "cliente": ped["cliente"],
+                        "contacto": contacto_default,
+                        "telefono": CONTACTOS[contacto_default],
+                        "lleva_envio": ped["lleva_envio"],
+                        "descuento": 0.0,
+                        "productos": productos_finales,
+                        **totales,
+                    }
+                    st.session_state.pedidos.append(pedido)
+                    generados += 1
+
+                del st.session_state["preview_pedidos"]
+                st.success(f"✅ Se generaron {generados} tickets. Velos en la pestaña Resumen.")
+                st.rerun()
+        with col_g2:
+            if st.button("🚫 Descartar vista previa", use_container_width=True):
+                del st.session_state["preview_pedidos"]
+                st.rerun()
+
+
+# ============================
+# Tab 3: Modificar
 # ============================
 with tab_modificar:
     if not st.session_state.pedidos:
@@ -602,7 +999,7 @@ with tab_modificar:
 
 
 # ============================
-# Tab 3: Resumen
+# Tab 4: Resumen
 # ============================
 with tab_resumen:
     pedidos = st.session_state.pedidos
