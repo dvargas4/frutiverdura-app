@@ -1031,6 +1031,14 @@ def buscar_match_catalogo(descripcion, catalogo_keys, umbral=0.4):
 
 
 with tab_pegar:
+    # Si se marcó limpiar después de generar tickets, lo hacemos ahora
+    # ANTES de crear los widgets (Streamlit no permite modificarlos después).
+    if st.session_state.get("limpiar_pegado_flag", False):
+        for k in ("texto_pegado", "rapido_cliente", "pegar_envio_multi", "rapido_envio"):
+            if k in st.session_state:
+                del st.session_state[k]
+        st.session_state["limpiar_pegado_flag"] = False
+
     st.subheader("Pegar pedido")
     st.caption(
         "Pega solo la lista de productos. El nombre del cliente y el contacto los pones aquí arriba. "
@@ -1392,12 +1400,11 @@ Laura Canales
                     generados += 1
 
                 del st.session_state["preview_pedidos"]
-                # Limpiar el texto pegado y los campos relacionados al generar exitosamente
+                # Marcar que se debe limpiar el textarea en el próximo ciclo
+                # (no se puede modificar st.session_state[key] de un widget ya creado
+                # en este mismo ciclo; Streamlit lo prohíbe).
                 if generados > 0:
-                    st.session_state["texto_pegado"] = ""
-                    st.session_state["rapido_cliente"] = ""
-                    st.session_state["pegar_envio_multi"] = ""
-                    st.session_state["rapido_envio"] = False
+                    st.session_state["limpiar_pegado_flag"] = True
                 msg = f"✅ Se generaron {generados} tickets."
                 if productos_sin_asignar:
                     msg += f" ⚠️ {len(productos_sin_asignar)} productos quedaron sin cobrar."
