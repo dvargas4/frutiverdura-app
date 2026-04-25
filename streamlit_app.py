@@ -226,7 +226,9 @@ def guardar_pedidos_en_historico(pedidos):
 @st.cache_data(ttl=120, show_spinner="Cargando histórico...")
 def cargar_historico():
     """Carga el histórico completo desde Google Sheets.
-    Devuelve (df_tickets, df_productos) como pandas DataFrames."""
+    Devuelve (df_tickets, df_productos) como pandas DataFrames.
+    Usa limpiar_valor para parsear montos respetando el formato '$1,234.50'
+    (coma decimal convertida a punto), igual que en la carga de catálogo."""
     try:
         ss = _abrir_spreadsheet()
         try:
@@ -240,14 +242,31 @@ def cargar_historico():
         except Exception:
             df_p = pd.DataFrame(columns=HEADERS_PRODUCTOS)
 
-        # Normalizar tipos
-        for col in ["subtotal_costo", "subtotal_venta", "costo_envio", "descuento",
-                    "total_final", "utilidad", "num_productos"]:
+        # Normalizar montos usando limpiar_valor (respeta el formato del catálogo:
+        # "$1,234.50" donde la coma es decimal). Esta es la misma lógica que el
+        # catálogo de precios para mantener consistencia en toda la app.
+        columnas_dinero_t = [
+            "subtotal_costo", "subtotal_venta", "costo_envio",
+            "descuento", "total_final", "utilidad",
+        ]
+        for col in columnas_dinero_t:
             if col in df_t.columns:
-                df_t[col] = pd.to_numeric(df_t[col], errors="coerce").fillna(0)
-        for col in ["gramos", "costo", "venta"]:
+                df_t[col] = df_t[col].apply(limpiar_valor)
+
+        # num_productos es entero, sin formato de moneda
+        if "num_productos" in df_t.columns:
+            df_t["num_productos"] = pd.to_numeric(
+                df_t["num_productos"], errors="coerce"
+            ).fillna(0).astype(int)
+
+        # Productos: costo y venta son dinero, gramos es entero
+        for col in ["costo", "venta"]:
             if col in df_p.columns:
-                df_p[col] = pd.to_numeric(df_p[col], errors="coerce").fillna(0)
+                df_p[col] = df_p[col].apply(limpiar_valor)
+        if "gramos" in df_p.columns:
+            df_p["gramos"] = pd.to_numeric(
+                df_p["gramos"], errors="coerce"
+            ).fillna(0).astype(int)
 
         if "fecha" in df_t.columns:
             df_t["fecha_dt"] = pd.to_datetime(df_t["fecha"], errors="coerce")
