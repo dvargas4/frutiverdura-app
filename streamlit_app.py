@@ -175,6 +175,7 @@ def generar_ticket_png(pedido):
             f_header = ImageFont.truetype(FUENTE_BOLD, 13)
             f_reg = ImageFont.truetype(FUENTE_REG, 13)
             f_total_bold = ImageFont.truetype(FUENTE_BOLD, 14)
+            f_compacta = ImageFont.truetype(FUENTE_REG, 10)  # para COSTO/DIF en zona estrecha
         else:
             raise IOError("Fuentes no encontradas")
     except (IOError, OSError):
@@ -183,6 +184,7 @@ def generar_ticket_png(pedido):
         f_header = default
         f_reg = default
         f_total_bold = default
+        f_compacta = default
 
     # ---- Dimensiones ----
     ancho = 440
@@ -200,8 +202,7 @@ def generar_ticket_png(pedido):
     alto += 10  # espacio
     alto += len(productos) * interlinea  # productos
     alto += 18  # línea separadora
-    alto += interlinea_pequena  # COSTO
-    alto += interlinea_pequena  # DIF
+    alto += 70  # bloque compacto COSTO + DIF (5 líneas pequeñas)
     alto += interlinea  # Subtotal venta
     if totales["costo_envio"] > 0:
         alto += interlinea
@@ -235,16 +236,21 @@ def generar_ticket_png(pedido):
     col_venta_x = ancho - margen_x  # alineado derecha
 
     # ---- Encabezado ----
+    # El centro de los textos para el cliente es la zona entre col_producto_x y borde derecho.
+    # Esto es porque el ticket se recorta en col_producto_x (línea de corte): la izquierda
+    # es info para el contacto/proveedor, la derecha es lo que ve el cliente.
+    centro_cliente = (col_producto_x + (ancho - margen_x)) // 2
+
     y = 18
     titulo = "FRUTIVERDURA A DOMICILIO"
     tw = text_width(titulo, f_titulo)
-    draw.text(((ancho - tw) // 2, y), titulo, font=f_titulo, fill=c_titulo)
+    draw.text((centro_cliente - tw // 2, y), titulo, font=f_titulo, fill=c_titulo)
     y += interlinea + 4
 
     mx_time = datetime.now(pytz.timezone(ZONA_HORARIA))
     fecha = mx_time.strftime("%d/%m/%Y")
     tw = text_width(fecha, f_reg)
-    draw.text(((ancho - tw) // 2, y), fecha, font=f_reg, fill=c_titulo)
+    draw.text((centro_cliente - tw // 2, y), fecha, font=f_reg, fill=c_titulo)
     y += interlinea + 4
 
     pedido_txt = f"PEDIDO : {pedido['cliente'].upper()}"
@@ -291,14 +297,37 @@ def generar_ticket_png(pedido):
     draw.line([(margen_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
     y += 10
 
-    # ---- Totales (izquierda: COSTO/DIF; derecha: Subtotal/Envio/Total) ----
-    draw.text((col_costo_x, y), f"COSTO : ${totales['subtotal_costo']:,.2f}", font=f_reg, fill=c_sec)
-    y += interlinea_pequena
+    # ---- Totales ----
+    # Zona del PROVEEDOR (izquierda de la línea de corte en col_producto_x):
+    # COSTO y DIF compactos, sobre dos líneas cada uno para no rebasar la línea
+    # de corte. La imagen se recorta por col_producto_x al entregar al cliente.
+    y_izq_inicio = y
+    ancho_zona_izq = col_producto_x - col_costo_x - 8  # 8px de margen interno
 
-    dif_txt = f"DIF : ${totales['utilidad']:,.2f} ({totales['utilidad_pct']:.2f}%)"
-    draw.text((col_costo_x, y), dif_txt, font=f_reg, fill=c_sec)
-    y += interlinea_pequena + 4
+    def dibujar_compacto_izq(y_local, label, valor, color):
+        """Dibuja label y valor en la zona estrecha izquierda. Si no caben en una
+        sola línea las pone en dos líneas."""
+        linea_completa = f"{label} {valor}"
+        if text_width(linea_completa, f_compacta) <= ancho_zona_izq:
+            draw.text((col_costo_x, y_local), linea_completa, font=f_compacta, fill=color)
+            return y_local + 14
+        # No cabe: poner label arriba y valor abajo
+        draw.text((col_costo_x, y_local), label, font=f_compacta, fill=color)
+        draw.text((col_costo_x, y_local + 12), valor, font=f_compacta, fill=color)
+        return y_local + 26
 
+    y_izq = y_izq_inicio
+    y_izq = dibujar_compacto_izq(
+        y_izq, "COSTO:", f"${totales['subtotal_costo']:,.2f}", c_sec
+    )
+    y_izq = dibujar_compacto_izq(
+        y_izq,
+        "DIF:",
+        f"${totales['utilidad']:,.2f} ({totales['utilidad_pct']:.1f}%)",
+        c_sec,
+    )
+
+    # Zona del CLIENTE (derecha de la línea de corte): Subtotal / Envío / Descuento / TOTAL
     sub_txt = f"Subtotal Venta : ${totales['subtotal_venta']:,.2f}"
     tw = text_width(sub_txt, f_total_bold)
     draw.text((col_venta_x - tw, y), sub_txt, font=f_total_bold, fill=c_venta)
@@ -316,7 +345,7 @@ def generar_ticket_png(pedido):
         draw.text((col_venta_x - tw, y), desc_txt, font=f_reg, fill=c_sec)
         y += interlinea
 
-    # Línea fina antes del total
+    # Línea fina antes del total (solo en zona cliente)
     draw.line([(col_producto_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
     y += 8
 
@@ -325,9 +354,13 @@ def generar_ticket_png(pedido):
     draw.text((col_venta_x - tw, y), total_txt, font=f_total_bold, fill=c_venta)
     y += interlinea + 8
 
+    # Asegurar que el ticket no termine antes de que acabe la zona izquierda
+    y = max(y, y_izq + 4)
+
     gracias = "GRACIAS POR TU COMPRA"
     tw = text_width(gracias, f_total_bold)
-    draw.text(((ancho - tw) // 2, y), gracias, font=f_total_bold, fill=c_titulo)
+    # Centrado en zona cliente (entre col_producto_x y borde derecho), no en ancho total
+    draw.text((centro_cliente - tw // 2, y), gracias, font=f_total_bold, fill=c_titulo)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -645,7 +678,52 @@ ALIASES_PRODUCTOS = {
     "cartón de huevo": "huevo",
     "cartones de huevo": "huevo",
     "papas fritas": "papas fritas",
+    # Aliases en inglés / nombres alternativos
+    "blue berries": "mora azul",
+    "blueberries": "mora azul",
+    "blueberry": "mora azul",
+    "blue berry": "mora azul",
+    "raspberry": "frambuesa",
+    "raspberries": "frambuesa",
+    "blackberry": "zarzamora",
+    "blackberries": "zarzamora",
+    "strawberry": "fresa",
+    "strawberries": "fresa",
+    # Variantes de manzana (golden = amarilla)
+    "manzana golden": "manzana amarilla",
+    "manzanas golden": "manzana amarilla",
+    "golden": "manzana amarilla",
+    "manzana red": "manzana roja",
+    "manzanas red": "manzana roja",
+    # Churritos / churros
+    "churritos": "churros",
+    "churrito": "churros",
 }
+
+# Palabras que cuando aparecen indican que el producto viene EN BOLSA o EMPACADO,
+# lo cual lo hace un producto distinto al fresco/granel. La app no asigna alias
+# automático en estos casos: tú decides en la vista previa si crear nuevo o mapear.
+INDICADORES_EMPAQUE = [
+    "en bolsa",
+    "en bolsita",
+    "en bolsitas",
+    "bolsa de",
+    "bolsas de",
+    "bolsita de",
+    "bolsitas de",
+    "empacado",
+    "empacada",
+    "envasado",
+    "envasada",
+]
+
+
+def tiene_indicador_empaque(descripcion):
+    """Devuelve True si la descripción menciona bolsa/empaque,
+    sugiriendo que es un producto distinto al fresco."""
+    desc = descripcion.lower()
+    return any(ind in desc for ind in INDICADORES_EMPAQUE)
+
 
 
 def aplicar_alias(descripcion, catalogo_keys):
@@ -669,7 +747,13 @@ def aplicar_alias(descripcion, catalogo_keys):
 
 
 def buscar_match_catalogo(descripcion, catalogo_keys, umbral=0.4):
-    """Busca el mejor match. Prioriza coincidencia de la PRIMERA palabra significativa."""
+    """Busca el mejor match. Prioriza coincidencia de la PRIMERA palabra significativa.
+    Si la descripción menciona 'en bolsa', 'empacado', etc., NO retorna match
+    automático (el usuario debe decidir si es producto nuevo o cuál mapear)."""
+    # Si menciona empaque, no asignar alias ni match automático: forzar revisión manual
+    if tiene_indicador_empaque(descripcion):
+        return None
+
     # 0. Primero intentar con aliases manuales
     alias_match = aplicar_alias(descripcion, catalogo_keys)
     if alias_match:
@@ -912,7 +996,10 @@ Laura Canales
                 for j, prod in enumerate(ped["productos"]):
                     col1, col2, col3 = st.columns([3, 3, 1])
                     with col1:
-                        st.text(f"{prod['descripcion_original']} ({int(prod['gramos'])}g)")
+                        etiqueta = f"{prod['descripcion_original']} ({int(prod['gramos'])}g)"
+                        if tiene_indicador_empaque(prod['descripcion_original']):
+                            etiqueta = "📦 " + etiqueta
+                        st.text(etiqueta)
                     with col2:
                         opciones = ["(omitir)", "➕ Crear nuevo producto"] + catalogo_keys
                         idx_default = (
@@ -982,9 +1069,48 @@ Laura Canales
                                 st.error("Completa nombre, costo y precio")
 
         st.divider()
+
+        # Detectar productos sin asignar ANTES de mostrar botón de generar
+        productos_sin_asignar = []
+        for ped in st.session_state["preview_pedidos"]:
+            for prod in ped["productos"]:
+                if (not prod["match"]
+                    or prod["match"] == "__nuevo__"
+                    or prod["match"] not in st.session_state.precios_dict):
+                    productos_sin_asignar.append({
+                        "cliente": ped["cliente"],
+                        "descripcion": prod["descripcion_original"],
+                        "gramos": prod["gramos"],
+                    })
+
+        if productos_sin_asignar:
+            st.error(
+                f"⚠️ Hay {len(productos_sin_asignar)} productos sin asignar. "
+                "Si generas los tickets ahora, esos productos NO se cobrarán al cliente. "
+                "Asigna cada uno a un producto del catálogo o créalo como nuevo."
+            )
+            with st.expander("Ver productos sin asignar", expanded=True):
+                for sa in productos_sin_asignar:
+                    st.markdown(
+                        f"- **{sa['cliente']}**: `{sa['descripcion']}` ({int(sa['gramos'])}g)"
+                    )
+            forzar_generar = st.checkbox(
+                "Sé que faltan productos por asignar y aún así quiero generar los tickets "
+                "(los productos sin asignar NO se cobrarán)",
+                key="forzar_generar",
+            )
+        else:
+            forzar_generar = True
+
         col_g1, col_g2 = st.columns(2)
         with col_g1:
-            if st.button("✅ Generar todos los tickets", type="primary", use_container_width=True):
+            puede_generar = (not productos_sin_asignar) or forzar_generar
+            if st.button(
+                "✅ Generar todos los tickets",
+                type="primary",
+                use_container_width=True,
+                disabled=not puede_generar,
+            ):
                 generados = 0
                 for ped in st.session_state["preview_pedidos"]:
                     productos_finales = []
@@ -1021,7 +1147,10 @@ Laura Canales
                     generados += 1
 
                 del st.session_state["preview_pedidos"]
-                st.success(f"✅ Se generaron {generados} tickets. Velos en la pestaña Resumen.")
+                msg = f"✅ Se generaron {generados} tickets."
+                if productos_sin_asignar:
+                    msg += f" ⚠️ {len(productos_sin_asignar)} productos quedaron sin cobrar."
+                st.success(msg)
                 st.rerun()
         with col_g2:
             if st.button("🚫 Descartar vista previa", use_container_width=True):
