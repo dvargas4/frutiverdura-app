@@ -623,8 +623,9 @@ if not st.session_state.precios_dict:
     st.warning("⚠️ Primero carga el catálogo desde el panel lateral.")
     st.stop()
 
-tab_capturar, tab_pegar, tab_modificar, tab_resumen, tab_analisis = st.tabs(
-    ["📝 Capturar", "📋 Pegar pedido", "✏️ Modificar", "📊 Resumen y Descarga", "📈 Análisis de clientes"]
+tab_capturar, tab_pegar, tab_modificar, tab_resumen, tab_analisis, tab_mayoreo = st.tabs(
+    ["📝 Capturar", "📋 Pegar pedido", "✏️ Modificar", "📊 Resumen y Descarga",
+     "📈 Análisis de clientes", "🛒 Lista de compra"]
 )
 
 
@@ -865,6 +866,12 @@ ALIASES_PRODUCTOS = {
     "papas": "papa blanca",
     "tomate": "tomate",
     "tomates": "tomate",
+    "jitomate bola": "jitomate bola",
+    "jitomates bola": "jitomate bola",
+    "jito bola": "jitomate bola",
+    "jitomate saladet": "jitomate saladet",
+    "jitomates saladet": "jitomate saladet",
+    "jito saladet": "jitomate saladet",
     "jito": "jitomate",
     "jitos": "jitomate",
     "jitomate": "jitomate",
@@ -2101,3 +2108,342 @@ with tab_analisis:
             mime="text/csv",
             use_container_width=True,
         )
+
+
+# ============================
+# Tab 6: Lista de compra (mayoreo)
+# ============================
+def parsear_linea_compra(linea):
+    """Parsea una línea tipo:
+        '* 5 calabazas'         → ('calabaza', 5, 'pz')
+        '* 1 kg jitomate'       → ('jitomate', 1.0, 'kg')
+        '* 1/2 kg cebolla'      → ('cebolla', 0.5, 'kg')
+        '* 100g arándano'       → ('arandano', 0.1, 'kg')
+        '* 1 manojo cilantro'   → ('cilantro', 1, 'pz')
+        '* 1 cabeza ajos'       → ('ajo', 1, 'pz')
+        '* 1.5k plátano'        → ('platano', 1.5, 'kg')
+
+    Devuelve (producto_normalizado, cantidad, unidad) o None si no parseable.
+    Unidad es 'kg' o 'pz'.
+    """
+    s = linea.strip()
+    if not s:
+        return None
+
+    # Quitar viñetas (*, -, •, [x], 1., 1))
+    s = re.sub(r"^(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX\s]?\s*\]\s*)?", "", s).strip()
+    if not s:
+        return None
+
+    # Quitar paréntesis al final (gramos comprados, no es lo que pidieron)
+    s = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
+    # Quitar precios
+    s = re.sub(r"\$\s*[\d.,]+", "", s)
+    # Quitar emojis
+    s = "".join(c for c in s if c.isascii() or c.isalpha() or c.isspace() or c in "/.")
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return None
+
+    # Convertir fracciones tipo "1/2" en su valor decimal AL INICIO
+    # Patrón: número entero opcional + fracción
+    def num_a_float(token):
+        token = token.strip()
+        if "/" in token:
+            try:
+                a, b = token.split("/")
+                return float(a) / float(b)
+            except (ValueError, ZeroDivisionError):
+                return None
+        # Intentar como número simple
+        token_norm = token.replace(",", ".")
+        try:
+            return float(token_norm)
+        except ValueError:
+            return None
+
+    # Buscar la cantidad al inicio. Acepta: "5", "1.5", "1/2", "1 1/2"
+    m = re.match(r"^(\d+\s+\d+/\d+|\d+/\d+|[\d.,]+)\s*(.*)$", s)
+    if not m:
+        return None
+    cant_str, resto = m.group(1).strip(), m.group(2).strip()
+
+    # Manejar "1 1/2" (entero + fracción)
+    if " " in cant_str:
+        partes = cant_str.split()
+        cantidad = sum(filter(None, (num_a_float(p) for p in partes)))
+        if cantidad == 0:
+            cantidad = num_a_float(cant_str.split()[0])
+    else:
+        cantidad = num_a_float(cant_str)
+
+    if cantidad is None or cantidad <= 0:
+        return None
+
+    # Detectar unidad: kg, g, k, o palabras de pieza
+    unidades_kg = ["kg", "kgs", "kilo", "kilos", "k"]
+    unidades_g = ["g", "gr", "grs", "gramos"]
+    palabras_pieza = [
+        "pz", "pza", "pzas", "pieza", "piezas",
+        "manojo", "manojos", "ramo", "ramos",
+        "cabeza", "cabezas",
+        "domo", "domos", "domito", "domitos",
+        "penca", "pencas",
+        "cartón", "carton", "cartones",
+        "cajita", "cajitas", "caja", "cajas",
+        "bolsa", "bolsas", "bolsita", "bolsitas",
+        "lata", "latas", "frasco", "frascos",
+        "atado", "atados", "racimo", "racimos",
+    ]
+
+    # Tomar primera palabra del resto, ver si es unidad
+    primera = resto.split()[0].lower() if resto else ""
+    primera_norm = primera.rstrip(".,;:")
+
+    unidad = None
+    if primera_norm in unidades_kg:
+        unidad = "kg"
+        resto = resto.split(maxsplit=1)[1] if " " in resto else ""
+    elif primera_norm in unidades_g:
+        # gramos -> kg dividiendo entre 1000
+        cantidad = cantidad / 1000
+        unidad = "kg"
+        resto = resto.split(maxsplit=1)[1] if " " in resto else ""
+    elif primera_norm in palabras_pieza:
+        unidad = "pz"
+        resto = resto.split(maxsplit=1)[1] if " " in resto else ""
+    else:
+        # Caso especial: número pegado con "g" o "kg" (ej "100g", "1kg")
+        m2 = re.match(r"^([\d.,/]+)\s*(kg|kgs|k|g|gr)\b\s*(.*)", s, re.IGNORECASE)
+        if m2:
+            num = num_a_float(m2.group(1))
+            uni = m2.group(2).lower()
+            if num and num > 0:
+                if uni in ("g", "gr"):
+                    cantidad = num / 1000
+                    unidad = "kg"
+                else:
+                    cantidad = num
+                    unidad = "kg"
+                resto = m2.group(3).strip()
+        if unidad is None:
+            # Si no se detectó unidad, asumir piezas (ej "5 calabazas")
+            # EXCEPTO si es fracción sola sin unidad: ahí asumir kg (ej "1/2 jamaica")
+            if "/" in cant_str and not cant_str.replace("/", "").replace(" ", "").isdigit() == False:
+                # Es fracción pura como "1/4 jamaica" -> asumir kg
+                unidad = "kg"
+            elif cantidad < 1 and "/" in cant_str:
+                unidad = "kg"
+            else:
+                unidad = "pz"
+
+    # Quitar "de" inicial: "de plátano" -> "plátano"
+    resto = re.sub(r"^de\s+", "", resto, flags=re.IGNORECASE).strip()
+
+    if not resto:
+        return None
+
+    # Aplicar matcher para normalizar a nombre de catálogo
+    catalogo_keys = list(st.session_state.precios_dict.keys()) if st.session_state.precios_dict else []
+    nombre_norm = buscar_match_catalogo(resto, catalogo_keys) if catalogo_keys else None
+    if not nombre_norm:
+        # Si no hay match, usar la descripción limpia (singularizada en español)
+        palabras = resto.lower().split()
+        palabras_limpias = []
+        for p in palabras:
+            # En español:
+            # - palabras terminadas en vocal forman plural con -s (manzana->manzanas, jitomate->jitomates)
+            # - palabras terminadas en consonante forman plural con -es (limón->limones, color->colores)
+            # Para singularizar miramos la letra que queda antes de 's' al quitar la 's' final.
+            if len(p) > 3 and p.endswith("s"):
+                # Quitar 's' tentativamente
+                sin_s = p[:-1]
+                # Si lo que queda termina en 'e' Y la letra antes de la 'e' es consonante,
+                # probablemente venía de un plural -es de palabra terminada en consonante
+                # Ej: 'limones' -> sin_s='limone' -> 'n' antes de 'e' -> quitar 'e' -> 'limon'
+                # Ej: 'jitomates' -> sin_s='jitomate' -> 't' antes de 'e' -> mantener (es 'jitomate')
+                # La diferencia: limón termina en consonante (n) y forma -es. jitomate termina en vocal y forma -s.
+                # Heurística: si la palabra original termina en 'ones', 'anes', 'ales' (consonante+es), quitar 'es'
+                if len(sin_s) > 2 and sin_s.endswith("e"):
+                    # Posibles terminaciones de plural -es: nes, res, les, ces, ses, des, jes
+                    if len(sin_s) >= 3 and sin_s[-2] in "nrlcsdjzpvfbgkmhqtxy":
+                        # Verificar que no sea palabra que naturalmente termina en 'e' + esas letras
+                        # Lista de excepciones (palabras que terminan en consonante+e en singular):
+                        # 'jitomate', 'tomate', 'aguacate', 'chayote', 'elote', 'paquete', 'machete'
+                        # Si la palabra original es 'jitomates', sin_s sería 'jitomate' que es válida.
+                        # Para distinguir: si sin_s sin la 'e' final también es palabra válida, usamos esa.
+                        # Heurística más simple: si la consonante antes de 'e' es l, n, r, s, z, d -> probable plural -es
+                        # Si es t, c -> probable singular ya (jitomate, chayote)
+                        consonante = sin_s[-2]
+                        if consonante in "lnrszd":
+                            palabras_limpias.append(sin_s[:-1])  # quitar 'e' también
+                        else:
+                            palabras_limpias.append(sin_s)
+                    else:
+                        palabras_limpias.append(sin_s)
+                else:
+                    palabras_limpias.append(sin_s)
+            else:
+                palabras_limpias.append(p)
+        nombre_norm = " ".join(palabras_limpias)
+
+    return (nombre_norm, cantidad, unidad)
+
+
+with tab_mayoreo:
+    st.subheader("🛒 Lista de compra al mayoreo")
+    st.caption(
+        "Pega todos los pedidos del día. La app suma piezas y kilos por producto, "
+        "manteniéndolos separados, para que sepas cuánto comprar de cada cosa."
+    )
+
+    ejemplo = """Lulú Velasco
+* 5 calabazas
+* 5 zanahorias
+* 6 jitomates
+* 6 plátanos
+* 2 papas
+
+Macry Funez
+* 1 kilo mandarina
+* 1 kilo jitomate
+* 1 kilo zanahoria
+* 1/2 kg cebolla
+
+Abue Lucero
+* 1 kg dominico
+* 6 manzanas golden
+* 1/4 jamaica
+* 100g arándano"""
+
+    with st.expander("Ver ejemplo de formato"):
+        st.code(ejemplo, language="text")
+
+    texto_compra = st.text_area(
+        "Pega los pedidos completos aquí",
+        height=400,
+        placeholder=ejemplo,
+        key="texto_compra",
+    )
+
+    if st.button("🧮 Calcular lista de compra", type="primary"):
+        if not texto_compra.strip():
+            st.warning("Pega al menos un pedido.")
+        else:
+            # Acumuladores
+            kg_por_producto = {}
+            pz_por_producto = {}
+            no_parseables = []
+
+            # Procesar línea por línea
+            for linea in texto_compra.split("\n"):
+                linea = linea.strip()
+                if not linea:
+                    continue
+                # Detectar si es viñeta (producto) o nombre (cliente)
+                es_viñeta = bool(re.match(r"^(?:[\*\-\u2022]|\d+[\.\)])", linea))
+                if not es_viñeta:
+                    continue  # nombres de clientes se ignoran
+
+                resultado = parsear_linea_compra(linea)
+                if resultado is None:
+                    no_parseables.append(linea)
+                    continue
+                nombre, cantidad, unidad = resultado
+                if unidad == "kg":
+                    kg_por_producto[nombre] = kg_por_producto.get(nombre, 0) + cantidad
+                else:
+                    pz_por_producto[nombre] = pz_por_producto.get(nombre, 0) + cantidad
+
+            st.session_state["lista_compra"] = {
+                "kg": kg_por_producto,
+                "pz": pz_por_producto,
+                "no_parseables": no_parseables,
+            }
+
+    # Mostrar resultado
+    if "lista_compra" in st.session_state:
+        lc = st.session_state["lista_compra"]
+        kg_dict = lc["kg"]
+        pz_dict = lc["pz"]
+
+        # Combinar todos los productos
+        todos_productos = sorted(set(list(kg_dict.keys()) + list(pz_dict.keys())))
+
+        if not todos_productos:
+            st.warning("No se detectó nada parseable.")
+        else:
+            st.divider()
+            st.markdown("### 📋 Lista de compra consolidada")
+
+            # Tabla con kg y pz separados
+            filas = []
+            for prod in todos_productos:
+                kg = kg_dict.get(prod, 0)
+                pz = pz_dict.get(prod, 0)
+                filas.append({
+                    "Producto": prod.title(),
+                    "Kilos": f"{kg:.3f} kg" if kg > 0 else "—",
+                    "Piezas": f"{int(pz)} pz" if pz > 0 and pz == int(pz) else (f"{pz:.1f} pz" if pz > 0 else "—"),
+                })
+
+            df_compra = pd.DataFrame(filas)
+            st.dataframe(df_compra, use_container_width=True, hide_index=True)
+
+            # Resumen
+            col_res1, col_res2 = st.columns(2)
+            with col_res1:
+                st.metric("Productos distintos", len(todos_productos))
+            with col_res2:
+                kg_total = sum(kg_dict.values())
+                pz_total = sum(pz_dict.values())
+                st.metric("Total", f"{kg_total:.2f} kg + {int(pz_total)} pz")
+
+            # Vista en dos columnas: solo kg / solo pz
+            col_kg, col_pz = st.columns(2)
+            with col_kg:
+                st.markdown("**🟢 Comprar por kilos**")
+                if kg_dict:
+                    df_kg = pd.DataFrame(
+                        sorted(kg_dict.items(), key=lambda x: -x[1]),
+                        columns=["Producto", "Kilos"],
+                    )
+                    df_kg["Producto"] = df_kg["Producto"].str.title()
+                    df_kg["Kilos"] = df_kg["Kilos"].apply(lambda x: f"{x:.3f}")
+                    st.dataframe(df_kg, use_container_width=True, hide_index=True)
+                else:
+                    st.caption("Nada por kilos")
+
+            with col_pz:
+                st.markdown("**🔵 Comprar por piezas**")
+                if pz_dict:
+                    df_pz = pd.DataFrame(
+                        sorted(pz_dict.items(), key=lambda x: -x[1]),
+                        columns=["Producto", "Piezas"],
+                    )
+                    df_pz["Producto"] = df_pz["Producto"].str.title()
+                    df_pz["Piezas"] = df_pz["Piezas"].apply(
+                        lambda x: f"{int(x)}" if x == int(x) else f"{x:.1f}"
+                    )
+                    st.dataframe(df_pz, use_container_width=True, hide_index=True)
+                else:
+                    st.caption("Nada por piezas")
+
+            # Líneas que no se pudieron parsear
+            if lc["no_parseables"]:
+                with st.expander(f"⚠️ {len(lc['no_parseables'])} líneas no parseables"):
+                    for ln in lc["no_parseables"]:
+                        st.code(ln, language="text")
+
+            # Descargar como CSV
+            csv_compra = df_compra.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "📄 Descargar lista de compra (CSV)",
+                data=csv_compra,
+                file_name="lista_compra.csv",
+                mime="text/csv",
+            )
+
+            if st.button("🗑️ Limpiar"):
+                del st.session_state["lista_compra"]
+                st.rerun()
