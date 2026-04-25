@@ -269,16 +269,22 @@ def cargar_historico():
 
     try:
         ss = _abrir_spreadsheet()
-        try:
-            ws_t = ss.worksheet("HISTORICO_TICKETS")
-            df_t = pd.DataFrame(ws_t.get_all_records())
-        except Exception:
-            df_t = pd.DataFrame(columns=HEADERS_TICKETS)
-        try:
-            ws_p = ss.worksheet("HISTORICO_PRODUCTOS")
-            df_p = pd.DataFrame(ws_p.get_all_records())
-        except Exception:
-            df_p = pd.DataFrame(columns=HEADERS_PRODUCTOS)
+
+        def hoja_a_df(ws_name, headers_default):
+            """Lee una pestaña como strings literales (sin parseo automático)."""
+            try:
+                ws = ss.worksheet(ws_name)
+                valores = ws.get_all_values()
+            except Exception:
+                return pd.DataFrame(columns=headers_default)
+            if not valores or len(valores) < 2:
+                return pd.DataFrame(columns=headers_default)
+            headers = valores[0]
+            filas = valores[1:]
+            return pd.DataFrame(filas, columns=headers)
+
+        df_t = hoja_a_df("HISTORICO_TICKETS", HEADERS_TICKETS)
+        df_p = hoja_a_df("HISTORICO_PRODUCTOS", HEADERS_PRODUCTOS)
 
         # Normalizar montos del histórico de tickets
         columnas_dinero_t = [
@@ -1376,6 +1382,12 @@ Laura Canales
                     generados += 1
 
                 del st.session_state["preview_pedidos"]
+                # Limpiar el texto pegado y los campos relacionados al generar exitosamente
+                if generados > 0:
+                    st.session_state["texto_pegado"] = ""
+                    st.session_state["rapido_cliente"] = ""
+                    st.session_state["pegar_envio_multi"] = ""
+                    st.session_state["rapido_envio"] = False
                 msg = f"✅ Se generaron {generados} tickets."
                 if productos_sin_asignar:
                     msg += f" ⚠️ {len(productos_sin_asignar)} productos quedaron sin cobrar."
