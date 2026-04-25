@@ -79,6 +79,9 @@ if "precios_dict" not in st.session_state:
     st.session_state.precios_dict = {}
 if "costos_dict" not in st.session_state:
     st.session_state.costos_dict = {}
+if "gastos_sesion" not in st.session_state:
+    # Lista de dicts: {"contacto": "IVAN", "concepto": "...", "monto": 0.0}
+    st.session_state.gastos_sesion = []
 
 # ============================
 # Carga del catálogo (Google Sheets o CSV local)
@@ -145,6 +148,12 @@ HEADERS_TICKETS = [
 ]
 HEADERS_PRODUCTOS = [
     "fecha", "cliente", "contacto", "producto", "gramos", "costo", "venta",
+]
+# Gastos: bitácora independiente. NO se mezcla con tickets/productos ni
+# afecta utilidad, análisis de clientes ni resultados. Es solo un registro
+# de "le debo X a este contacto" para llevar control de reembolsos.
+HEADERS_GASTOS = [
+    "fecha", "contacto", "concepto", "monto", "pagado",
 ]
 
 
@@ -597,6 +606,7 @@ with st.sidebar:
     if st.button("🗑️ Limpiar sesión completa", type="secondary"):
         st.session_state.pedidos = []
         st.session_state.productos_actuales = []
+        st.session_state.gastos_sesion = []
         st.session_state["historico_guardado_sesion"] = False
         st.rerun()
 
@@ -1600,12 +1610,84 @@ with tab_resumen:
                 zf.writestr(f"{p['cliente'].replace(' ', '_')}.png", png)
         zip_buf.seek(0)
 
-        # CSV de resumen (mismo formato que el original)
+        # ---- Gastos extra para el CSV (independiente de tickets/utilidad/análisis) ----
+        st.divider()
+        st.subheader("💸 Gastos adicionales")
+        st.caption(
+            "Registra gastos como gasolina, empaques, etc. Se sumarán como filas extra "
+            "en el CSV descargable, asignados al contacto que pagó. **No afectan los tickets, "
+            "la utilidad, ni el análisis de clientes.**"
+        )
+
+        with st.expander("➕ Agregar gasto", expanded=False):
+            cg1, cg2, cg3, cg4 = st.columns([1, 2, 1, 1])
+            with cg1:
+                gasto_contacto = st.selectbox(
+                    "Contacto",
+                    list(CONTACTOS.keys()),
+                    key="gasto_contacto",
+                )
+            with cg2:
+                gasto_concepto = st.text_input(
+                    "Concepto",
+                    placeholder="ej: Gasolina, Bolsas, Estacionamiento",
+                    key="gasto_concepto",
+                )
+            with cg3:
+                gasto_monto = st.number_input(
+                    "Monto",
+                    min_value=0.0,
+                    step=10.0,
+                    key="gasto_monto",
+                )
+            with cg4:
+                st.write("")
+                st.write("")
+                if st.button("Agregar", use_container_width=True):
+                    if gasto_monto > 0:
+                        st.session_state.gastos_sesion.append({
+                            "contacto": gasto_contacto,
+                            "concepto": gasto_concepto.strip() or "Gasto",
+                            "monto": float(gasto_monto),
+                        })
+                        st.rerun()
+                    else:
+                        st.error("El monto debe ser mayor a 0")
+
+        if st.session_state.gastos_sesion:
+            st.markdown("**Gastos registrados en esta sesión:**")
+            for idx, g in enumerate(st.session_state.gastos_sesion):
+                gc1, gc2, gc3, gc4 = st.columns([1, 2, 1, 1])
+                gc1.text(g["contacto"])
+                gc2.text(g["concepto"])
+                gc3.text(f"${g['monto']:,.2f}")
+                with gc4:
+                    if st.button("🗑️", key=f"del_gasto_{idx}"):
+                        st.session_state.gastos_sesion.pop(idx)
+                        st.rerun()
+
+            # Resumen rápido por contacto
+            total_por_contacto = {}
+            for g in st.session_state.gastos_sesion:
+                total_por_contacto[g["contacto"]] = total_por_contacto.get(g["contacto"], 0) + g["monto"]
+            resumen_gastos = "  |  ".join(
+                f"{c}: ${m:,.2f}" for c, m in total_por_contacto.items()
+            )
+            st.caption(f"Total gastos: {resumen_gastos}")
+
+        # ---- CSV de resumen (incluye gastos como filas extra con cliente='GASTO') ----
         data = {nombre: [] for nombre in CONTACTOS.keys()}
         costos = {nombre: [] for nombre in CONTACTOS.keys()}
+        # 1. Filas de clientes (pedidos normales)
         for p in pedidos:
             data[p["contacto"]].append(p["cliente"])
             costos[p["contacto"]].append(f"{p['subtotal_costo']:.2f}")
+        # 2. Filas de gastos (independientes, marcadas como 'GASTO')
+        for g in st.session_state.gastos_sesion:
+            etiqueta = f"GASTO: {g['concepto']}" if g["concepto"] else "GASTO"
+            data[g["contacto"]].append(etiqueta)
+            costos[g["contacto"]].append(f"{g['monto']:.2f}")
+
         max_p = max((len(v) for v in data.values()), default=0)
         for key in data:
             while len(data[key]) < max_p:
@@ -1624,6 +1706,8 @@ with tab_resumen:
             columnas.append("COSTO")
         df_csv = pd.DataFrame(merged, columns=columnas)
         csv_bytes = df_csv.to_csv(index=False).encode("utf-8")
+
+        st.divider()
 
         col_zip, col_csv = st.columns(2)
         with col_zip:
