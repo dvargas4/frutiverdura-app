@@ -214,9 +214,9 @@ def guardar_pedidos_en_historico(pedidos):
                 ])
 
         if filas_tickets:
-            ws_tickets.append_rows(filas_tickets, value_input_option="USER_ENTERED")
+            ws_tickets.append_rows(filas_tickets, value_input_option="RAW")
         if filas_productos:
-            ws_productos.append_rows(filas_productos, value_input_option="USER_ENTERED")
+            ws_productos.append_rows(filas_productos, value_input_option="RAW")
 
         return len(filas_tickets), len(filas_productos)
     except Exception as e:
@@ -226,9 +226,47 @@ def guardar_pedidos_en_historico(pedidos):
 @st.cache_data(ttl=120, show_spinner="Cargando histórico...")
 def cargar_historico():
     """Carga el histórico completo desde Google Sheets.
-    Devuelve (df_tickets, df_productos) como pandas DataFrames.
-    Usa limpiar_valor para parsear montos respetando el formato '$1,234.50'
-    (coma decimal convertida a punto), igual que en la carga de catálogo."""
+    Devuelve (df_tickets, df_productos) como pandas DataFrames."""
+
+    def parsear_dinero(valor):
+        """Parsea un valor monetario que puede venir en varios formatos:
+        - float Python: 1154.42 → 1154.42
+        - int Python: 1154 → 1154.0
+        - string '1154.42' (punto decimal) → 1154.42
+        - string '1,154.42' (coma miles + punto decimal) → 1154.42
+        - string '$1,154.42' (con prefijo) → 1154.42
+        - string '1154,42' (coma decimal estilo MX, sin separador miles) → 1154.42
+        - vacío / None → 0.0
+        """
+        if valor is None or valor == "":
+            return 0.0
+        # Si ya es número, regresar directo
+        if isinstance(valor, (int, float)):
+            return float(valor)
+        # Es string
+        s = str(valor).replace("$", "").strip()
+        if not s:
+            return 0.0
+        # Caso 1: contiene tanto coma como punto → coma es separador de miles
+        if "," in s and "." in s:
+            s = s.replace(",", "")
+            try:
+                return float(s)
+            except ValueError:
+                return 0.0
+        # Caso 2: solo coma → es separador decimal estilo MX
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+            try:
+                return float(s)
+            except ValueError:
+                return 0.0
+        # Caso 3: solo punto o solo dígitos
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+
     try:
         ss = _abrir_spreadsheet()
         try:
@@ -242,18 +280,16 @@ def cargar_historico():
         except Exception:
             df_p = pd.DataFrame(columns=HEADERS_PRODUCTOS)
 
-        # Normalizar montos usando limpiar_valor (respeta el formato del catálogo:
-        # "$1,234.50" donde la coma es decimal). Esta es la misma lógica que el
-        # catálogo de precios para mantener consistencia en toda la app.
+        # Normalizar montos del histórico de tickets
         columnas_dinero_t = [
             "subtotal_costo", "subtotal_venta", "costo_envio",
             "descuento", "total_final", "utilidad",
         ]
         for col in columnas_dinero_t:
             if col in df_t.columns:
-                df_t[col] = df_t[col].apply(limpiar_valor)
+                df_t[col] = df_t[col].apply(parsear_dinero)
 
-        # num_productos es entero, sin formato de moneda
+        # num_productos es entero
         if "num_productos" in df_t.columns:
             df_t["num_productos"] = pd.to_numeric(
                 df_t["num_productos"], errors="coerce"
@@ -262,7 +298,7 @@ def cargar_historico():
         # Productos: costo y venta son dinero, gramos es entero
         for col in ["costo", "venta"]:
             if col in df_p.columns:
-                df_p[col] = df_p[col].apply(limpiar_valor)
+                df_p[col] = df_p[col].apply(parsear_dinero)
         if "gramos" in df_p.columns:
             df_p["gramos"] = pd.to_numeric(
                 df_p["gramos"], errors="coerce"
