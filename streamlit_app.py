@@ -2367,8 +2367,16 @@ Abue Lucero
         kg_dict = lc["kg"]
         pz_dict = lc["pz"]
 
-        # Combinar todos los productos
-        todos_productos = sorted(set(list(kg_dict.keys()) + list(pz_dict.keys())))
+        # Combinar todos los productos, ordenados de mayor a menor
+        # Criterio: max(kg, pz) descendente; si están en pz se compara con pz, si en kg con kg.
+        # Como kg suele ser número pequeño (1, 2, 3) y pz puede ser 5-30, ordenamos
+        # por la suma de ambos para tener un ranking justo (kilos cuentan como su valor numérico).
+        productos_con_total = [
+            (p, kg_dict.get(p, 0) + pz_dict.get(p, 0))
+            for p in set(list(kg_dict.keys()) + list(pz_dict.keys()))
+        ]
+        productos_con_total.sort(key=lambda x: x[1], reverse=True)
+        todos_productos = [p for p, _ in productos_con_total]
 
         if not todos_productos:
             st.warning("No se detectó nada parseable.")
@@ -2376,7 +2384,7 @@ Abue Lucero
             st.divider()
             st.markdown("### 📋 Lista de compra consolidada")
 
-            # Tabla con kg y pz separados
+            # Tabla con kg y pz separados, ya ordenada
             filas = []
             for prod in todos_productos:
                 kg = kg_dict.get(prod, 0)
