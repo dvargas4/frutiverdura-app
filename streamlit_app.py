@@ -136,6 +136,131 @@ def cargar_catalogo_csv(archivo):
 
 
 # ============================
+# Persistencia: Histórico en Google Sheets
+# ============================
+HEADERS_TICKETS = [
+    "fecha", "cliente", "contacto", "telefono", "lleva_envio", "num_productos",
+    "subtotal_costo", "subtotal_venta", "costo_envio", "descuento",
+    "total_final", "utilidad",
+]
+HEADERS_PRODUCTOS = [
+    "fecha", "cliente", "contacto", "producto", "gramos", "costo", "venta",
+]
+
+
+def _abrir_spreadsheet():
+    """Abre el spreadsheet con permisos de escritura."""
+    import gspread
+    from google.oauth2.service_account import Credentials
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    client = gspread.authorize(creds)
+    return client.open_by_url(SPREADSHEET_URL)
+
+
+def _obtener_o_crear_pestaña(spreadsheet, nombre, headers):
+    """Devuelve la pestaña; si no existe la crea con los headers indicados."""
+    try:
+        ws = spreadsheet.worksheet(nombre)
+    except Exception:
+        ws = spreadsheet.add_worksheet(title=nombre, rows=1000, cols=len(headers))
+        ws.append_row(headers)
+    return ws
+
+
+def guardar_pedidos_en_historico(pedidos):
+    """Apenda los pedidos al histórico en Google Sheets.
+    Devuelve (tickets_guardados, productos_guardados) o (None, error_msg)."""
+    if not pedidos:
+        return 0, 0
+
+    try:
+        ss = _abrir_spreadsheet()
+        ws_tickets = _obtener_o_crear_pestaña(ss, "HISTORICO_TICKETS", HEADERS_TICKETS)
+        ws_productos = _obtener_o_crear_pestaña(ss, "HISTORICO_PRODUCTOS", HEADERS_PRODUCTOS)
+
+        fecha = datetime.now(pytz.timezone(ZONA_HORARIA)).strftime("%Y-%m-%d %H:%M")
+
+        filas_tickets = []
+        filas_productos = []
+
+        for p in pedidos:
+            filas_tickets.append([
+                fecha,
+                p["cliente"],
+                p["contacto"],
+                p.get("telefono", ""),
+                "Sí" if p["lleva_envio"] else "No",
+                len(p["productos"]),
+                round(p["subtotal_costo"], 2),
+                round(p["subtotal_venta"], 2),
+                round(p["costo_envio"], 2),
+                round(p.get("descuento", 0.0), 2),
+                round(p["nuevo_total"], 2),
+                round(p["utilidad"], 2),
+            ])
+
+            for nombre, gramos, costo, venta in p["productos"]:
+                filas_productos.append([
+                    fecha,
+                    p["cliente"],
+                    p["contacto"],
+                    nombre,
+                    int(gramos),
+                    round(costo, 2),
+                    round(venta, 2),
+                ])
+
+        if filas_tickets:
+            ws_tickets.append_rows(filas_tickets, value_input_option="USER_ENTERED")
+        if filas_productos:
+            ws_productos.append_rows(filas_productos, value_input_option="USER_ENTERED")
+
+        return len(filas_tickets), len(filas_productos)
+    except Exception as e:
+        return None, str(e)
+
+
+@st.cache_data(ttl=120, show_spinner="Cargando histórico...")
+def cargar_historico():
+    """Carga el histórico completo desde Google Sheets.
+    Devuelve (df_tickets, df_productos) como pandas DataFrames."""
+    try:
+        ss = _abrir_spreadsheet()
+        try:
+            ws_t = ss.worksheet("HISTORICO_TICKETS")
+            df_t = pd.DataFrame(ws_t.get_all_records())
+        except Exception:
+            df_t = pd.DataFrame(columns=HEADERS_TICKETS)
+        try:
+            ws_p = ss.worksheet("HISTORICO_PRODUCTOS")
+            df_p = pd.DataFrame(ws_p.get_all_records())
+        except Exception:
+            df_p = pd.DataFrame(columns=HEADERS_PRODUCTOS)
+
+        # Normalizar tipos
+        for col in ["subtotal_costo", "subtotal_venta", "costo_envio", "descuento",
+                    "total_final", "utilidad", "num_productos"]:
+            if col in df_t.columns:
+                df_t[col] = pd.to_numeric(df_t[col], errors="coerce").fillna(0)
+        for col in ["gramos", "costo", "venta"]:
+            if col in df_p.columns:
+                df_p[col] = pd.to_numeric(df_p[col], errors="coerce").fillna(0)
+
+        if "fecha" in df_t.columns:
+            df_t["fecha_dt"] = pd.to_datetime(df_t["fecha"], errors="coerce")
+        if "fecha" in df_p.columns:
+            df_p["fecha_dt"] = pd.to_datetime(df_p["fecha"], errors="coerce")
+
+        return df_t, df_p
+    except Exception as e:
+        return None, str(e)
+
+
+
+# ============================
 # Cálculo de totales
 # ============================
 def calcular_totales(productos, lleva_envio, descuento=0.0):
@@ -411,6 +536,7 @@ with st.sidebar:
     if st.button("🗑️ Limpiar sesión completa", type="secondary"):
         st.session_state.pedidos = []
         st.session_state.productos_actuales = []
+        st.session_state["historico_guardado_sesion"] = False
         st.rerun()
 
 
@@ -423,8 +549,8 @@ if not st.session_state.precios_dict:
     st.warning("⚠️ Primero carga el catálogo desde el panel lateral.")
     st.stop()
 
-tab_capturar, tab_pegar, tab_modificar, tab_resumen = st.tabs(
-    ["📝 Capturar", "📋 Pegar pedido", "✏️ Modificar", "📊 Resumen y Descarga"]
+tab_capturar, tab_pegar, tab_modificar, tab_resumen, tab_analisis = st.tabs(
+    ["📝 Capturar", "📋 Pegar pedido", "✏️ Modificar", "📊 Resumen y Descarga", "📈 Análisis de clientes"]
 )
 
 
@@ -1072,6 +1198,49 @@ Laura Canales
                             else:
                                 st.error("Completa nombre, costo y precio")
 
+                # ---- Descuento (solo si tiene MIN_PRODUCTOS_DESCUENTO+ productos válidos) ----
+                productos_validos = [
+                    p for p in ped["productos"]
+                    if p["match"]
+                    and p["match"] != "__nuevo__"
+                    and p["match"] in st.session_state.precios_dict
+                    and p["gramos"] > 0
+                ]
+
+                if len(productos_validos) >= MIN_PRODUCTOS_DESCUENTO:
+                    # Calcular subtotales con productos válidos para saber el descuento máximo
+                    subtotal_costo_prev = sum(
+                        (p["gramos"] * st.session_state.costos_dict[p["match"]]["costo_kg"]) / 1000
+                        for p in productos_validos
+                    )
+                    subtotal_venta_prev = sum(
+                        (p["gramos"] * st.session_state.precios_dict[p["match"]]["precio_venta_kg"]) / 1000
+                        for p in productos_validos
+                    )
+                    costo_envio_prev = COSTO_ENVIO if ped["lleva_envio"] else 0
+                    utilidad_prev = subtotal_venta_prev + costo_envio_prev - subtotal_costo_prev
+                    util_min = subtotal_costo_prev * UTILIDAD_MINIMA_PCT
+                    max_descuento = utilidad_prev - util_min
+
+                    if max_descuento > 0:
+                        st.markdown(
+                            f"💰 Elegible a descuento ({len(productos_validos)} productos). "
+                            f"Máximo aplicable: **${max_descuento:,.2f}**"
+                        )
+                        ped["descuento"] = st.number_input(
+                            "Descuento a aplicar",
+                            min_value=0.0,
+                            max_value=float(max_descuento),
+                            value=float(ped.get("descuento", 0.0)) if ped.get("descuento", 0.0) <= max_descuento else 0.0,
+                            step=5.0,
+                            key=f"prev_desc_{i}",
+                        )
+                    else:
+                        ped["descuento"] = 0.0
+                else:
+                    # No elegible: ni se muestra ni se aplica
+                    ped["descuento"] = 0.0
+
         st.divider()
 
         # Detectar productos sin asignar ANTES de mostrar botón de generar
@@ -1137,13 +1306,14 @@ Laura Canales
                     if not productos_finales:
                         continue
 
-                    totales = calcular_totales(productos_finales, ped["lleva_envio"], 0.0)
+                    descuento_aplicar = float(ped.get("descuento", 0.0))
+                    totales = calcular_totales(productos_finales, ped["lleva_envio"], descuento_aplicar)
                     pedido = {
                         "cliente": ped["cliente"],
                         "contacto": contacto_default,
                         "telefono": CONTACTOS[contacto_default],
                         "lleva_envio": ped["lleva_envio"],
-                        "descuento": 0.0,
+                        "descuento": descuento_aplicar,
                         "productos": productos_finales,
                         **totales,
                     }
@@ -1407,9 +1577,305 @@ with tab_resumen:
             )
 
         st.divider()
+        st.subheader("💾 Guardar al histórico")
+        st.caption(
+            "Guarda permanentemente estos pedidos en Google Sheets para análisis futuros. "
+            "Los datos quedan en las pestañas HISTORICO_TICKETS y HISTORICO_PRODUCTOS."
+        )
+
+        if st.session_state.get("historico_guardado_sesion", False):
+            st.success("✅ Esta sesión ya fue guardada al histórico.")
+            if st.button("Guardar de nuevo (duplicará registros)"):
+                st.session_state["historico_guardado_sesion"] = False
+                st.rerun()
+        else:
+            if st.button("💾 Guardar todos los tickets al histórico", type="primary"):
+                with st.spinner("Guardando en Google Sheets..."):
+                    tickets_g, productos_g = guardar_pedidos_en_historico(pedidos)
+                if tickets_g is None:
+                    st.error(f"Error al guardar: {productos_g}")
+                else:
+                    st.success(
+                        f"✅ Guardados {tickets_g} tickets y {productos_g} productos al histórico. "
+                        "Velos en la pestaña 'Análisis de clientes'."
+                    )
+                    st.session_state["historico_guardado_sesion"] = True
+                    cargar_historico.clear()
+
+        st.divider()
         st.subheader("Galería de tickets")
         cols_gal = st.columns(3)
         for i, p in enumerate(pedidos):
             with cols_gal[i % 3]:
                 png = generar_ticket_png(p)
                 st.image(png, caption=f"{p['cliente']} - ${p['nuevo_total']:,.2f}", use_container_width=True)
+
+
+# ============================
+# Tab 5: Análisis de clientes
+# ============================
+with tab_analisis:
+    st.subheader("📈 Análisis de clientes")
+    st.caption(
+        "Datos acumulados de todos los pedidos guardados al histórico. "
+        "Usa esta vista para identificar clientes fieles, productos más vendidos y oportunidades."
+    )
+
+    col_recargar, col_info = st.columns([1, 3])
+    with col_recargar:
+        if st.button("🔄 Recargar histórico"):
+            cargar_historico.clear()
+            st.rerun()
+
+    resultado = cargar_historico()
+    if resultado is None or (isinstance(resultado[0], type(None))):
+        st.error(f"No se pudo cargar el histórico: {resultado[1]}")
+        st.stop()
+
+    df_tickets, df_productos = resultado
+
+    if df_tickets is None or df_tickets.empty:
+        st.info(
+            "Aún no hay datos en el histórico. Genera tickets en la pestaña Capturar o "
+            "Pegar pedido, y dale 'Guardar al histórico' en la pestaña Resumen."
+        )
+        st.stop()
+
+    # ---- Filtros temporales ----
+    st.markdown("### Filtros")
+    col_f1, col_f2, col_f3 = st.columns(3)
+
+    fecha_min = df_tickets["fecha_dt"].min()
+    fecha_max = df_tickets["fecha_dt"].max()
+
+    with col_f1:
+        rango = st.selectbox(
+            "Período",
+            ["Todo el histórico", "Últimos 30 días", "Últimos 90 días", "Este año"],
+            key="rango_analisis",
+        )
+    with col_f2:
+        contacto_filter = st.selectbox(
+            "Contacto",
+            ["Todos"] + sorted(df_tickets["contacto"].unique().tolist()),
+            key="contacto_analisis",
+        )
+    with col_f3:
+        st.metric(
+            "Período total",
+            f"{(fecha_max - fecha_min).days if pd.notna(fecha_min) else 0} días",
+        )
+
+    # Aplicar filtros
+    df_t = df_tickets.copy()
+    df_p = df_productos.copy()
+
+    hoy = pd.Timestamp.now()
+    if rango == "Últimos 30 días":
+        corte = hoy - pd.Timedelta(days=30)
+        df_t = df_t[df_t["fecha_dt"] >= corte]
+        df_p = df_p[df_p["fecha_dt"] >= corte]
+    elif rango == "Últimos 90 días":
+        corte = hoy - pd.Timedelta(days=90)
+        df_t = df_t[df_t["fecha_dt"] >= corte]
+        df_p = df_p[df_p["fecha_dt"] >= corte]
+    elif rango == "Este año":
+        df_t = df_t[df_t["fecha_dt"].dt.year == hoy.year]
+        df_p = df_p[df_p["fecha_dt"].dt.year == hoy.year]
+
+    if contacto_filter != "Todos":
+        df_t = df_t[df_t["contacto"] == contacto_filter]
+        df_p = df_p[df_p["contacto"] == contacto_filter]
+
+    if df_t.empty:
+        st.warning("No hay datos para los filtros seleccionados.")
+        st.stop()
+
+    # ---- KPIs globales ----
+    st.divider()
+    st.markdown("### Resumen del período")
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Tickets totales", len(df_t))
+    k2.metric("Clientes únicos", df_t["cliente"].nunique())
+    k3.metric("Ingresos", f"${df_t['total_final'].sum():,.2f}")
+    k4.metric("Utilidad total", f"${df_t['utilidad'].sum():,.2f}")
+
+    k5, k6, k7, k8 = st.columns(4)
+    k5.metric("Ticket promedio", f"${df_t['total_final'].mean():,.2f}")
+    k6.metric("Productos vendidos", int(df_t["num_productos"].sum()))
+    k7.metric("Kg vendidos", f"{df_p['gramos'].sum() / 1000:,.2f}")
+    margen_pct = (df_t['utilidad'].sum() / df_t['subtotal_costo'].sum() * 100) if df_t['subtotal_costo'].sum() > 0 else 0
+    k8.metric("Margen sobre costo", f"{margen_pct:.1f}%")
+
+    # ---- Ranking de clientes fieles ----
+    st.divider()
+    st.markdown("### 🏆 Top clientes")
+
+    df_clientes = (
+        df_t.groupby("cliente")
+        .agg(
+            tickets=("cliente", "count"),
+            total_gastado=("total_final", "sum"),
+            ticket_promedio=("total_final", "mean"),
+            utilidad_generada=("utilidad", "sum"),
+            ultima_visita=("fecha_dt", "max"),
+            primera_visita=("fecha_dt", "min"),
+        )
+        .reset_index()
+    )
+    df_clientes["dias_sin_comprar"] = (hoy - df_clientes["ultima_visita"]).dt.days
+    df_clientes = df_clientes.sort_values("total_gastado", ascending=False)
+
+    # Score de fidelidad simple: tickets * 10 + frecuencia (tickets / dias_activo)
+    df_clientes["dias_activo"] = (df_clientes["ultima_visita"] - df_clientes["primera_visita"]).dt.days.clip(lower=1)
+    df_clientes["frecuencia"] = (df_clientes["tickets"] / df_clientes["dias_activo"] * 30).round(2)  # tickets por mes
+
+    col_ranking_a, col_ranking_b = st.columns(2)
+    with col_ranking_a:
+        st.markdown("**Por monto gastado**")
+        df_show = df_clientes.head(10)[["cliente", "tickets", "total_gastado", "ticket_promedio"]].copy()
+        df_show["total_gastado"] = df_show["total_gastado"].apply(lambda x: f"${x:,.2f}")
+        df_show["ticket_promedio"] = df_show["ticket_promedio"].apply(lambda x: f"${x:,.2f}")
+        df_show.columns = ["Cliente", "Tickets", "Total gastado", "Promedio"]
+        st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+    with col_ranking_b:
+        st.markdown("**Por frecuencia (más recurrentes)**")
+        df_freq = df_clientes.sort_values("tickets", ascending=False).head(10).copy()
+        df_freq_show = df_freq[["cliente", "tickets", "frecuencia", "dias_sin_comprar"]].copy()
+        df_freq_show["frecuencia"] = df_freq_show["frecuencia"].apply(lambda x: f"{x:.1f}/mes")
+        df_freq_show["dias_sin_comprar"] = df_freq_show["dias_sin_comprar"].astype(int).astype(str) + " días"
+        df_freq_show.columns = ["Cliente", "Tickets", "Frecuencia", "Última compra hace"]
+        st.dataframe(df_freq_show, use_container_width=True, hide_index=True)
+
+    # ---- Clientes que se están perdiendo ----
+    st.divider()
+    st.markdown("### ⚠️ Clientes en riesgo de pérdida")
+    st.caption("Clientes que solían comprar pero no han vuelto en 30+ días.")
+
+    df_riesgo = df_clientes[
+        (df_clientes["dias_sin_comprar"] >= 30)
+        & (df_clientes["tickets"] >= 2)
+    ].sort_values("total_gastado", ascending=False).head(15)
+
+    if df_riesgo.empty:
+        st.success("Ningún cliente recurrente en riesgo. ¡Bien!")
+    else:
+        df_riesgo_show = df_riesgo[["cliente", "tickets", "total_gastado", "ultima_visita", "dias_sin_comprar"]].copy()
+        df_riesgo_show["total_gastado"] = df_riesgo_show["total_gastado"].apply(lambda x: f"${x:,.2f}")
+        df_riesgo_show["ultima_visita"] = df_riesgo_show["ultima_visita"].dt.strftime("%Y-%m-%d")
+        df_riesgo_show["dias_sin_comprar"] = df_riesgo_show["dias_sin_comprar"].astype(int).astype(str) + " días"
+        df_riesgo_show.columns = ["Cliente", "Tickets", "Total gastado", "Última compra", "Hace"]
+        st.dataframe(df_riesgo_show, use_container_width=True, hide_index=True)
+
+    # ---- Productos top ----
+    st.divider()
+    st.markdown("### 🥬 Productos más vendidos")
+
+    if not df_p.empty:
+        df_prods = (
+            df_p.groupby("producto")
+            .agg(
+                veces_pedido=("producto", "count"),
+                total_gramos=("gramos", "sum"),
+                ingresos=("venta", "sum"),
+            )
+            .reset_index()
+            .sort_values("ingresos", ascending=False)
+        )
+        df_prods["total_kg"] = (df_prods["total_gramos"] / 1000).round(2)
+        df_prods_show = df_prods.head(15)[["producto", "veces_pedido", "total_kg", "ingresos"]].copy()
+        df_prods_show["ingresos"] = df_prods_show["ingresos"].apply(lambda x: f"${x:,.2f}")
+        df_prods_show.columns = ["Producto", "Veces pedido", "Kg vendidos", "Ingresos"]
+        st.dataframe(df_prods_show, use_container_width=True, hide_index=True)
+
+    # ---- Tendencia mensual ----
+    st.divider()
+    st.markdown("### 📅 Tendencia mensual")
+
+    df_t_temp = df_t.copy()
+    df_t_temp["mes"] = df_t_temp["fecha_dt"].dt.to_period("M").astype(str)
+    df_mes = df_t_temp.groupby("mes").agg(
+        tickets=("cliente", "count"),
+        ingresos=("total_final", "sum"),
+        utilidad=("utilidad", "sum"),
+        clientes_unicos=("cliente", "nunique"),
+    ).reset_index()
+
+    if len(df_mes) > 0:
+        st.bar_chart(df_mes.set_index("mes")[["ingresos", "utilidad"]])
+        df_mes_show = df_mes.copy()
+        df_mes_show["ingresos"] = df_mes_show["ingresos"].apply(lambda x: f"${x:,.2f}")
+        df_mes_show["utilidad"] = df_mes_show["utilidad"].apply(lambda x: f"${x:,.2f}")
+        df_mes_show.columns = ["Mes", "Tickets", "Ingresos", "Utilidad", "Clientes únicos"]
+        st.dataframe(df_mes_show, use_container_width=True, hide_index=True)
+
+    # ---- Ficha individual de cliente ----
+    st.divider()
+    st.markdown("### 🔍 Ficha individual de cliente")
+
+    cliente_buscar = st.selectbox(
+        "Selecciona un cliente",
+        [""] + sorted(df_t["cliente"].unique().tolist()),
+        key="ficha_cliente",
+    )
+
+    if cliente_buscar:
+        df_c_t = df_tickets[df_tickets["cliente"] == cliente_buscar]
+        df_c_p = df_productos[df_productos["cliente"] == cliente_buscar]
+
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        fc1.metric("Tickets", len(df_c_t))
+        fc2.metric("Total gastado", f"${df_c_t['total_final'].sum():,.2f}")
+        fc3.metric("Ticket promedio", f"${df_c_t['total_final'].mean():,.2f}")
+        ult = df_c_t["fecha_dt"].max()
+        dias_ult = (hoy - ult).days if pd.notna(ult) else 0
+        fc4.metric("Hace", f"{dias_ult} días")
+
+        col_hist, col_top = st.columns(2)
+
+        with col_hist:
+            st.markdown("**Histórico de tickets**")
+            df_c_show = df_c_t.sort_values("fecha_dt", ascending=False).head(10)[
+                ["fecha", "num_productos", "total_final", "lleva_envio"]
+            ].copy()
+            df_c_show["total_final"] = df_c_show["total_final"].apply(lambda x: f"${x:,.2f}")
+            df_c_show.columns = ["Fecha", "# Productos", "Total", "Envío"]
+            st.dataframe(df_c_show, use_container_width=True, hide_index=True)
+
+        with col_top:
+            st.markdown("**Productos favoritos**")
+            if not df_c_p.empty:
+                df_c_top = (
+                    df_c_p.groupby("producto")
+                    .agg(veces=("producto", "count"), total_g=("gramos", "sum"))
+                    .reset_index()
+                    .sort_values("veces", ascending=False)
+                    .head(10)
+                )
+                df_c_top["total_kg"] = (df_c_top["total_g"] / 1000).round(2)
+                df_c_top_show = df_c_top[["producto", "veces", "total_kg"]].copy()
+                df_c_top_show.columns = ["Producto", "Veces", "Kg total"]
+                st.dataframe(df_c_top_show, use_container_width=True, hide_index=True)
+
+    # ---- Descargar histórico completo ----
+    st.divider()
+    st.markdown("### 📥 Exportar histórico")
+    col_exp1, col_exp2 = st.columns(2)
+    with col_exp1:
+        st.download_button(
+            "Descargar tickets (CSV)",
+            data=df_tickets.to_csv(index=False).encode("utf-8"),
+            file_name="historico_tickets.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with col_exp2:
+        st.download_button(
+            "Descargar productos (CSV)",
+            data=df_productos.to_csv(index=False).encode("utf-8"),
+            file_name="historico_productos.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
