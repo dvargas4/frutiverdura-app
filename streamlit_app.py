@@ -1984,7 +1984,7 @@ with tab_analisis:
     st.caption("Clientes que solían comprar pero no han vuelto en 30+ días.")
 
     df_riesgo = df_clientes[
-        (df_clientes["dias_sin_comprar"] >= 30)
+        (df_clientes["dias_sin_comprar"] >= 14)
         & (df_clientes["tickets"] >= 2)
     ].sort_values("total_gastado", ascending=False).head(15)
 
