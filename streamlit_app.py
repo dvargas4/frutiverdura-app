@@ -1993,10 +1993,10 @@ with tab_analisis:
     # ---- Clientes que se están perdiendo ----
     st.divider()
     st.markdown("### ⚠️ Clientes en riesgo de pérdida")
-    st.caption("Clientes que solían comprar pero no han vuelto en 30+ días.")
+    st.caption("Clientes que solían comprar pero no han vuelto en 14+ días.")
 
     df_riesgo = df_clientes[
-        (df_clientes["dias_sin_comprar"] >= 30)
+        (df_clientes["dias_sin_comprar"] >= 14)
         & (df_clientes["tickets"] >= 2)
     ].sort_values("total_gastado", ascending=False).head(15)
 
@@ -2031,26 +2031,65 @@ with tab_analisis:
         df_prods_show.columns = ["Producto", "Veces pedido", "Kg vendidos", "Ingresos"]
         st.dataframe(df_prods_show, use_container_width=True, hide_index=True)
 
-    # ---- Tendencia mensual ----
+    # ---- Tendencia (gráfica de línea estilo mercado) ----
     st.divider()
-    st.markdown("### 📅 Tendencia mensual")
+    st.markdown("### 📈 Tendencia")
+
+    col_t1, col_t2 = st.columns([1, 3])
+    with col_t1:
+        granularidad = st.selectbox(
+            "Agrupar por",
+            ["Día", "Semana", "Mes"],
+            index=0,
+            key="granularidad_tendencia",
+        )
+    with col_t2:
+        metricas_sel = st.multiselect(
+            "Métricas a mostrar",
+            ["Ingresos", "Utilidad", "Tickets"],
+            default=["Ingresos", "Utilidad"],
+            key="metricas_tendencia",
+        )
 
     df_t_temp = df_t.copy()
-    df_t_temp["mes"] = df_t_temp["fecha_dt"].dt.to_period("M").astype(str)
-    df_mes = df_t_temp.groupby("mes").agg(
+    if granularidad == "Día":
+        df_t_temp["periodo"] = df_t_temp["fecha_dt"].dt.strftime("%Y-%m-%d")
+    elif granularidad == "Semana":
+        df_t_temp["periodo"] = df_t_temp["fecha_dt"].dt.to_period("W").apply(
+            lambda p: p.start_time.strftime("%Y-%m-%d")
+        )
+    else:  # Mes
+        df_t_temp["periodo"] = df_t_temp["fecha_dt"].dt.to_period("M").astype(str)
+
+    df_tendencia = df_t_temp.groupby("periodo").agg(
         tickets=("cliente", "count"),
         ingresos=("total_final", "sum"),
         utilidad=("utilidad", "sum"),
         clientes_unicos=("cliente", "nunique"),
     ).reset_index()
+    df_tendencia = df_tendencia.sort_values("periodo")
 
-    if len(df_mes) > 0:
-        st.bar_chart(df_mes.set_index("mes")[["ingresos", "utilidad"]])
-        df_mes_show = df_mes.copy()
+    if len(df_tendencia) > 0:
+        # Gráfica de línea (estilo mercado: línea horizontal con variaciones verticales)
+        mapeo_metricas = {"Ingresos": "ingresos", "Utilidad": "utilidad", "Tickets": "tickets"}
+        cols_graficar = [mapeo_metricas[m] for m in metricas_sel if m in mapeo_metricas]
+
+        if cols_graficar:
+            df_chart = df_tendencia.set_index("periodo")[cols_graficar]
+            # Renombrar para que la leyenda salga en español capitalizado
+            renombre = {v: k for k, v in mapeo_metricas.items()}
+            df_chart = df_chart.rename(columns=renombre)
+            st.line_chart(df_chart, height=350)
+        else:
+            st.info("Selecciona al menos una métrica para graficar.")
+
+        # Tabla con los mismos datos
+        df_mes_show = df_tendencia.copy()
         df_mes_show["ingresos"] = df_mes_show["ingresos"].apply(lambda x: f"${x:,.2f}")
         df_mes_show["utilidad"] = df_mes_show["utilidad"].apply(lambda x: f"${x:,.2f}")
-        df_mes_show.columns = ["Mes", "Tickets", "Ingresos", "Utilidad", "Clientes únicos"]
-        st.dataframe(df_mes_show, use_container_width=True, hide_index=True)
+        df_mes_show.columns = ["Período", "Tickets", "Ingresos", "Utilidad", "Clientes únicos"]
+        with st.expander(f"Ver datos por {granularidad.lower()}"):
+            st.dataframe(df_mes_show, use_container_width=True, hide_index=True)
 
     # ---- Ficha individual de cliente ----
     st.divider()
