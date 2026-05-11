@@ -909,6 +909,18 @@ ALIASES_PRODUCTOS = {
     # Churritos / churros
     "churritos": "churros",
     "churrito": "churros",
+    # Limón amarillo (eureka) vs limón verde común
+    "limon amarillo": "limon eureka",
+    "limones amarillos": "limon eureka",
+    "limón amarillo": "limon eureka",
+    "limones amarillos": "limon eureka",
+    "limon eureka": "limon eureka",
+    "eureka": "limon eureka",
+    # Cebolla morada (separada de cebolla blanca)
+    "cebolla morada": "cebolla morada",
+    "cebollas moradas": "cebolla morada",
+    "cebolla blanca": "cebolla blanca",
+    "cebollas blancas": "cebolla blanca",
 }
 
 # Palabras que cuando aparecen indican que el producto viene EN BOLSA o EMPACADO,
@@ -1984,7 +1996,7 @@ with tab_analisis:
     st.caption("Clientes que solían comprar pero no han vuelto en 30+ días.")
 
     df_riesgo = df_clientes[
-        (df_clientes["dias_sin_comprar"] >= 14)
+        (df_clientes["dias_sin_comprar"] >= 30)
         & (df_clientes["tickets"] >= 2)
     ].sort_values("total_gastado", ascending=False).head(15)
 
