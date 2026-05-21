@@ -184,6 +184,7 @@ def _obtener_o_crear_pestaña(spreadsheet, nombre, headers):
 
 def guardar_pedidos_en_historico(pedidos):
     """Apenda los pedidos al histórico en Google Sheets.
+    Si el pedido tiene 'fecha_custom', se usa esa fecha. Si no, usa la fecha actual.
     Devuelve (tickets_guardados, productos_guardados) o (None, error_msg)."""
     if not pedidos:
         return 0, 0
@@ -193,14 +194,17 @@ def guardar_pedidos_en_historico(pedidos):
         ws_tickets = _obtener_o_crear_pestaña(ss, "HISTORICO_TICKETS", HEADERS_TICKETS)
         ws_productos = _obtener_o_crear_pestaña(ss, "HISTORICO_PRODUCTOS", HEADERS_PRODUCTOS)
 
-        fecha = datetime.now(pytz.timezone(ZONA_HORARIA)).strftime("%Y-%m-%d %H:%M")
+        fecha_ahora = datetime.now(pytz.timezone(ZONA_HORARIA)).strftime("%Y-%m-%d %H:%M")
 
         filas_tickets = []
         filas_productos = []
 
         for p in pedidos:
+            # Si el pedido fue marcado con fecha pasada, usar esa. Si no, usar ahora.
+            fecha_p = p.get("fecha_custom", fecha_ahora)
+
             filas_tickets.append([
-                fecha,
+                fecha_p,
                 p["cliente"],
                 p["contacto"],
                 p.get("telefono", ""),
@@ -216,7 +220,7 @@ def guardar_pedidos_en_historico(pedidos):
 
             for nombre, gramos, costo, venta in p["productos"]:
                 filas_productos.append([
-                    fecha,
+                    fecha_p,
                     p["cliente"],
                     p["contacto"],
                     nombre,
@@ -1071,6 +1075,29 @@ with tab_pegar:
         "Si pegas varios clientes, sepáralos con línea en blanco y pon el nombre arriba de cada lista."
     )
 
+    # Selector de fecha del pedido (para registrar pedidos pasados al histórico)
+    col_f1, col_f2 = st.columns([1, 2])
+    with col_f1:
+        opcion_fecha = st.radio(
+            "Fecha del pedido",
+            ["Hoy", "Fecha anterior"],
+            horizontal=True,
+            key="opcion_fecha_pedido",
+        )
+    with col_f2:
+        hoy_mx = datetime.now(pytz.timezone(ZONA_HORARIA)).date()
+        if opcion_fecha == "Fecha anterior":
+            fecha_pedido = st.date_input(
+                "Selecciona la fecha",
+                value=hoy_mx,
+                max_value=hoy_mx,
+                key="fecha_pedido_custom",
+            )
+            st.caption("⚠️ Los tickets se guardarán con esta fecha en el histórico.")
+        else:
+            fecha_pedido = hoy_mx
+            st.caption(f"📅 Usando fecha actual: {hoy_mx.strftime('%d/%m/%Y')}")
+
     # Campos rápidos arriba
     col_n, col_c, col_e = st.columns([2, 1, 1])
     with col_n:
@@ -1420,6 +1447,7 @@ Laura Canales
                         "lleva_envio": ped["lleva_envio"],
                         "descuento": descuento_aplicar,
                         "productos": productos_finales,
+                        "fecha_custom": fecha_pedido.strftime("%Y-%m-%d %H:%M"),
                         **totales,
                     }
                     st.session_state.pedidos.append(pedido)
