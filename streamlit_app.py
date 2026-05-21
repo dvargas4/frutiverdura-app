@@ -925,6 +925,22 @@ ALIASES_PRODUCTOS = {
     "cebollas moradas": "cebolla morada",
     "cebolla blanca": "cebolla blanca",
     "cebollas blancas": "cebolla blanca",
+    # Productos empacados en bolsa (distintos del fresco a granel)
+    "bolsa espinaca": "bolsa espinaca",
+    "bolsa de espinaca": "bolsa espinaca",
+    "bolsas de espinaca": "bolsa espinaca",
+    "espinaca en bolsa": "bolsa espinaca",
+    "espinacas en bolsa": "bolsa espinaca",
+    "bolsa apio": "bolsa apio",
+    "bolsa de apio": "bolsa apio",
+    "bolsas de apio": "bolsa apio",
+    "apio en bolsa": "bolsa apio",
+    "apios en bolsa": "bolsa apio",
+    "bolsa lechuga": "bolsa lechuga",
+    "bolsa de lechuga": "bolsa lechuga",
+    "bolsas de lechuga": "bolsa lechuga",
+    "lechuga en bolsa": "bolsa lechuga",
+    "lechugas en bolsa": "bolsa lechuga",
 }
 
 # Palabras que cuando aparecen indican que el producto viene EN BOLSA o EMPACADO,
@@ -983,16 +999,22 @@ def aplicar_alias(descripcion, catalogo_keys):
 
 def buscar_match_catalogo(descripcion, catalogo_keys, umbral=0.4):
     """Busca el mejor match. Prioriza coincidencia de la PRIMERA palabra significativa.
-    Si la descripción menciona 'en bolsa', 'empacado', etc., NO retorna match
-    automático (el usuario debe decidir si es producto nuevo o cuál mapear)."""
-    # Si menciona empaque, no asignar alias ni match automático: forzar revisión manual
-    if tiene_indicador_empaque(descripcion):
-        return None
 
-    # 0. Primero intentar con aliases manuales
+    Orden de prioridad:
+    1. Aliases manuales (incluyendo aliases específicos para productos en bolsa
+       como 'bolsa espinaca', 'bolsa apio', etc.)
+    2. Si hay indicador de empaque ('en bolsa', 'empacado') y NO había alias
+       específico, retorna None para forzar revisión manual.
+    3. Matching general por palabras y difflib.
+    """
+    # 1. PRIMERO: intentar aliases manuales (incluyendo "bolsa espinaca" etc.)
     alias_match = aplicar_alias(descripcion, catalogo_keys)
     if alias_match:
         return alias_match
+
+    # 2. Si menciona empaque pero no había alias específico, forzar revisión manual
+    if tiene_indicador_empaque(descripcion):
+        return None
 
     desc = descripcion.lower().strip()
     desc = re.sub(r"^[\d\.\,/]+\s*(kg|kilo|kilos|k|gr|gramos|g|pz|pza|piezas|pieza|domo|domos|cabeza|manojo|ramo|ramos|penca|cartón|cartones|carton|bolsa|de)\s*", "", desc)
