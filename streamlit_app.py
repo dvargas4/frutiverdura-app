@@ -2144,126 +2144,93 @@ with tab_analisis:
     st.divider()
     st.markdown("### 💵 Evolución de costos por producto")
     st.caption(
-        "Cómo ha cambiado el costo por kilo de cada producto en el tiempo. "
-        "Útil para detectar productos que se encarecieron y revisar precios de venta."
+        "Una sola línea con el promedio de costo por kilo en el tiempo. "
+        "Selecciona un producto específico para ver solo su evolución."
     )
 
     if df_p.empty:
         st.info("No hay datos de productos suficientes para graficar costos.")
     else:
-        # Calcular costo por kg: costo / (gramos / 1000)
+        # Calcular costo y venta por kg
         df_costos = df_p.copy()
         df_costos = df_costos[df_costos["gramos"] > 0].copy()
         df_costos["costo_por_kg"] = df_costos["costo"] / (df_costos["gramos"] / 1000)
         df_costos["venta_por_kg"] = df_costos["venta"] / (df_costos["gramos"] / 1000)
         df_costos["fecha_dia"] = df_costos["fecha_dt"].dt.date
 
-        col_modo, col_filtro = st.columns([1, 2])
-        with col_modo:
-            modo_costos = st.radio(
-                "Vista",
-                ["General (varios productos)", "Particular (un producto)"],
-                key="modo_costos",
-            )
+        productos_disponibles = sorted(df_costos["producto"].unique().tolist())
+        producto_filtro = st.selectbox(
+            "Producto",
+            ["📊 Todos (promedio general)"] + productos_disponibles,
+            key="producto_costo_filtro",
+        )
 
-        if modo_costos == "General (varios productos)":
-            # Top N productos por veces pedido para no saturar la gráfica
-            productos_disponibles = (
-                df_costos["producto"].value_counts().index.tolist()
-            )
-            with col_filtro:
-                productos_grafica = st.multiselect(
-                    "Productos a comparar (máx. 8 recomendado)",
-                    productos_disponibles,
-                    default=productos_disponibles[:5],
-                    key="productos_grafica_general",
-                )
+        if producto_filtro == "📊 Todos (promedio general)":
+            # DOS líneas: costo promedio y venta promedio por día
+            df_general = df_costos.groupby("fecha_dia").agg(
+                costo_promedio=("costo_por_kg", "mean"),
+                venta_promedio=("venta_por_kg", "mean"),
+            ).reset_index()
+            df_general = df_general.set_index("fecha_dia").sort_index()
+            df_general.columns = ["Costo por kg (nosotros)", "Precio venta por kg"]
+            st.line_chart(df_general, height=400)
 
-            if productos_grafica:
-                # Promedio de costo por kg por día y por producto
-                df_filtrado = df_costos[df_costos["producto"].isin(productos_grafica)]
-                df_pivot = df_filtrado.groupby(
-                    ["fecha_dia", "producto"]
-                )["costo_por_kg"].mean().reset_index()
-                df_pivot_wide = df_pivot.pivot(
-                    index="fecha_dia", columns="producto", values="costo_por_kg"
-                ).sort_index()
-                st.line_chart(df_pivot_wide, height=400)
+            # KPIs generales con costo y venta
+            costo_prom = df_costos["costo_por_kg"].mean()
+            venta_prom = df_costos["venta_por_kg"].mean()
+            margen_gral = ((venta_prom - costo_prom) / costo_prom * 100) if costo_prom > 0 else 0
 
-                # Tabla resumen: costo mínimo, máximo, promedio y último
-                resumen_rows = []
-                for prod in productos_grafica:
-                    df_pp = df_costos[df_costos["producto"] == prod].sort_values("fecha_dt")
-                    if df_pp.empty:
-                        continue
-                    ultimo = df_pp.iloc[-1]
-                    primero = df_pp.iloc[0]
-                    cambio_pct = (
-                        (ultimo["costo_por_kg"] - primero["costo_por_kg"])
-                        / primero["costo_por_kg"] * 100
-                    ) if primero["costo_por_kg"] > 0 else 0
-                    resumen_rows.append({
-                        "Producto": prod.title(),
-                        "Costo mín": f"${df_pp['costo_por_kg'].min():,.2f}/kg",
-                        "Costo máx": f"${df_pp['costo_por_kg'].max():,.2f}/kg",
-                        "Promedio": f"${df_pp['costo_por_kg'].mean():,.2f}/kg",
-                        "Último": f"${ultimo['costo_por_kg']:,.2f}/kg",
-                        "Δ vs primero": f"{cambio_pct:+.1f}%",
-                    })
-                if resumen_rows:
-                    st.markdown("**Resumen estadístico por producto**")
-                    st.dataframe(pd.DataFrame(resumen_rows), use_container_width=True, hide_index=True)
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Productos distintos", len(productos_disponibles))
+            k2.metric("Costo promedio", f"${costo_prom:,.2f}/kg")
+            k3.metric("Venta promedio", f"${venta_prom:,.2f}/kg")
+            k4.metric("Margen promedio", f"{margen_gral:.1f}%")
+
+        else:
+            # Solo la línea del producto seleccionado: costo y venta
+            df_pp = df_costos[df_costos["producto"] == producto_filtro].sort_values("fecha_dt")
+
+            if df_pp.empty:
+                st.warning("No hay datos para este producto.")
             else:
-                st.info("Selecciona al menos un producto.")
+                df_grafica = df_pp.groupby("fecha_dia").agg(
+                    costo_kg=("costo_por_kg", "mean"),
+                    venta_kg=("venta_por_kg", "mean"),
+                ).reset_index()
+                df_grafica = df_grafica.set_index("fecha_dia").sort_index()
+                df_grafica.columns = [
+                    f"Costo {producto_filtro.title()} (nosotros)",
+                    f"Precio venta {producto_filtro.title()}",
+                ]
+                st.line_chart(df_grafica, height=400)
 
-        else:  # Particular
-            productos_disponibles = sorted(df_costos["producto"].unique().tolist())
-            with col_filtro:
-                producto_unico = st.selectbox(
-                    "Producto",
-                    [""] + productos_disponibles,
-                    key="producto_unico_costo",
-                )
+                # KPIs del producto
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Veces vendido", len(df_pp))
+                k2.metric("Total kg", f"{df_pp['gramos'].sum() / 1000:.2f} kg")
+                margen_prom = (
+                    (df_pp["venta_por_kg"].mean() - df_pp["costo_por_kg"].mean())
+                    / df_pp["costo_por_kg"].mean() * 100
+                ) if df_pp["costo_por_kg"].mean() > 0 else 0
+                k3.metric("Margen promedio", f"{margen_prom:.1f}%")
+                cambio = (
+                    (df_pp.iloc[-1]["costo_por_kg"] - df_pp.iloc[0]["costo_por_kg"])
+                    / df_pp.iloc[0]["costo_por_kg"] * 100
+                ) if df_pp.iloc[0]["costo_por_kg"] > 0 else 0
+                k4.metric("Δ costo", f"{cambio:+.1f}%")
 
-            if producto_unico:
-                df_pp = df_costos[df_costos["producto"] == producto_unico].sort_values("fecha_dt")
+                # Línea adicional: costo y venta promedio
+                k5, k6 = st.columns(2)
+                k5.metric("Costo promedio", f"${df_pp['costo_por_kg'].mean():,.2f}/kg")
+                k6.metric("Venta promedio", f"${df_pp['venta_por_kg'].mean():,.2f}/kg")
 
-                if df_pp.empty:
-                    st.warning("No hay datos para este producto.")
-                else:
-                    # Gráfica con costo Y venta por kg para comparar margen
-                    df_grafica = df_pp.groupby("fecha_dia").agg(
-                        costo_kg=("costo_por_kg", "mean"),
-                        venta_kg=("venta_por_kg", "mean"),
-                    ).reset_index()
-                    df_grafica = df_grafica.set_index("fecha_dia").sort_index()
-                    df_grafica.columns = ["Costo por kg", "Venta por kg"]
-                    st.line_chart(df_grafica, height=400)
-
-                    # KPIs del producto
-                    k1, k2, k3, k4 = st.columns(4)
-                    k1.metric("Veces vendido", len(df_pp))
-                    k2.metric("Total kg", f"{df_pp['gramos'].sum() / 1000:.2f} kg")
-                    margen_prom = (
-                        (df_pp["venta_por_kg"].mean() - df_pp["costo_por_kg"].mean())
-                        / df_pp["costo_por_kg"].mean() * 100
-                    ) if df_pp["costo_por_kg"].mean() > 0 else 0
-                    k3.metric("Margen promedio", f"{margen_prom:.1f}%")
-                    cambio = (
-                        (df_pp.iloc[-1]["costo_por_kg"] - df_pp.iloc[0]["costo_por_kg"])
-                        / df_pp.iloc[0]["costo_por_kg"] * 100
-                    ) if df_pp.iloc[0]["costo_por_kg"] > 0 else 0
-                    k4.metric("Δ costo", f"{cambio:+.1f}%")
-
-                    # Tabla histórica
-                    with st.expander("Historial detallado"):
-                        df_hist = df_pp[["fecha", "cliente", "gramos", "costo", "venta", "costo_por_kg", "venta_por_kg"]].copy()
-                        df_hist.columns = ["Fecha", "Cliente", "Gramos", "Costo total", "Venta total", "Costo/kg", "Venta/kg"]
-                        for col in ["Costo total", "Venta total", "Costo/kg", "Venta/kg"]:
-                            df_hist[col] = df_hist[col].apply(lambda x: f"${x:,.2f}")
-                        st.dataframe(df_hist, use_container_width=True, hide_index=True)
-            else:
-                st.info("Selecciona un producto para ver su evolución.")
+                # Tabla histórica
+                with st.expander("Historial detallado"):
+                    df_hist = df_pp[["fecha", "cliente", "gramos", "costo", "venta", "costo_por_kg", "venta_por_kg"]].copy()
+                    df_hist.columns = ["Fecha", "Cliente", "Gramos", "Costo total", "Venta total", "Costo/kg", "Venta/kg"]
+                    for col in ["Costo total", "Venta total", "Costo/kg", "Venta/kg"]:
+                        df_hist[col] = df_hist[col].apply(lambda x: f"${x:,.2f}")
+                    st.dataframe(df_hist, use_container_width=True, hide_index=True)
 
     # ---- Tendencia (gráfica de línea estilo mercado) ----
     st.divider()
