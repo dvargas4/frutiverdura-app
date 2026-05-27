@@ -873,6 +873,12 @@ ALIASES_PRODUCTOS = {
     "jitomate bola": "jitomate bola",
     "jitomates bola": "jitomate bola",
     "jito bola": "jitomate bola",
+    "jitomate cherry": "jitomate cherry",
+    "jitomates cherry": "jitomate cherry",
+    "jito cherry": "jitomate cherry",
+    "cherry": "jitomate cherry",
+    "cherrys": "jitomate cherry",
+    "cherries": "jitomate cherry",
     "jitomate saladet": "jitomate saladet",
     "jitomates saladet": "jitomate saladet",
     "jito saladet": "jitomate saladet",
@@ -968,6 +974,38 @@ def tiene_indicador_empaque(descripcion):
     return any(ind in desc for ind in INDICADORES_EMPAQUE)
 
 
+# Productos base que tienen una versión "bolsa <producto>" en el catálogo.
+# Si la descripción contiene "bolsa" Y uno de estos productos (en cualquier orden,
+# por ejemplo "espinaca bolsa", "1 bolsa espinaca", "2 bolsas de apio", "apio en bolsa"),
+# se mapea a "bolsa <producto>".
+PRODUCTOS_CON_VERSION_BOLSA = ["espinaca", "apio", "lechuga"]
+
+
+def detectar_bolsa_flexible(descripcion, catalogo_keys):
+    """Si la descripción contiene la palabra 'bolsa' (o variantes) Y alguno de los
+    productos base, devuelve 'bolsa <producto>' si está en el catálogo.
+    Detecta cualquier orden: 'bolsa espinaca', 'espinaca bolsa', 'espinaca en bolsa',
+    'bolsa de espinaca', '2 bolsas de apio', etc."""
+    desc = descripcion.lower()
+    # Buscar palabras tipo "bolsa", "bolsas", "bolsita", "bolsitas"
+    palabras = desc.split()
+    tiene_bolsa = any(
+        p.rstrip(".,;:").startswith("bolsa") or p.rstrip(".,;:").startswith("bolsit")
+        for p in palabras
+    )
+    if not tiene_bolsa:
+        return None
+
+    # Buscar si alguno de los productos base aparece en la descripción
+    for base in PRODUCTOS_CON_VERSION_BOLSA:
+        # Aceptar singular y plural simple
+        if base in desc or (base + "s") in desc:
+            target = f"bolsa {base}"
+            if target in catalogo_keys:
+                return target
+
+    return None
+
 
 def aplicar_alias(descripcion, catalogo_keys):
     """Si la descripción contiene un alias, devuelve el match directo.
@@ -1001,18 +1039,22 @@ def buscar_match_catalogo(descripcion, catalogo_keys, umbral=0.4):
     """Busca el mejor match. Prioriza coincidencia de la PRIMERA palabra significativa.
 
     Orden de prioridad:
-    1. Aliases manuales (incluyendo aliases específicos para productos en bolsa
-       como 'bolsa espinaca', 'bolsa apio', etc.)
-    2. Si hay indicador de empaque ('en bolsa', 'empacado') y NO había alias
-       específico, retorna None para forzar revisión manual.
-    3. Matching general por palabras y difflib.
+    1. Detección flexible de "bolsa" (espinaca/apio/lechuga en cualquier orden).
+    2. Aliases manuales.
+    3. Si hay indicador de empaque sin match específico, retorna None.
+    4. Matching general por palabras y difflib.
     """
-    # 1. PRIMERO: intentar aliases manuales (incluyendo "bolsa espinaca" etc.)
+    # 1. PRIORIDAD: detectar "bolsa" + producto base en cualquier orden
+    bolsa_match = detectar_bolsa_flexible(descripcion, catalogo_keys)
+    if bolsa_match:
+        return bolsa_match
+
+    # 2. Intentar aliases manuales
     alias_match = aplicar_alias(descripcion, catalogo_keys)
     if alias_match:
         return alias_match
 
-    # 2. Si menciona empaque pero no había alias específico, forzar revisión manual
+    # 3. Si menciona empaque pero no había match específico, forzar revisión manual
     if tiene_indicador_empaque(descripcion):
         return None
 
@@ -1521,6 +1563,23 @@ with tab_modificar:
 
         with col_edit:
             st.markdown("**Acciones**")
+
+            # Cambiar contacto asignado
+            contactos_list = list(CONTACTOS.keys())
+            idx_contacto_actual = (
+                contactos_list.index(pedido["contacto"])
+                if pedido["contacto"] in contactos_list else 0
+            )
+            nuevo_contacto = st.selectbox(
+                "Contacto asignado",
+                contactos_list,
+                index=idx_contacto_actual,
+                key=f"contacto_mod_{idx_sel}",
+            )
+            if nuevo_contacto != pedido["contacto"]:
+                pedido["contacto"] = nuevo_contacto
+                pedido["telefono"] = CONTACTOS[nuevo_contacto]
+                st.rerun()
 
             # Cambiar envío
             nuevo_envio = st.checkbox(
@@ -2080,6 +2139,131 @@ with tab_analisis:
         df_prods_show["ingresos"] = df_prods_show["ingresos"].apply(lambda x: f"${x:,.2f}")
         df_prods_show.columns = ["Producto", "Veces pedido", "Kg vendidos", "Ingresos"]
         st.dataframe(df_prods_show, use_container_width=True, hide_index=True)
+
+    # ---- Evolución de costos de productos ----
+    st.divider()
+    st.markdown("### 💵 Evolución de costos por producto")
+    st.caption(
+        "Cómo ha cambiado el costo por kilo de cada producto en el tiempo. "
+        "Útil para detectar productos que se encarecieron y revisar precios de venta."
+    )
+
+    if df_p.empty:
+        st.info("No hay datos de productos suficientes para graficar costos.")
+    else:
+        # Calcular costo por kg: costo / (gramos / 1000)
+        df_costos = df_p.copy()
+        df_costos = df_costos[df_costos["gramos"] > 0].copy()
+        df_costos["costo_por_kg"] = df_costos["costo"] / (df_costos["gramos"] / 1000)
+        df_costos["venta_por_kg"] = df_costos["venta"] / (df_costos["gramos"] / 1000)
+        df_costos["fecha_dia"] = df_costos["fecha_dt"].dt.date
+
+        col_modo, col_filtro = st.columns([1, 2])
+        with col_modo:
+            modo_costos = st.radio(
+                "Vista",
+                ["General (varios productos)", "Particular (un producto)"],
+                key="modo_costos",
+            )
+
+        if modo_costos == "General (varios productos)":
+            # Top N productos por veces pedido para no saturar la gráfica
+            productos_disponibles = (
+                df_costos["producto"].value_counts().index.tolist()
+            )
+            with col_filtro:
+                productos_grafica = st.multiselect(
+                    "Productos a comparar (máx. 8 recomendado)",
+                    productos_disponibles,
+                    default=productos_disponibles[:5],
+                    key="productos_grafica_general",
+                )
+
+            if productos_grafica:
+                # Promedio de costo por kg por día y por producto
+                df_filtrado = df_costos[df_costos["producto"].isin(productos_grafica)]
+                df_pivot = df_filtrado.groupby(
+                    ["fecha_dia", "producto"]
+                )["costo_por_kg"].mean().reset_index()
+                df_pivot_wide = df_pivot.pivot(
+                    index="fecha_dia", columns="producto", values="costo_por_kg"
+                ).sort_index()
+                st.line_chart(df_pivot_wide, height=400)
+
+                # Tabla resumen: costo mínimo, máximo, promedio y último
+                resumen_rows = []
+                for prod in productos_grafica:
+                    df_pp = df_costos[df_costos["producto"] == prod].sort_values("fecha_dt")
+                    if df_pp.empty:
+                        continue
+                    ultimo = df_pp.iloc[-1]
+                    primero = df_pp.iloc[0]
+                    cambio_pct = (
+                        (ultimo["costo_por_kg"] - primero["costo_por_kg"])
+                        / primero["costo_por_kg"] * 100
+                    ) if primero["costo_por_kg"] > 0 else 0
+                    resumen_rows.append({
+                        "Producto": prod.title(),
+                        "Costo mín": f"${df_pp['costo_por_kg'].min():,.2f}/kg",
+                        "Costo máx": f"${df_pp['costo_por_kg'].max():,.2f}/kg",
+                        "Promedio": f"${df_pp['costo_por_kg'].mean():,.2f}/kg",
+                        "Último": f"${ultimo['costo_por_kg']:,.2f}/kg",
+                        "Δ vs primero": f"{cambio_pct:+.1f}%",
+                    })
+                if resumen_rows:
+                    st.markdown("**Resumen estadístico por producto**")
+                    st.dataframe(pd.DataFrame(resumen_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("Selecciona al menos un producto.")
+
+        else:  # Particular
+            productos_disponibles = sorted(df_costos["producto"].unique().tolist())
+            with col_filtro:
+                producto_unico = st.selectbox(
+                    "Producto",
+                    [""] + productos_disponibles,
+                    key="producto_unico_costo",
+                )
+
+            if producto_unico:
+                df_pp = df_costos[df_costos["producto"] == producto_unico].sort_values("fecha_dt")
+
+                if df_pp.empty:
+                    st.warning("No hay datos para este producto.")
+                else:
+                    # Gráfica con costo Y venta por kg para comparar margen
+                    df_grafica = df_pp.groupby("fecha_dia").agg(
+                        costo_kg=("costo_por_kg", "mean"),
+                        venta_kg=("venta_por_kg", "mean"),
+                    ).reset_index()
+                    df_grafica = df_grafica.set_index("fecha_dia").sort_index()
+                    df_grafica.columns = ["Costo por kg", "Venta por kg"]
+                    st.line_chart(df_grafica, height=400)
+
+                    # KPIs del producto
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("Veces vendido", len(df_pp))
+                    k2.metric("Total kg", f"{df_pp['gramos'].sum() / 1000:.2f} kg")
+                    margen_prom = (
+                        (df_pp["venta_por_kg"].mean() - df_pp["costo_por_kg"].mean())
+                        / df_pp["costo_por_kg"].mean() * 100
+                    ) if df_pp["costo_por_kg"].mean() > 0 else 0
+                    k3.metric("Margen promedio", f"{margen_prom:.1f}%")
+                    cambio = (
+                        (df_pp.iloc[-1]["costo_por_kg"] - df_pp.iloc[0]["costo_por_kg"])
+                        / df_pp.iloc[0]["costo_por_kg"] * 100
+                    ) if df_pp.iloc[0]["costo_por_kg"] > 0 else 0
+                    k4.metric("Δ costo", f"{cambio:+.1f}%")
+
+                    # Tabla histórica
+                    with st.expander("Historial detallado"):
+                        df_hist = df_pp[["fecha", "cliente", "gramos", "costo", "venta", "costo_por_kg", "venta_por_kg"]].copy()
+                        df_hist.columns = ["Fecha", "Cliente", "Gramos", "Costo total", "Venta total", "Costo/kg", "Venta/kg"]
+                        for col in ["Costo total", "Venta total", "Costo/kg", "Venta/kg"]:
+                            df_hist[col] = df_hist[col].apply(lambda x: f"${x:,.2f}")
+                        st.dataframe(df_hist, use_container_width=True, hide_index=True)
+            else:
+                st.info("Selecciona un producto para ver su evolución.")
 
     # ---- Tendencia (gráfica de línea estilo mercado) ----
     st.divider()
