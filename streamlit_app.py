@@ -3391,7 +3391,7 @@ with tab_catalogo:
                 "Escribe para buscar...",
                 opciones_busqueda,
                 format_func=lambda x: (
-                    f"{(emoji_para_producto(x) + ' ') if emoji_para_producto(x) else ''}{x.title()} (${limpiar_valor(st.session_state.precios_dict[x]):.2f}/kg)"
+                    f"{(emoji_para_producto(x) + ' ') if emoji_para_producto(x) else ''}{x.title()} (${st.session_state.precios_dict[x]['precio_venta_kg']:.2f}/kg)"
                     if x else "Selecciona un producto..."
                 ),
                 key="busqueda_producto",
@@ -3419,7 +3419,7 @@ with tab_catalogo:
             seleccionados_ordenados = sorted(st.session_state.catalogo_seleccionados.keys())
 
             for prod in seleccionados_ordenados:
-                precio_kg = limpiar_valor(st.session_state.precios_dict[prod])
+                precio_kg = st.session_state.precios_dict[prod]["precio_venta_kg"]
                 unidad_actual = st.session_state.catalogo_seleccionados[prod]
                 factor = {"1/4 kg": 0.25, "1/2 kg": 0.5, "1 kg": 1.0}[unidad_actual]
                 precio_final = precio_kg * factor
@@ -3454,7 +3454,7 @@ with tab_catalogo:
         for prod in sorted(st.session_state.catalogo_seleccionados.keys()):
             unidad = st.session_state.catalogo_seleccionados[prod]
             factor = {"1/4 kg": 0.25, "1/2 kg": 0.5, "1 kg": 1.0}[unidad]
-            precio_final = limpiar_valor(st.session_state.precios_dict[prod]) * factor
+            precio_final = st.session_state.precios_dict[prod]["precio_venta_kg"] * factor
             productos_incluidos.append({
                 "nombre": prod,
                 "unidad": unidad,
