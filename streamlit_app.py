@@ -3016,7 +3016,7 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
 
         # ---- Footer ----
         fecha_gen = datetime.now(pytz.timezone(ZONA_HORARIA)).strftime("%d/%m/%Y")
-        footer_txt = f"Catálogo válido para entrega del {dia_entrega} · Generado {fecha_gen}"
+        footer_txt = f"Catálogo válido para entrega del {dia_entrega.lower()} · Generado {fecha_gen}"
         bbox = draw.textbbox((0, 0), footer_txt, font=f_footer)
         tw = bbox[2] - bbox[0]
         draw.text(((ancho - tw) // 2, alto - 30), footer_txt, fill=GRIS, font=f_footer)
@@ -3043,18 +3043,13 @@ with tab_catalogo:
                 key="cat_contacto",
             )
         with col_c2:
-            hoy_mx = datetime.now(pytz.timezone(ZONA_HORARIA)).date()
-            dia_entrega_date = st.date_input(
+            DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+            dia_entrega_str = st.selectbox(
                 "Día de entrega",
-                value=hoy_mx,
+                DIAS_SEMANA,
+                index=5,  # Sábado por default
                 key="cat_dia_entrega",
             )
-
-        # Formateo bonito del día (ej: "Sábado 25 de abril")
-        DIAS_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-        MESES_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
-                    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
-        dia_entrega_str = f"{DIAS_ES[dia_entrega_date.weekday()]} {dia_entrega_date.day} de {MESES_ES[dia_entrega_date.month - 1]}"
 
         st.markdown("### 💬 Frase del catálogo")
         st.caption("Elige una categoría para ver opciones de frase, o escribe la tuya.")
@@ -3223,7 +3218,7 @@ with tab_catalogo:
                         st.download_button(
                             "🖼️ Descargar PNG",
                             data=png_buf.getvalue(),
-                            file_name=f"catalogo_{dia_entrega_date.strftime('%Y-%m-%d')}.png",
+                            file_name=f"catalogo_{dia_entrega_str.lower()}_{datetime.now(pytz.timezone(ZONA_HORARIA)).strftime('%Y%m%d')}.png",
                             mime="image/png",
                             use_container_width=True,
                         )
@@ -3238,7 +3233,7 @@ with tab_catalogo:
                         st.download_button(
                             "🖼️ Descargar PNGs (ZIP)",
                             data=zip_buf.getvalue(),
-                            file_name=f"catalogo_{dia_entrega_date.strftime('%Y-%m-%d')}.zip",
+                            file_name=f"catalogo_{dia_entrega_str.lower()}_{datetime.now(pytz.timezone(ZONA_HORARIA)).strftime('%Y%m%d')}.zip",
                             mime="application/zip",
                             use_container_width=True,
                         )
@@ -3257,7 +3252,7 @@ with tab_catalogo:
                     st.download_button(
                         "📄 Descargar PDF",
                         data=pdf_buf.getvalue(),
-                        file_name=f"catalogo_{dia_entrega_date.strftime('%Y-%m-%d')}.pdf",
+                        file_name=f"catalogo_{dia_entrega_str.lower()}_{datetime.now(pytz.timezone(ZONA_HORARIA)).strftime('%Y%m%d')}.pdf",
                         mime="application/pdf",
                         use_container_width=True,
                     )
