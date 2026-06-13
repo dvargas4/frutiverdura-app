@@ -3131,7 +3131,7 @@ with tab_catalogo:
         productos_ordenados = sorted(st.session_state.precios_dict.keys())
 
         for prod in productos_ordenados:
-            precio_kg = st.session_state.precios_dict[prod]
+            precio_kg = limpiar_valor(st.session_state.precios_dict[prod])
             estado_prev = st.session_state.catalogo_productos_state.get(prod, {})
             incluido_prev = estado_prev.get("incluido", False)
             unidad_prev = estado_prev.get("unidad", "1 kg")
@@ -3171,7 +3171,7 @@ with tab_catalogo:
             if estado.get("incluido", False):
                 unidad = estado.get("unidad", "1 kg")
                 factor = {"1/4 kg": 0.25, "1/2 kg": 0.5, "1 kg": 1.0}[unidad]
-                precio_final = st.session_state.precios_dict[prod] * factor
+                precio_final = limpiar_valor(st.session_state.precios_dict[prod]) * factor
                 productos_incluidos.append({
                     "nombre": prod,
                     "unidad": unidad,
