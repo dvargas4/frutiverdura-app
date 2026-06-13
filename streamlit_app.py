@@ -2818,38 +2818,65 @@ def detectar_unidad_producto(nombre):
 
     Returns:
         (etiqueta_unidad, admite_fracciones)
-        - etiqueta_unidad: str para mostrar (ej. "Kg", "Pieza", "Bolsa", "Lt", "Manojo")
-        - admite_fracciones: True si se puede vender en 1/4, 1/2 o 1; False si es unidad fija
     """
     n = nombre.lower()
 
-    # Litros / mililitros
+    # 1. Aceites siempre por Lt (aunque no diga "lt" en el nombre)
+    if "aceite" in n:
+        return ("Lt", False)
+
+    # 2. Berries pequeños se venden por canastilla de 170g
+    if any(re.search(rf"\b{k}\b", n) for k in [
+        "frambuesa", "frambuesas", "zarzamora", "zarzamoras",
+        "blueberry", "blueberries", "blue berry", "blue berries",
+        "mora azul", "moras azules", "arándano", "arandano",
+        "arándanos", "arandanos"
+    ]):
+        return ("170g", False)
+
+    # 3. Litros / mililitros explícitos
     if any(re.search(rf"\b{k}\b", n) for k in ["lt", "litro", "litros", "ml"]):
         return ("Lt", False)
-    # También detectar "Xlt" o "Xml" (número pegado)
     if re.search(r"\d+\s*(lt|ml|litro|litros)", n):
         return ("Lt", False)
 
-    # Productos en bolsa (la bolsa es unidad fija)
+    # 4. Productos en bolsa (la bolsa es unidad fija)
     if "bolsa" in n or "bolsit" in n:
         return ("Bolsa", False)
 
-    # Productos en lata / frasco
+    # 5. Productos en lata / frasco
     if any(re.search(rf"\b{k}\b", n) for k in ["lata", "latas", "frasco", "frascos"]):
         return ("Pieza", False)
 
-    # Domo (berries usualmente)
+    # 6. Domo (otros berries / fresas en canastilla)
     if any(re.search(rf"\b{k}\b", n) for k in ["domo", "domos", "domito", "domitos"]):
         return ("Domo", False)
 
-    # Productos que claramente son por pieza (palabra explícita)
+    # 7. Productos que claramente son por pieza
     if any(re.search(rf"\b{k}\b", n) for k in ["pieza", "piezas", "pza", "pzas",
                                                  "unidad", "unidades"]):
         return ("Pieza", False)
 
     # Default: kg con fracciones permitidas
-    # (huevo, ajo, cilantro, perejil, manojos, cabezas, pencas, cartones se venden por peso)
     return ("Kg", True)
+
+
+def unidad_default_producto(nombre):
+    """Devuelve la unidad por default que debería tener un producto al ser agregado al catálogo.
+    Por ejemplo, fresas por 1/2 kg por default, berries por 170g, aceites por Lt, etc."""
+    n = nombre.lower()
+
+    # Fresas por 1/2 kg por default
+    if "fresa" in n:
+        return "1/2 kg"
+
+    etiq, admite_frac = detectar_unidad_producto(nombre)
+    if admite_frac:
+        return "1 kg"
+    # Si la etiqueta ya contiene cantidad (ej "170g"), usarla tal cual sin "1 "
+    if etiq[0].isdigit():
+        return etiq
+    return f"1 {etiq.lower()}"
 
 
 def categorizar_producto(nombre):
@@ -3046,48 +3073,26 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
         filas_disponibles = alto_disponible // alto_fila
         prods_por_pagina = filas_disponibles - 5
 
-    # Construir páginas: distribuir respetando categorías
-    paginas = []
-    pagina_actual = []  # lista de tuples (tipo, contenido) donde tipo es 'cat' o 'prod'
-    items_en_pagina = 0
-    max_por_pagina = prods_por_pagina if prods_por_pagina > 0 else 20
-
+    # Una sola imagen larga: meter todos los productos en una sola "página"
+    items_unica_pagina = []
     for cat in categorias_orden:
-        prods_cat = productos_por_cat[cat]
-        # Si la categoría no cabe completa, igual la metemos hasta donde alcance
-        if items_en_pagina + 2 > max_por_pagina and pagina_actual:
-            paginas.append(pagina_actual)
-            pagina_actual = []
-            items_en_pagina = 0
+        items_unica_pagina.append(("cat", cat))
+        for p in productos_por_cat[cat]:
+            items_unica_pagina.append(("prod", p))
 
-        pagina_actual.append(("cat", cat))
-        items_en_pagina += 2  # el separador cuenta como ~2 productos visualmente
-
-        for p in prods_cat:
-            if items_en_pagina >= max_por_pagina and pagina_actual:
-                paginas.append(pagina_actual)
-                pagina_actual = [("cat", cat + " (cont.)")]  # repetir categoría
-                items_en_pagina = 2
-            pagina_actual.append(("prod", p))
-            items_en_pagina += 1
-
-    if pagina_actual:
-        paginas.append(pagina_actual)
-
-    if not paginas:
-        paginas = [[]]
+    paginas = [items_unica_pagina] if items_unica_pagina else [[]]
 
     imagenes = []
     DIAS_MAYUS = dia_entrega.upper()
 
     for idx_pag, items_pagina in enumerate(paginas):
-        # Calcular altura de página
-        es_ultima = (idx_pag == len(paginas) - 1)
+        # Calcular altura: como es UNA sola imagen larga, el alto depende del contenido total
+        es_ultima = True  # siempre es última: solo hay una
         h_productos = sum(
             alto_separador_cat if t == "cat" else alto_fila
             for t, _ in items_pagina
         )
-        alto = header_h + espacio_top_lista + h_productos + 40 + (bloque_envio_h if es_ultima else 0) + footer_h
+        alto = header_h + espacio_top_lista + h_productos + 60 + bloque_envio_h + footer_h
         if alto < 1200:
             alto = 1200
 
@@ -3168,9 +3173,12 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
                         elif unidad_raw == "1/2 kg":
                             precio_completo = f"{precio_txt} ½ Kg"
                         elif unidad_raw.startswith("1 "):
-                            # ej "1 bolsa", "1 lt", "1 manojo" -> "Bolsa", "Lt", "Manojo"
+                            # ej "1 bolsa", "1 lt" -> "Bolsa", "Lt"
                             etiq = unidad_raw[2:].capitalize()
                             precio_completo = f"{precio_txt} {etiq}"
+                        elif unidad_raw and unidad_raw[0].isdigit():
+                            # ej "170g" -> tal cual
+                            precio_completo = f"{precio_txt} {unidad_raw}"
                         else:
                             precio_completo = f"{precio_txt} {unidad_raw}"
 
@@ -3221,6 +3229,8 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
                     elif unidad_raw.startswith("1 "):
                         etiq = unidad_raw[2:].capitalize()
                         precio_completo = f"{precio_txt} {etiq}"
+                    elif unidad_raw and unidad_raw[0].isdigit():
+                        precio_completo = f"{precio_txt} {unidad_raw}"
                     else:
                         precio_completo = f"{precio_txt} {unidad_raw}"
 
@@ -3421,14 +3431,10 @@ with tab_catalogo:
         col_b1, col_b2, col_b3 = st.columns([1.5, 1.5, 1])
         with col_b1:
             if st.button("✅ Seleccionar TODO el catálogo", use_container_width=True, type="primary"):
-                # Llenar el dict respetando el tipo de unidad de cada producto
+                # Llenar el dict respetando el tipo y unidad por default de cada producto
                 nuevo_sel = {}
                 for prod in productos_ordenados:
-                    etiq, admite_frac = detectar_unidad_producto(prod)
-                    if admite_frac:
-                        nuevo_sel[prod] = "1 kg"
-                    else:
-                        nuevo_sel[prod] = f"1 {etiq.lower()}"
+                    nuevo_sel[prod] = unidad_default_producto(prod)
                 st.session_state.catalogo_seleccionados = nuevo_sel
                 st.rerun()
         with col_b2:
@@ -3465,19 +3471,28 @@ with tab_catalogo:
                 _, admite_frac = detectar_unidad_producto(producto_a_agregar)
 
             if admite_frac:
+                # Para productos que admiten fracciones, usar el default del producto (ej fresa = 1/2 kg)
+                default_unidad = unidad_default_producto(producto_a_agregar) if producto_a_agregar else "1 kg"
+                opciones_frac = ["1/4 kg", "1/2 kg", "1 kg"]
+                idx_default = opciones_frac.index(default_unidad) if default_unidad in opciones_frac else 2
                 unidad_nueva = st.selectbox(
                     "Unidad",
-                    ["1/4 kg", "1/2 kg", "1 kg"],
-                    index=2,  # 1 kg por default
+                    opciones_frac,
+                    index=idx_default,
                     key="unidad_nueva",
                     label_visibility="collapsed",
                 )
             else:
-                # Para productos no-kg, la unidad es la natural del producto
                 if producto_a_agregar:
                     etiq, _ = detectar_unidad_producto(producto_a_agregar)
-                    unidad_nueva = f"1 {etiq.lower()}"
-                    st.markdown(f"<div style='padding-top: 8px; color: #888;'>1 {etiq}</div>", unsafe_allow_html=True)
+                    # Si etiq empieza con dígito (ej "170g"), no prefijar "1"
+                    if etiq[0].isdigit():
+                        unidad_nueva = etiq
+                        display = etiq
+                    else:
+                        unidad_nueva = f"1 {etiq.lower()}"
+                        display = f"1 {etiq}"
+                    st.markdown(f"<div style='padding-top: 8px; color: #888;'>{display}</div>", unsafe_allow_html=True)
                 else:
                     unidad_nueva = "1 kg"
 
@@ -3526,7 +3541,11 @@ with tab_catalogo:
                             st.rerun()
                     else:
                         # Producto con unidad fija: solo mostrar la etiqueta
-                        st.markdown(f"<div style='padding-top: 8px;'>1 {etiq_unidad}</div>", unsafe_allow_html=True)
+                        if etiq_unidad[0].isdigit():
+                            display = etiq_unidad
+                        else:
+                            display = f"1 {etiq_unidad}"
+                        st.markdown(f"<div style='padding-top: 8px;'>{display}</div>", unsafe_allow_html=True)
                 with col_p:
                     st.write(f"**${precio_final:,.2f}**")
                 with col_x:
@@ -3548,7 +3567,11 @@ with tab_catalogo:
                 precio_final = precio_kg * factor
             else:
                 precio_final = precio_kg
-                unidad = f"1 {etiq_unidad.lower()}"
+                # Si la etiqueta ya incluye cantidad (ej "170g"), usar tal cual
+                if etiq_unidad[0].isdigit():
+                    unidad = etiq_unidad
+                else:
+                    unidad = f"1 {etiq_unidad.lower()}"
             productos_incluidos.append({
                 "nombre": prod,
                 "unidad": unidad,
@@ -3579,51 +3602,27 @@ with tab_catalogo:
                 imagenes = st.session_state["catalogo_generado"]
 
                 st.markdown("#### 👁️ Vista previa")
-                for i, img in enumerate(imagenes):
-                    st.image(img, caption=f"Página {i+1}" if len(imagenes) > 1 else "Catálogo", use_container_width=True)
+                # Como ahora generamos UNA sola imagen larga, siempre hay 1 elemento
+                st.image(imagenes[0], caption="Catálogo", use_container_width=True)
 
                 st.markdown("#### 📥 Descargar")
                 col_d1, col_d2 = st.columns(2)
 
-                # Descargar como PNG (ZIP si son varias páginas)
                 with col_d1:
-                    if len(imagenes) == 1:
-                        png_buf = io.BytesIO()
-                        imagenes[0].save(png_buf, format="PNG")
-                        png_buf.seek(0)
-                        st.download_button(
-                            "🖼️ Descargar PNG",
-                            data=png_buf.getvalue(),
-                            file_name=f"catalogo_{dia_entrega_str.lower()}_{datetime.now(pytz.timezone(ZONA_HORARIA)).strftime('%Y%m%d')}.png",
-                            mime="image/png",
-                            use_container_width=True,
-                        )
-                    else:
-                        zip_buf = io.BytesIO()
-                        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                            for i, img in enumerate(imagenes):
-                                png_b = io.BytesIO()
-                                img.save(png_b, format="PNG")
-                                zf.writestr(f"catalogo_pag{i+1}.png", png_b.getvalue())
-                        zip_buf.seek(0)
-                        st.download_button(
-                            "🖼️ Descargar PNGs (ZIP)",
-                            data=zip_buf.getvalue(),
-                            file_name=f"catalogo_{dia_entrega_str.lower()}_{datetime.now(pytz.timezone(ZONA_HORARIA)).strftime('%Y%m%d')}.zip",
-                            mime="application/zip",
-                            use_container_width=True,
-                        )
+                    png_buf = io.BytesIO()
+                    imagenes[0].save(png_buf, format="PNG")
+                    png_buf.seek(0)
+                    st.download_button(
+                        "🖼️ Descargar PNG",
+                        data=png_buf.getvalue(),
+                        file_name=f"catalogo_{dia_entrega_str.lower()}_{datetime.now(pytz.timezone(ZONA_HORARIA)).strftime('%Y%m%d')}.png",
+                        mime="image/png",
+                        use_container_width=True,
+                    )
 
-                # Descargar como PDF
                 with col_d2:
                     pdf_buf = io.BytesIO()
-                    imagenes[0].save(
-                        pdf_buf,
-                        format="PDF",
-                        save_all=True,
-                        append_images=imagenes[1:] if len(imagenes) > 1 else [],
-                        resolution=100,
-                    )
+                    imagenes[0].save(pdf_buf, format="PDF", resolution=100)
                     pdf_buf.seek(0)
                     st.download_button(
                         "📄 Descargar PDF",
