@@ -2811,33 +2811,141 @@ def emoji_para_producto(nombre):
     return ""  # Sin emoji si no hay uno fiel al producto
 
 
-def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entrega, frase, ancho=900, prods_por_pagina=10):
-    """Genera UNA imagen vertical bonita con los productos seleccionados.
-    Devuelve lista de imágenes (una por página si son muchos productos)."""
+def categorizar_producto(nombre):
+    """Clasifica un producto en una categoría visible.
+    Devuelve (categoria, orden_categoria) donde orden_categoria sirve para mostrar primero
+    las categorías más importantes."""
+    n = nombre.lower().strip()
 
-    # Colores
-    BG = (250, 248, 243)         # crema suave
-    VERDE_OSCURO = (45, 90, 39)   # verde botánico
-    VERDE_CLARO = (140, 180, 100) # verde fresco
-    ACENTO = (220, 130, 50)       # naranja cálido
-    NEGRO = (40, 40, 40)
-    GRIS = (120, 120, 120)
+    # 1. Hierbas y aromáticos (específicas)
+    if any(re.search(rf"\b{k}\b", n) for k in [
+        "cilantro", "perejil", "hierbabuena", "yerbabuena", "epazote",
+        "menta", "romero", "tomillo", "laurel", "orégano", "oregano",
+        "albahaca", "ruda", "borraja", "jamaica", "hierba santa"
+    ]):
+        return ("HIERBAS Y AROMÁTICOS", 4)
+
+    # 2. Chiles (la palabra "chile" o variedad específica)
+    if re.search(r"\bchile\b", n) or any(re.search(rf"\b{k}\b", n) for k in [
+        "jalapeño", "jalapeno", "serrano", "habanero",
+        "poblano", "guajillo", "ancho", "pasilla",
+        "morita", "chipotle", "árbol", "arbol",
+        "cascabel", "manzano"
+    ]):
+        return ("CHILES", 3)
+
+    # 3. Frutas (palabras completas para evitar falsos positivos)
+    frutas = ["manzana", "manzanas", "plátano", "platano", "plátanos", "platanos",
+              "uva", "uvas", "naranja", "naranjas", "mandarina", "mandarinas",
+              "limón", "limon", "limones", "limón sin semilla",
+              "piña", "pina", "piñas", "pinas", "mango", "mangos",
+              "pera", "peras", "durazno", "duraznos", "fresa", "fresas",
+              "sandía", "sandia", "melón", "melon", "melones",
+              "cereza", "cerezas", "cherry", "kiwi", "kiwis", "coco", "cocos",
+              "mora", "moras", "blueberry", "blueberries", "zarzamora", "zarzamoras",
+              "frambuesa", "frambuesas", "papaya", "papayas", "guayaba", "guayabas",
+              "granada", "granadas", "mamey", "chicozapote", "chicopazote", "zapote",
+              "tuna", "tunas", "xoconostle", "tejocote", "tejocotes",
+              "ciruela", "ciruelas", "membrillo", "níspero", "nispero",
+              "carambola", "maracuyá", "maracuya", "lichi", "lichis",
+              "rambután", "rambutan", "pitahaya", "tamarindo", "tamarindos",
+              "higo", "higos", "datil", "dátil", "dátiles", "datiles",
+              "arándano", "arandano", "arándanos", "arandanos",
+              "toronja", "toronjas", "pomelo", "pomelos"]
+    if any(re.search(rf"\b{k}\b", n) for k in frutas):
+        return ("FRUTAS", 1)
+
+    # 4. Lácteos y huevo
+    if any(re.search(rf"\b{k}\b", n) for k in [
+        "queso", "quesos", "leche", "crema", "yogurt",
+        "mantequilla", "huevo", "huevos"
+    ]):
+        return ("LÁCTEOS Y HUEVO", 5)
+
+    # 5. Legumbres y semillas
+    if any(re.search(rf"\b{k}\b", n) for k in [
+        "frijol", "frijoles", "lenteja", "lentejas", "garbanzo", "garbanzos",
+        "haba", "habas", "alubia", "alubias", "alverjón", "alverjon",
+        "ejote", "ejotes", "chícharo", "chicharo", "chícharos", "chicharos",
+        "cacahuate", "cacahuates", "nuez", "nueces", "almendra", "almendras",
+        "pistache", "pistaches", "semilla", "semillas", "pepita", "pepitas",
+        "ajonjolí", "ajonjoli", "chía", "chia", "linaza", "amaranto"
+    ]):
+        return ("LEGUMBRES Y SEMILLAS", 6)
+
+    # 6. Abarrotes (productos específicos, no por substring)
+    if any(re.search(rf"\b{k}\b", n) for k in [
+        "miel", "tortilla", "tortillas", "pan", "salsa", "salsas",
+        "aceite", "vinagre", "azúcar", "azucar", "café", "cafe",
+        "chocolate", "harina", "arroz", "pasta"
+    ]):
+        return ("ABARROTES", 7)
+
+    # 7. Verduras (cualquier vegetal restante)
+    verduras = ["jitomate", "jitomates", "tomate", "tomates", "tomatillo", "tomatillos",
+                "aguacate", "aguacates", "elote", "elotes",
+                "zanahoria", "zanahorias", "papa", "papas", "patata", "patatas",
+                "camote", "camotes", "batata", "brócoli", "brocoli",
+                "lechuga", "lechugas", "espinaca", "espinacas", "acelga", "acelgas",
+                "cebolla", "cebollas", "ajo", "ajos", "pepino", "pepinos",
+                "calabaza", "calabazas", "calabacita", "calabacitas",
+                "calabacín", "calabacin", "chayote", "chayotes",
+                "betabel", "betabeles", "remolacha", "rábano", "rabano", "rábanos", "rabanos",
+                "nabo", "nabos", "nopal", "nopales",
+                "hongo", "hongos", "champiñón", "champinon", "champiñones", "champinones",
+                "seta", "setas", "portobello", "apio",
+                "espárrago", "esparrago", "espárragos", "esparragos",
+                "coliflor", "col", "repollo", "kale", "berro", "berros",
+                "arúgula", "arugula", "pimiento", "pimientos", "morrón", "morron",
+                "puerro", "poro", "berenjena", "berenjenas", "okra",
+                "germinado", "germinados", "jengibre", "jenjibre",
+                "cúrcuma", "curcuma", "yuca", "jícama", "jicama",
+                "verdolaga", "verdolagas", "huauzontle", "huauzontles",
+                "quelite", "quelites", "romerito", "romeritos",
+                "flor de calabaza", "huitlacoche", "cuitlacoche", "maíz", "maiz"]
+    if any(re.search(rf"\b{k}\b", n) for k in verduras):
+        return ("VERDURAS", 2)
+
+    return ("OTROS", 8)
+
+
+def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entrega, frase, ancho=900):
+    """Genera el catálogo en una o más páginas con diseño elegante por categorías.
+    Compacta automáticamente: 1 columna si hay pocos productos, 2 columnas si hay muchos."""
+
+    # Paleta elegante
+    BG = (252, 250, 245)              # crema muy suave
+    NEGRO = (35, 35, 35)
+    GRIS_OSCURO = (90, 90, 90)
+    GRIS_CLARO = (180, 180, 180)
+    VERDE_PROFUNDO = (40, 70, 45)     # verde elegante
+    VERDE_HOJA = (110, 150, 90)
+    DORADO = (175, 130, 60)           # acento dorado/marrón cálido
     BLANCO = (255, 255, 255)
-    TARJETA_BG = (255, 255, 255)
 
-    # Cargar fuentes
-    def font(size, bold=False):
+    def font(size, bold=False, italic=False):
         candidatos_bold = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/Library/Fonts/Arial Bold.ttf",
-            "C:/Windows/Fonts/arialbd.ttf",
+            "/Library/Fonts/Georgia Bold.ttf",
+            "C:/Windows/Fonts/georgiab.ttf",
+        ]
+        candidatos_italic = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
         ]
         candidatos_reg = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/Library/Fonts/Arial.ttf",
-            "C:/Windows/Fonts/arial.ttf",
+            "/Library/Fonts/Georgia.ttf",
+            "C:/Windows/Fonts/georgia.ttf",
         ]
-        candidatos = candidatos_bold if bold else candidatos_reg
+        if italic:
+            candidatos = candidatos_italic + candidatos_reg
+        elif bold:
+            candidatos = candidatos_bold
+        else:
+            candidatos = candidatos_reg
         for c in candidatos:
             try:
                 return ImageFont.truetype(c, size)
@@ -2845,213 +2953,332 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
                 continue
         return ImageFont.load_default()
 
-    f_title = font(46, bold=True)
-    f_subtitle = font(22)
-    f_frase = font(20, bold=True)
-    f_prod = font(24, bold=True)
-    f_precio = font(28, bold=True)
-    f_unidad = font(15)
-    f_info = font(17)
-    f_info_bold = font(17, bold=True)
-    f_footer = font(14)
+    f_titulo = font(54, italic=True)       # "Servicio de entrega"
+    f_subtitulo = font(22, bold=True)      # "FRUTAS Y VERDURAS A DOMICILIO"
+    f_categoria = font(16, bold=True)      # Separadores de sección
+    f_producto = font(15)                  # Nombre del producto
+    f_precio = font(15, bold=True)         # Precio
+    f_frase = font(13, bold=True)          # Frase pegadora
+    f_envio_big = font(18, bold=True)      # "ENTREGA DÍAS / SÁBADOS"
+    f_envio_circ = font(20, bold=True)     # "$35 envío" del círculo
+    f_contacto = font(17, italic=True)     # Contacto al final
+    f_buscar = font(13, bold=True)         # Mensaje "si tu producto no está"
+    f_footer = font(11)                    # Footer chiquito
 
-    # Particionar productos en páginas
-    paginas = [productos[i:i + prods_por_pagina] for i in range(0, len(productos), prods_por_pagina)]
+    # Ordenar productos por categoría y luego alfabéticamente
+    productos_con_cat = [
+        (categorizar_producto(p["nombre"])[1], categorizar_producto(p["nombre"])[0], p["nombre"], p)
+        for p in productos
+    ]
+    productos_con_cat.sort(key=lambda x: (x[0], x[2].lower()))
+
+    # Agrupar por categoría preservando orden
+    categorias_orden = []
+    productos_por_cat = {}
+    for orden, cat, nombre, prod in productos_con_cat:
+        if cat not in productos_por_cat:
+            productos_por_cat[cat] = []
+            categorias_orden.append(cat)
+        productos_por_cat[cat].append(prod)
+
+    # Decidir columnas: 1 si pocos productos, 2 si muchos
+    total = len(productos)
+    usar_2_columnas = total > 22
+
+    # Alturas de elementos
+    pad_lateral = 60
+    header_h = 200
+    espacio_top_lista = 30
+    alto_fila = 28 if usar_2_columnas else 32
+    alto_separador_cat = 50
+    bloque_envio_h = 240
+    footer_h = 60
+
+    # Calcular cuántos productos caben por página
+    if usar_2_columnas:
+        alto_disponible = 1100  # altura útil de zona productos
+        filas_disponibles = alto_disponible // alto_fila
+        # Estimación: distribuir categorías en 2 columnas
+        prods_por_pagina = filas_disponibles * 2 - 8  # margen para separadores
+    else:
+        alto_disponible = 1100
+        filas_disponibles = alto_disponible // alto_fila
+        prods_por_pagina = filas_disponibles - 5
+
+    # Construir páginas: distribuir respetando categorías
+    paginas = []
+    pagina_actual = []  # lista de tuples (tipo, contenido) donde tipo es 'cat' o 'prod'
+    items_en_pagina = 0
+    max_por_pagina = prods_por_pagina if prods_por_pagina > 0 else 20
+
+    for cat in categorias_orden:
+        prods_cat = productos_por_cat[cat]
+        # Si la categoría no cabe completa, igual la metemos hasta donde alcance
+        if items_en_pagina + 2 > max_por_pagina and pagina_actual:
+            paginas.append(pagina_actual)
+            pagina_actual = []
+            items_en_pagina = 0
+
+        pagina_actual.append(("cat", cat))
+        items_en_pagina += 2  # el separador cuenta como ~2 productos visualmente
+
+        for p in prods_cat:
+            if items_en_pagina >= max_por_pagina and pagina_actual:
+                paginas.append(pagina_actual)
+                pagina_actual = [("cat", cat + " (cont.)")]  # repetir categoría
+                items_en_pagina = 2
+            pagina_actual.append(("prod", p))
+            items_en_pagina += 1
+
+    if pagina_actual:
+        paginas.append(pagina_actual)
+
     if not paginas:
         paginas = [[]]
 
     imagenes = []
-    for idx_pag, prods_pagina in enumerate(paginas):
-        # Calcular altura dinámica
-        header_h = 200
-        frase_h = 80
-        info_compra_h = 280  # más alto para incluir mensaje de búsqueda
-        footer_h = 50
-        # Cada tarjeta es ~120 px de alto, en 2 columnas
-        filas = (len(prods_pagina) + 1) // 2
-        tarjetas_h = filas * 135 + 30
-        alto = header_h + frase_h + tarjetas_h + info_compra_h + footer_h
+    DIAS_MAYUS = dia_entrega.upper()
+
+    for idx_pag, items_pagina in enumerate(paginas):
+        # Calcular altura de página
+        es_ultima = (idx_pag == len(paginas) - 1)
+        h_productos = sum(
+            alto_separador_cat if t == "cat" else alto_fila
+            for t, _ in items_pagina
+        )
+        alto = header_h + espacio_top_lista + h_productos + 40 + (bloque_envio_h if es_ultima else 0) + footer_h
         if alto < 1200:
             alto = 1200
 
         img = Image.new("RGB", (ancho, alto), BG)
         draw = ImageDraw.Draw(img)
 
-        # ---- Header con franja verde ----
-        draw.rectangle([0, 0, ancho, header_h], fill=VERDE_OSCURO)
-        # Decoración: línea naranja debajo del header
-        draw.rectangle([0, header_h, ancho, header_h + 5], fill=ACENTO)
-
-        # Título grande centrado
-        titulo = "FRUTIVERDURA"
-        bbox = draw.textbbox((0, 0), titulo, font=f_title)
+        # ---- HEADER ELEGANTE ----
+        # Título "Servicio de entrega" en cursiva grande
+        titulo = "Servicio de entrega"
+        bbox = draw.textbbox((0, 0), titulo, font=f_titulo)
         tw = bbox[2] - bbox[0]
-        draw.text(((ancho - tw) // 2, 50), titulo, fill=BLANCO, font=f_title)
+        draw.text(((ancho - tw) // 2, 50), titulo, fill=NEGRO, font=f_titulo)
 
-        subtitulo = "a Domicilio"
-        bbox = draw.textbbox((0, 0), subtitulo, font=f_subtitle)
+        # Subtítulo en versalitas
+        subtitulo = "FRUTAS Y VERDURAS A DOMICILIO"
+        bbox = draw.textbbox((0, 0), subtitulo, font=f_subtitulo)
         tw = bbox[2] - bbox[0]
-        draw.text(((ancho - tw) // 2, 110), subtitulo, fill=(220, 220, 200), font=f_subtitle)
+        # Letra-espaciado manual: dibujar carácter por carácter
+        spacing = 4
+        total_w = sum(draw.textbbox((0, 0), c, font=f_subtitulo)[2] for c in subtitulo) + spacing * (len(subtitulo) - 1)
+        x_letra = (ancho - total_w) // 2
+        for c in subtitulo:
+            draw.text((x_letra, 130), c, fill=NEGRO, font=f_subtitulo)
+            x_letra += draw.textbbox((0, 0), c, font=f_subtitulo)[2] + spacing
 
-        # Día de entrega
-        dia_txt = f"📅 Entrega: {dia_entrega}"
-        bbox = draw.textbbox((0, 0), dia_txt, font=f_info)
-        tw = bbox[2] - bbox[0]
-        draw.text(((ancho - tw) // 2, 150), dia_txt, fill=BLANCO, font=f_info)
+        # Línea decorativa delgada bajo el header
+        linea_y = 175
+        draw.line([(ancho // 2 - 100, linea_y), (ancho // 2 + 100, linea_y)], fill=DORADO, width=2)
+        # Punto central
+        draw.ellipse([ancho // 2 - 4, linea_y - 4, ancho // 2 + 4, linea_y + 4], fill=DORADO)
 
-        # Numero de página si hay varias
+        # Número de página (si hay varias)
         if len(paginas) > 1:
-            pag_txt = f"Página {idx_pag + 1}/{len(paginas)}"
-            draw.text((ancho - 130, 15), pag_txt, fill=(180, 180, 180), font=f_footer)
+            pag_txt = f"Página {idx_pag + 1} de {len(paginas)}"
+            draw.text((ancho - 150, 20), pag_txt, fill=GRIS_CLARO, font=f_footer)
 
-        y = header_h + 25
+        y = header_h + espacio_top_lista
 
-        # ---- Frase pegadora ----
-        # Wrap manual si es larga
-        palabras = frase.split()
-        lineas_frase = []
-        linea_actual = ""
-        for w in palabras:
-            test = (linea_actual + " " + w).strip()
-            bbox = draw.textbbox((0, 0), test, font=f_frase)
-            if bbox[2] - bbox[0] > ancho - 80:
-                if linea_actual:
-                    lineas_frase.append(linea_actual)
-                linea_actual = w
-            else:
-                linea_actual = test
-        if linea_actual:
-            lineas_frase.append(linea_actual)
+        # ---- LISTADO POR CATEGORÍAS ----
+        if usar_2_columnas:
+            # Dividir items_pagina en dos columnas balanceadas
+            mitad = len(items_pagina) // 2 + (1 if len(items_pagina) % 2 else 0)
+            # Ajustar para que la división no parta una categoría sin productos
+            for i in range(mitad - 1, min(mitad + 3, len(items_pagina))):
+                if items_pagina[i][0] == "cat":
+                    mitad = i
+                    break
+            col1_items = items_pagina[:mitad]
+            col2_items = items_pagina[mitad:]
+            col_ancho = (ancho - pad_lateral * 2 - 40) // 2
+            x_col1 = pad_lateral
+            x_col2 = pad_lateral + col_ancho + 40
 
-        for ln in lineas_frase:
-            bbox = draw.textbbox((0, 0), ln, font=f_frase)
-            tw = bbox[2] - bbox[0]
-            draw.text(((ancho - tw) // 2, y), f'"{ln}"' if ln == lineas_frase[0] and len(lineas_frase) == 1 else ln, fill=VERDE_OSCURO, font=f_frase)
-            y += 28
-        y += 25
+            def dibujar_columna(items, x_inicio, y_inicio, ancho_col):
+                y_local = y_inicio
+                for tipo, cont in items:
+                    if tipo == "cat":
+                        # Separador de categoría
+                        cat_w = draw.textbbox((0, 0), cont, font=f_categoria)[2]
+                        # Línea izquierda
+                        draw.line([(x_inicio, y_local + 20), (x_inicio + 20, y_local + 20)], fill=DORADO, width=1)
+                        # Texto centrado
+                        draw.text((x_inicio + 28, y_local + 11), cont, fill=VERDE_PROFUNDO, font=f_categoria)
+                        # Línea derecha
+                        draw.line([(x_inicio + 28 + cat_w + 8, y_local + 20),
+                                   (x_inicio + ancho_col, y_local + 20)], fill=DORADO, width=1)
+                        y_local += alto_separador_cat
+                    else:
+                        prod = cont
+                        nombre = prod["nombre"].title()
+                        precio_txt = f"${prod['precio']:.2f}"
+                        unidad_corto = prod["unidad"].replace("1 kg", "Kg").replace("1/4 kg", "¼ Kg").replace("1/2 kg", "½ Kg")
+                        # Si unidad es Kg simple, no la repetimos
+                        if unidad_corto == "Kg":
+                            precio_completo = f"{precio_txt} Kg"
+                        else:
+                            precio_completo = f"{precio_txt} {unidad_corto}"
 
-        # ---- Tarjetas de productos (2 columnas) ----
-        tarjeta_w = (ancho - 60) // 2  # 20 padding lados + 20 espacio entre
-        tarjeta_h = 120
-        pad_x = 20
-        for i, prod in enumerate(prods_pagina):
-            col = i % 2
-            fila = i // 2
-            tx = pad_x + col * (tarjeta_w + 20)
-            ty = y + fila * (tarjeta_h + 15)
+                        # Truncar nombre si es muy largo
+                        max_nombre_w = ancho_col - draw.textbbox((0, 0), precio_completo, font=f_precio)[2] - 20
+                        while draw.textbbox((0, 0), nombre, font=f_producto)[2] > max_nombre_w and len(nombre) > 3:
+                            nombre = nombre[:-1]
+                        if draw.textbbox((0, 0), nombre, font=f_producto)[2] > max_nombre_w:
+                            nombre = nombre[:-3] + "..."
 
-            # Sombra suave
-            draw.rectangle([tx + 3, ty + 3, tx + tarjeta_w + 3, ty + tarjeta_h + 3], fill=(220, 215, 205))
-            # Tarjeta blanca con borde verde
-            draw.rectangle([tx, ty, tx + tarjeta_w, ty + tarjeta_h], fill=TARJETA_BG, outline=VERDE_CLARO, width=2)
+                        draw.text((x_inicio, y_local), nombre, fill=NEGRO, font=f_producto)
+                        # Precio alineado a la derecha
+                        p_w = draw.textbbox((0, 0), precio_completo, font=f_precio)[2]
+                        draw.text((x_inicio + ancho_col - p_w, y_local), precio_completo, fill=NEGRO, font=f_precio)
+                        y_local += alto_fila
+                return y_local
 
-            # Emoji grande a la izquierda (solo si existe)
-            emoji = prod.get("emoji", "")
-            if emoji:
-                draw.text((tx + 15, ty + 25), emoji, fill=NEGRO, font=f_title)
-                texto_x = tx + 80  # con espacio para emoji
-            else:
-                texto_x = tx + 20  # sin emoji, texto pegado a la izquierda
+            y1 = dibujar_columna(col1_items, x_col1, y, col_ancho)
+            y2 = dibujar_columna(col2_items, x_col2, y, col_ancho)
+            y = max(y1, y2) + 30
 
-            # Nombre del producto
-            nombre = prod["nombre"].title()
-            # Ancho disponible varía si hay o no emoji
-            ancho_texto = tarjeta_w - (90 if emoji else 30)
-            # Wrap si es largo
-            bbox = draw.textbbox((0, 0), nombre, font=f_prod)
-            if bbox[2] - bbox[0] > ancho_texto:
-                while nombre and draw.textbbox((0, 0), nombre + "...", font=f_prod)[2] > ancho_texto:
-                    nombre = nombre[:-1]
-                if not nombre.endswith("..."):
-                    nombre += "..."
-            draw.text((texto_x, ty + 18), nombre, fill=NEGRO, font=f_prod)
-
-            # Unidad
-            unidad_txt = prod.get("unidad", "kg")
-            draw.text((texto_x, ty + 50), unidad_txt, fill=GRIS, font=f_unidad)
-
-            # Precio destacado
-            precio_txt = f"${prod['precio']:.2f}"
-            bbox = draw.textbbox((0, 0), precio_txt, font=f_precio)
-            pw = bbox[2] - bbox[0]
-            draw.text((tx + tarjeta_w - pw - 15, ty + 70), precio_txt, fill=ACENTO, font=f_precio)
-
-        y += filas * (tarjeta_h + 15) + 30
-
-        # ---- Bloque de información de compra ----
-        info_y = alto - info_compra_h - footer_h
-        # Fondo verde claro
-        draw.rectangle([20, info_y, ancho - 20, info_y + info_compra_h - 20], fill=(235, 245, 225), outline=VERDE_OSCURO, width=2)
-
-        # Título "PARA ORDENAR"
-        ordenar_txt = "📲 PARA ORDENAR"
-        bbox = draw.textbbox((0, 0), ordenar_txt, font=f_prod)
-        tw = bbox[2] - bbox[0]
-        draw.text(((ancho - tw) // 2, info_y + 15), ordenar_txt, fill=VERDE_OSCURO, font=f_prod)
-
-        # Línea de contacto
-        contacto_txt = f"📱 {contacto_nombre}: {contacto_tel}"
-        bbox = draw.textbbox((0, 0), contacto_txt, font=f_info_bold)
-        tw = bbox[2] - bbox[0]
-        draw.text(((ancho - tw) // 2, info_y + 55), contacto_txt, fill=NEGRO, font=f_info_bold)
-
-        # Envío
-        envio_txt = f"🛵 Envío: $35"
-        bbox = draw.textbbox((0, 0), envio_txt, font=f_info)
-        tw = bbox[2] - bbox[0]
-        draw.text(((ancho - tw) // 2, info_y + 88), envio_txt, fill=NEGRO, font=f_info)
-
-        # Pago
-        pago_txt = "💳 Efectivo · Transferencia · Tarjeta débito/crédito"
-        bbox = draw.textbbox((0, 0), pago_txt, font=f_info)
-        tw = bbox[2] - bbox[0]
-        if tw > ancho - 60:
-            l1 = "💳 Efectivo · Transferencia"
-            l2 = "Tarjeta débito o crédito"
-            bbox1 = draw.textbbox((0, 0), l1, font=f_info)
-            bbox2 = draw.textbbox((0, 0), l2, font=f_info)
-            draw.text(((ancho - (bbox1[2] - bbox1[0])) // 2, info_y + 115), l1, fill=NEGRO, font=f_info)
-            draw.text(((ancho - (bbox2[2] - bbox2[0])) // 2, info_y + 140), l2, fill=NEGRO, font=f_info)
         else:
-            draw.text(((ancho - tw) // 2, info_y + 115), pago_txt, fill=NEGRO, font=f_info)
+            # Una sola columna centrada
+            col_ancho = ancho - pad_lateral * 2
+            x_col = pad_lateral
 
-        # Mensaje destacado: si no está en el catálogo, lo buscamos
-        # Solo en la última página para no repetirlo
-        if idx_pag == len(paginas) - 1:
-            buscar_y = info_y + 165
-            # Fondo naranja suave para destacar
-            draw.rectangle(
-                [40, buscar_y, ancho - 40, buscar_y + 35],
-                fill=(255, 240, 220),
-                outline=ACENTO,
-                width=2,
+            for tipo, cont in items_pagina:
+                if tipo == "cat":
+                    cat_w = draw.textbbox((0, 0), cont, font=f_categoria)[2]
+                    # Línea decorativa antes del texto
+                    line_inicio_x = x_col + (col_ancho - cat_w - 80) // 2
+                    draw.line([(line_inicio_x, y + 20), (line_inicio_x + 30, y + 20)], fill=DORADO, width=1)
+                    draw.text((line_inicio_x + 40, y + 11), cont, fill=VERDE_PROFUNDO, font=f_categoria)
+                    draw.line([(line_inicio_x + 40 + cat_w + 10, y + 20),
+                               (line_inicio_x + 80 + cat_w, y + 20)], fill=DORADO, width=1)
+                    y += alto_separador_cat
+                else:
+                    prod = cont
+                    nombre = prod["nombre"].title()
+                    precio_txt = f"${prod['precio']:.2f}"
+                    unidad_corto = prod["unidad"].replace("1 kg", "Kg").replace("1/4 kg", "¼ Kg").replace("1/2 kg", "½ Kg")
+                    if unidad_corto == "Kg":
+                        precio_completo = f"{precio_txt} Kg"
+                    else:
+                        precio_completo = f"{precio_txt} {unidad_corto}"
+
+                    draw.text((x_col + 100, y), nombre, fill=NEGRO, font=f_producto)
+                    p_w = draw.textbbox((0, 0), precio_completo, font=f_precio)[2]
+                    draw.text((x_col + col_ancho - p_w - 100, y), precio_completo, fill=NEGRO, font=f_precio)
+                    y += alto_fila
+
+            y += 30
+
+        # ---- BLOQUE FINAL (solo en última página) ----
+        if es_ultima:
+            # Frase pegadora en versalitas centrada
+            frase_upper = frase.upper()
+            # Wrap
+            palabras = frase_upper.split()
+            lineas_frase = []
+            linea_actual = ""
+            for w in palabras:
+                test = (linea_actual + " " + w).strip()
+                if draw.textbbox((0, 0), test, font=f_frase)[2] > ancho - 160:
+                    if linea_actual:
+                        lineas_frase.append(linea_actual)
+                    linea_actual = w
+                else:
+                    linea_actual = test
+            if linea_actual:
+                lineas_frase.append(linea_actual)
+
+            for ln in lineas_frase:
+                bbox = draw.textbbox((0, 0), ln, font=f_frase)
+                tw = bbox[2] - bbox[0]
+                draw.text(((ancho - tw) // 2, y), ln, fill=NEGRO, font=f_frase)
+                y += 22
+            y += 30
+
+            # Bloque "ENTREGA DÍAS + $35 envío"
+            bloque_y = y
+            # Lado izquierdo: ENTREGA DÍAS
+            entrega_x = ancho // 2 - 180
+            draw.text((entrega_x, bloque_y), "ENTREGA", fill=NEGRO, font=f_envio_big)
+            draw.text((entrega_x, bloque_y + 30), "DÍAS", fill=NEGRO, font=f_envio_big)
+            draw.text((entrega_x, bloque_y + 60), DIAS_MAYUS, fill=NEGRO, font=f_envio_big)
+
+            # Signo "+" en medio
+            draw.text((ancho // 2 - 15, bloque_y + 30), "+", fill=NEGRO, font=f_titulo)
+
+            # Lado derecho: círculo con "$35 de envío"
+            circulo_cx = ancho // 2 + 130
+            circulo_cy = bloque_y + 55
+            circulo_r = 55
+            draw.ellipse(
+                [circulo_cx - circulo_r, circulo_cy - circulo_r,
+                 circulo_cx + circulo_r, circulo_cy + circulo_r],
+                fill=NEGRO,
             )
-            buscar_txt = "🔎 ¿No ves tu producto? Lo buscamos y te lo llevamos."
-            bbox = draw.textbbox((0, 0), buscar_txt, font=f_info_bold)
+            # Texto blanco centrado en el círculo
+            envio_l1 = "$35"
+            envio_l2 = "de envío"
+            bbox1 = draw.textbbox((0, 0), envio_l1, font=f_envio_circ)
+            bbox2 = draw.textbbox((0, 0), envio_l2, font=font(13, bold=True))
+            draw.text(
+                (circulo_cx - (bbox1[2] - bbox1[0]) // 2, circulo_cy - 22),
+                envio_l1, fill=BLANCO, font=f_envio_circ
+            )
+            draw.text(
+                (circulo_cx - (bbox2[2] - bbox2[0]) // 2, circulo_cy + 8),
+                envio_l2, fill=BLANCO, font=font(13, bold=True)
+            )
+
+            y = bloque_y + 130
+
+            # Pago
+            pago_txt = "Efectivo · Transferencia · Tarjeta débito o crédito"
+            bbox = draw.textbbox((0, 0), pago_txt, font=font(13))
+            tw = bbox[2] - bbox[0]
+            draw.text(((ancho - tw) // 2, y), pago_txt, fill=GRIS_OSCURO, font=font(13))
+            y += 30
+
+            # Mensaje "Si tu producto no está..."
+            buscar_txt = "SI TU PRODUCTO NO ESTÁ EN EL CATÁLOGO, NOSOTROS TE LO CONSEGUIMOS"
+            bbox = draw.textbbox((0, 0), buscar_txt, font=f_buscar)
             tw = bbox[2] - bbox[0]
             if tw > ancho - 80:
-                # Dos líneas si no cabe
-                l1 = "🔎 ¿No ves tu producto?"
-                l2 = "Lo buscamos y te lo llevamos."
-                draw.rectangle(
-                    [40, buscar_y, ancho - 40, buscar_y + 55],
-                    fill=(255, 240, 220),
-                    outline=ACENTO,
-                    width=2,
-                )
-                bbox1 = draw.textbbox((0, 0), l1, font=f_info_bold)
-                bbox2 = draw.textbbox((0, 0), l2, font=f_info_bold)
-                draw.text(((ancho - (bbox1[2] - bbox1[0])) // 2, buscar_y + 7), l1, fill=ACENTO, font=f_info_bold)
-                draw.text(((ancho - (bbox2[2] - bbox2[0])) // 2, buscar_y + 30), l2, fill=NEGRO, font=f_info_bold)
+                # Dividir
+                l1 = "SI TU PRODUCTO NO ESTÁ EN EL CATÁLOGO,"
+                l2 = "NOSOTROS TE LO CONSEGUIMOS"
+                b1 = draw.textbbox((0, 0), l1, font=f_buscar)
+                b2 = draw.textbbox((0, 0), l2, font=f_buscar)
+                draw.text(((ancho - (b1[2] - b1[0])) // 2, y), l1, fill=NEGRO, font=f_buscar)
+                draw.text(((ancho - (b2[2] - b2[0])) // 2, y + 20), l2, fill=NEGRO, font=f_buscar)
+                y += 50
             else:
-                draw.text(((ancho - tw) // 2, buscar_y + 8), buscar_txt, fill=ACENTO, font=f_info_bold)
+                draw.text(((ancho - tw) // 2, y), buscar_txt, fill=NEGRO, font=f_buscar)
+                y += 30
+
+            # Contacto con ícono WhatsApp simulado
+            contacto_completo = f"  {contacto_nombre.title()}  -  {contacto_tel}"
+            # Ícono WhatsApp simple: círculo verde con check
+            ico_x = ancho // 2 - 150
+            ico_y = y + 5
+            draw.ellipse([ico_x, ico_y, ico_x + 24, ico_y + 24], outline=VERDE_HOJA, width=2)
+            # "tail" del bocadillo
+            draw.polygon([(ico_x + 4, ico_y + 22), (ico_x + 10, ico_y + 18), (ico_x + 4, ico_y + 14)],
+                         fill=VERDE_HOJA)
+            # Texto contacto
+            draw.text((ico_x + 30, ico_y - 2), contacto_completo, fill=NEGRO, font=f_contacto)
 
         # ---- Footer ----
         fecha_gen = datetime.now(pytz.timezone(ZONA_HORARIA)).strftime("%d/%m/%Y")
-        footer_txt = f"Catálogo válido para entrega del {dia_entrega.lower()} · Generado {fecha_gen}"
+        footer_txt = f"Catálogo generado el {fecha_gen}"
         bbox = draw.textbbox((0, 0), footer_txt, font=f_footer)
         tw = bbox[2] - bbox[0]
-        draw.text(((ancho - tw) // 2, alto - 30), footer_txt, fill=GRIS, font=f_footer)
+        draw.text(((ancho - tw) // 2, alto - 25), footer_txt, fill=GRIS_CLARO, font=f_footer)
 
         imagenes.append(img)
 
@@ -3251,7 +3478,6 @@ with tab_catalogo:
                         dia_entrega_str,
                         frase_seleccionada,
                         ancho=900,
-                        prods_por_pagina=10,
                     )
                     st.session_state["catalogo_generado"] = imagenes
 
