@@ -2758,30 +2758,57 @@ FRASES_CATALOGO = {
 
 
 def emoji_para_producto(nombre):
-    """Asigna un emoji según el nombre del producto."""
+    """Asigna un emoji solo si existe uno que corresponda fielmente al producto.
+    Si no hay emoji correcto, devuelve cadena vacía (sin emoji)."""
     n = nombre.lower()
+    # Solo emojis verificados que coinciden con el producto.
+    # Si no hay uno correcto, prefiero no poner nada.
     mapa = {
-        ("manzana",): "🍎", ("plátano", "platano"): "🍌", ("uva",): "🍇",
-        ("naranja",): "🍊", ("mandarina", "tangerina"): "🍊", ("limón", "limon"): "🍋",
-        ("piña", "pina"): "🍍", ("mango",): "🥭", ("pera",): "🍐",
-        ("durazno",): "🍑", ("fresa",): "🍓", ("mora", "blueberry"): "🫐",
-        ("sandía", "sandia"): "🍉", ("melón", "melon"): "🍈", ("cereza", "cherry"): "🍒",
-        ("kiwi",): "🥝", ("aguacate",): "🥑", ("jitomate", "tomate"): "🍅",
-        ("zanahoria",): "🥕", ("papa", "patata"): "🥔", ("camote", "batata"): "🍠",
-        ("brócoli", "brocoli"): "🥦", ("lechuga", "espinaca", "acelga"): "🥬",
-        ("cebolla",): "🧅", ("ajo",): "🧄", ("pepino",): "🥒", ("calabaza", "calabacita"): "🎃",
-        ("elote", "maíz", "maiz"): "🌽", ("chile", "jalapeño", "jalapeno"): "🌶️",
-        ("hongo", "champiñón", "champinon"): "🍄", ("apio",): "🥬",
-        ("huevo",): "🥚", ("queso",): "🧀", ("leche",): "🥛",
-        ("pan",): "🍞", ("miel",): "🍯", ("nuez", "almendra", "cacahuate"): "🥜",
-        ("coco",): "🥥", ("granada",): "🍎", ("papaya",): "🍈",
-        ("jamaica",): "🌺", ("nopal",): "🌵", ("cilantro", "perejil", "hierba"): "🌿",
+        # Frutas con emoji exacto
+        ("manzana",): "🍎",
+        ("plátano", "platano"): "🍌",
+        ("uva",): "🍇",
+        ("naranja",): "🍊",
+        ("mandarina",): "🍊",
+        ("limón", "limon"): "🍋",
+        ("piña", "pina"): "🍍",
+        ("mango",): "🥭",
+        ("pera",): "🍐",
+        ("durazno",): "🍑",
+        ("fresa",): "🍓",
+        ("sandía", "sandia"): "🍉",
+        ("melón", "melon"): "🍈",
+        ("cereza", "cherry"): "🍒",
+        ("kiwi",): "🥝",
+        ("aguacate",): "🥑",
+        ("coco",): "🥥",
+        ("mora azul", "blueberry", "blueberries"): "🫐",
+        # Verduras con emoji exacto
+        ("jitomate", "tomate"): "🍅",
+        ("zanahoria",): "🥕",
+        ("papa", "patata"): "🥔",
+        ("camote", "batata"): "🍠",
+        ("brócoli", "brocoli"): "🥦",
+        ("lechuga",): "🥬",
+        ("espinaca",): "🥬",
+        ("cebolla",): "🧅",
+        ("ajo",): "🧄",
+        ("pepino",): "🥒",
+        ("elote", "maíz", "maiz"): "🌽",
+        ("chile",): "🌶️",
+        ("jalapeño", "jalapeno"): "🌶️",
+        # Otros con emoji exacto
+        ("huevo",): "🥚",
+        ("queso",): "🧀",
+        ("leche",): "🥛",
+        ("pan",): "🍞",
+        ("miel",): "🍯",
     }
     for claves, emoji in mapa.items():
         for k in claves:
             if k in n:
                 return emoji
-    return "🥬"  # default: hoja verde
+    return ""  # Sin emoji si no hay uno fiel al producto
 
 
 def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entrega, frase, ancho=900, prods_por_pagina=10):
@@ -2918,25 +2945,30 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
             # Tarjeta blanca con borde verde
             draw.rectangle([tx, ty, tx + tarjeta_w, ty + tarjeta_h], fill=TARJETA_BG, outline=VERDE_CLARO, width=2)
 
-            # Emoji grande a la izquierda
-            emoji = prod.get("emoji", "🥬")
-            draw.text((tx + 15, ty + 25), emoji, fill=NEGRO, font=f_title)
+            # Emoji grande a la izquierda (solo si existe)
+            emoji = prod.get("emoji", "")
+            if emoji:
+                draw.text((tx + 15, ty + 25), emoji, fill=NEGRO, font=f_title)
+                texto_x = tx + 80  # con espacio para emoji
+            else:
+                texto_x = tx + 20  # sin emoji, texto pegado a la izquierda
 
             # Nombre del producto
             nombre = prod["nombre"].title()
+            # Ancho disponible varía si hay o no emoji
+            ancho_texto = tarjeta_w - (90 if emoji else 30)
             # Wrap si es largo
             bbox = draw.textbbox((0, 0), nombre, font=f_prod)
-            if bbox[2] - bbox[0] > tarjeta_w - 90:
-                # Recortar con elipsis
-                while nombre and draw.textbbox((0, 0), nombre + "...", font=f_prod)[2] > tarjeta_w - 90:
+            if bbox[2] - bbox[0] > ancho_texto:
+                while nombre and draw.textbbox((0, 0), nombre + "...", font=f_prod)[2] > ancho_texto:
                     nombre = nombre[:-1]
                 if not nombre.endswith("..."):
                     nombre += "..."
-            draw.text((tx + 80, ty + 18), nombre, fill=NEGRO, font=f_prod)
+            draw.text((texto_x, ty + 18), nombre, fill=NEGRO, font=f_prod)
 
             # Unidad
             unidad_txt = prod.get("unidad", "kg")
-            draw.text((tx + 80, ty + 50), unidad_txt, fill=GRIS, font=f_unidad)
+            draw.text((texto_x, ty + 50), unidad_txt, fill=GRIS, font=f_unidad)
 
             # Precio destacado
             precio_txt = f"${prod['precio']:.2f}"
@@ -3087,97 +3119,121 @@ with tab_catalogo:
 
         # ---- SELECCIÓN DE PRODUCTOS ----
         st.markdown("### 🥬 Productos a incluir")
-        st.caption("Marca los productos del día y elige la presentación.")
 
-        # Inicializar estado por producto
-        if "catalogo_productos_state" not in st.session_state:
-            st.session_state.catalogo_productos_state = {}
+        # Inicializar lista de productos seleccionados (formato: dict con nombre -> unidad)
+        if "catalogo_seleccionados" not in st.session_state:
+            st.session_state.catalogo_seleccionados = {}
 
         # Toggle URL de fotos (preparado pero apagado)
-        usar_fotos_url = st.checkbox(
-            "🖼️ Incluir foto del producto desde URL (no disponible aún, próximamente)",
+        st.checkbox(
+            "🖼️ Incluir foto del producto desde URL (próximamente)",
             value=False,
             disabled=True,
             key="usar_fotos_url",
         )
 
-        # Botones grandes de selección masiva (para hacer un catálogo completo de un solo click)
-        st.markdown("**🎯 Selección rápida**")
-        col_a1, col_a2, col_a3 = st.columns([1, 1, 1])
-        with col_a1:
-            if st.button("✅ Seleccionar TODO el catálogo", use_container_width=True, type="primary"):
-                for prod in st.session_state.precios_dict.keys():
-                    st.session_state.catalogo_productos_state[prod] = {
-                        **st.session_state.catalogo_productos_state.get(prod, {}),
-                        "incluido": True,
-                        "unidad": st.session_state.catalogo_productos_state.get(prod, {}).get("unidad", "1 kg"),
-                    }
-                st.rerun()
-        with col_a2:
-            if st.button("❌ Deseleccionar todos", use_container_width=True):
-                for prod in st.session_state.precios_dict.keys():
-                    if prod in st.session_state.catalogo_productos_state:
-                        st.session_state.catalogo_productos_state[prod]["incluido"] = False
-                st.rerun()
-        with col_a3:
-            seleccionados = sum(
-                1 for p, s in st.session_state.catalogo_productos_state.items()
-                if s.get("incluido", False)
-            )
-            total_disponibles = len(st.session_state.precios_dict)
-            st.metric("Seleccionados", f"{seleccionados} / {total_disponibles}")
-
-        # Lista alfabética con checkbox + selector de unidad
         productos_ordenados = sorted(st.session_state.precios_dict.keys())
 
-        for prod in productos_ordenados:
-            precio_kg = limpiar_valor(st.session_state.precios_dict[prod])
-            estado_prev = st.session_state.catalogo_productos_state.get(prod, {})
-            incluido_prev = estado_prev.get("incluido", False)
-            unidad_prev = estado_prev.get("unidad", "1 kg")
+        # ---- Botones de selección masiva ----
+        col_b1, col_b2, col_b3 = st.columns([1.5, 1.5, 1])
+        with col_b1:
+            if st.button("✅ Seleccionar TODO el catálogo", use_container_width=True, type="primary"):
+                # Llenar el dict con todos los productos (default 1 kg)
+                st.session_state.catalogo_seleccionados = {
+                    prod: "1 kg" for prod in productos_ordenados
+                }
+                st.rerun()
+        with col_b2:
+            if st.button("❌ Deseleccionar todos", use_container_width=True):
+                st.session_state.catalogo_seleccionados = {}
+                st.rerun()
+        with col_b3:
+            st.metric(
+                "Seleccionados",
+                f"{len(st.session_state.catalogo_seleccionados)} / {len(productos_ordenados)}"
+            )
 
-            col_p1, col_p2, col_p3 = st.columns([3, 2, 2])
-            with col_p1:
-                incluido = st.checkbox(
-                    f"{emoji_para_producto(prod)} {prod.title()}",
-                    value=incluido_prev,
-                    key=f"chk_{prod}",
-                )
-            with col_p2:
-                unidad = st.selectbox(
-                    "Presentación",
-                    ["1/4 kg", "1/2 kg", "1 kg"],
-                    index=["1/4 kg", "1/2 kg", "1 kg"].index(unidad_prev),
-                    key=f"unit_{prod}",
-                    label_visibility="collapsed",
-                )
-            with col_p3:
-                # Calcular precio según unidad
-                factor = {"1/4 kg": 0.25, "1/2 kg": 0.5, "1 kg": 1.0}[unidad]
+        # ---- Buscador ----
+        st.markdown("**🔎 Buscar y agregar producto**")
+        col_busq, col_unidad = st.columns([3, 1])
+        with col_busq:
+            # Filtrar productos ya seleccionados
+            disponibles = [p for p in productos_ordenados if p not in st.session_state.catalogo_seleccionados]
+            opciones_busqueda = [""] + disponibles
+            producto_a_agregar = st.selectbox(
+                "Escribe para buscar...",
+                opciones_busqueda,
+                format_func=lambda x: (
+                    f"{(emoji_para_producto(x) + ' ') if emoji_para_producto(x) else ''}{x.title()} (${limpiar_valor(st.session_state.precios_dict[x]):.2f}/kg)"
+                    if x else "Selecciona un producto..."
+                ),
+                key="busqueda_producto",
+                label_visibility="collapsed",
+            )
+        with col_unidad:
+            unidad_nueva = st.selectbox(
+                "Unidad",
+                ["1/4 kg", "1/2 kg", "1 kg"],
+                index=2,  # 1 kg por default
+                key="unidad_nueva",
+                label_visibility="collapsed",
+            )
+
+        if producto_a_agregar:
+            if st.button(f"➕ Agregar {producto_a_agregar.title()}", use_container_width=True):
+                st.session_state.catalogo_seleccionados[producto_a_agregar] = unidad_nueva
+                st.rerun()
+
+        # ---- Lista compacta de seleccionados ----
+        if st.session_state.catalogo_seleccionados:
+            st.markdown(f"**🛒 Productos en el catálogo ({len(st.session_state.catalogo_seleccionados)})**")
+
+            # Mostrar en lista compacta, ordenados alfabéticamente
+            seleccionados_ordenados = sorted(st.session_state.catalogo_seleccionados.keys())
+
+            for prod in seleccionados_ordenados:
+                precio_kg = limpiar_valor(st.session_state.precios_dict[prod])
+                unidad_actual = st.session_state.catalogo_seleccionados[prod]
+                factor = {"1/4 kg": 0.25, "1/2 kg": 0.5, "1 kg": 1.0}[unidad_actual]
                 precio_final = precio_kg * factor
-                st.markdown(f"**${precio_final:,.2f}**")
 
-            # Actualizar estado
-            st.session_state.catalogo_productos_state[prod] = {
-                "incluido": incluido,
-                "unidad": unidad,
-            }
+                col_n, col_u, col_p, col_x = st.columns([3, 1.5, 1.5, 0.5])
+                with col_n:
+                    em = emoji_para_producto(prod)
+                    st.write(f"{em + ' ' if em else ''}{prod.title()}")
+                with col_u:
+                    nueva_u = st.selectbox(
+                        "u",
+                        ["1/4 kg", "1/2 kg", "1 kg"],
+                        index=["1/4 kg", "1/2 kg", "1 kg"].index(unidad_actual),
+                        key=f"sel_unit_{prod}",
+                        label_visibility="collapsed",
+                    )
+                    if nueva_u != unidad_actual:
+                        st.session_state.catalogo_seleccionados[prod] = nueva_u
+                        st.rerun()
+                with col_p:
+                    st.write(f"**${precio_final:,.2f}**")
+                with col_x:
+                    if st.button("🗑️", key=f"del_{prod}", help="Quitar del catálogo"):
+                        del st.session_state.catalogo_seleccionados[prod]
+                        st.rerun()
+        else:
+            st.info("Aún no has agregado productos. Usa el buscador arriba o el botón 'Seleccionar TODO'.")
 
         # ---- GENERAR CATÁLOGO ----
         st.markdown("### 📤 Generar catálogo")
         productos_incluidos = []
-        for prod in productos_ordenados:
-            estado = st.session_state.catalogo_productos_state.get(prod, {})
-            if estado.get("incluido", False):
-                unidad = estado.get("unidad", "1 kg")
-                factor = {"1/4 kg": 0.25, "1/2 kg": 0.5, "1 kg": 1.0}[unidad]
-                precio_final = limpiar_valor(st.session_state.precios_dict[prod]) * factor
-                productos_incluidos.append({
-                    "nombre": prod,
-                    "unidad": unidad,
-                    "precio": precio_final,
-                    "emoji": emoji_para_producto(prod),
-                })
+        for prod in sorted(st.session_state.catalogo_seleccionados.keys()):
+            unidad = st.session_state.catalogo_seleccionados[prod]
+            factor = {"1/4 kg": 0.25, "1/2 kg": 0.5, "1 kg": 1.0}[unidad]
+            precio_final = limpiar_valor(st.session_state.precios_dict[prod]) * factor
+            productos_incluidos.append({
+                "nombre": prod,
+                "unidad": unidad,
+                "precio": precio_final,
+                "emoji": emoji_para_producto(prod),
+            })
 
         if not productos_incluidos:
             st.warning("Selecciona al menos un producto.")
