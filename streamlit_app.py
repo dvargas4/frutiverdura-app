@@ -627,9 +627,9 @@ if not st.session_state.precios_dict:
     st.warning("⚠️ Primero carga el catálogo desde el panel lateral.")
     st.stop()
 
-tab_capturar, tab_pegar, tab_modificar, tab_resumen, tab_analisis, tab_mayoreo = st.tabs(
+tab_capturar, tab_pegar, tab_modificar, tab_resumen, tab_analisis, tab_mayoreo, tab_catalogo = st.tabs(
     ["📝 Capturar", "📋 Pegar pedido", "✏️ Modificar", "📊 Resumen y Descarga",
-     "📈 Análisis de clientes", "🛒 Lista de compra"]
+     "📈 Análisis de clientes", "🛒 Lista de compra", "🛍️ Catálogo"]
 )
 
 
@@ -1035,7 +1035,7 @@ def aplicar_alias(descripcion, catalogo_keys):
     return None
 
 
-def buscar_match_catalogo(descripcion, catalogo_keys, umbral=0.4):
+def buscar_match_catalogo(descripcion, catalogo_keys, umbral=0.7):
     """Busca el mejor match. Prioriza coincidencia de la PRIMERA palabra significativa.
 
     Orden de prioridad:
@@ -1062,6 +1062,20 @@ def buscar_match_catalogo(descripcion, catalogo_keys, umbral=0.4):
     desc = re.sub(r"^[\d\.\,/]+\s*(kg|kilo|kilos|k|gr|gramos|g|pz|pza|piezas|pieza|domo|domos|cabeza|manojo|ramo|ramos|penca|cartón|cartones|carton|bolsa|de)\s*", "", desc)
     desc = re.sub(r"^[\d\.\,/]+\s+", "", desc)
     desc = re.sub(r"^de\s+", "", desc)  # "de plátano" -> "plátano"
+
+    # Quitar adjetivos de tamaño/cualidad que no son parte del nombre del producto
+    palabras_adjetivos = {
+        "mediana", "medianas", "mediano", "medianos",
+        "chica", "chicas", "chico", "chicos", "pequeña", "pequeño", "pequeñas", "pequeños",
+        "grande", "grandes",
+        "mini", "minis",
+        "extra",
+        "fresca", "fresco", "frescas", "frescos",
+        "madura", "maduro", "maduras", "maduros",
+        "verde", "verdes",  # solo como adjetivo, no como variedad (manzana verde es alias propio)
+    }
+    palabras_filtradas = [p for p in desc.split() if p not in palabras_adjetivos]
+    desc = " ".join(palabras_filtradas) if palabras_filtradas else desc
 
     palabras = desc.split()
     palabras_norm = []
@@ -2707,3 +2721,547 @@ Abue Lucero
             if st.button("🗑️ Limpiar"):
                 del st.session_state["lista_compra"]
                 st.rerun()
+
+
+# ============================
+# Tab 7: Catálogo (genera PNG / PDF para enviar a clientes)
+# ============================
+
+# Frases organizadas por categoría
+FRASES_CATALOGO = {
+    "🌿 Calidad / Frescura": [
+        "Del mercado a tu puerta, fresco como debe ser.",
+        "Seleccionado a mano. Entregado el mismo día.",
+        "Lo bueno del mercado, sin las filas.",
+    ],
+    "🛵 Servicio / Comodidad": [
+        "Tu mercado, sin filas ni estacionamiento.",
+        "Pide hoy. Recibe mañana. Disfruta toda la semana.",
+        "Frutas y verduras frescas en la comodidad de tu casa.",
+    ],
+    "💛 Personal / Cercana": [
+        "Te llevamos lo mejor del mercado cada sábado.",
+        "Como ir al mercado, pero sin moverte de tu casa.",
+        "Cosechado el viernes, en tu mesa el sábado.",
+    ],
+    "🥗 Saludable / Aspiracional": [
+        "Comer fresco es comer bien.",
+        "Lo natural sabe mejor.",
+        "Salud que se nota desde el primer bocado.",
+    ],
+    "⚡ Con personalidad": [
+        "No vendemos verdura. Llevamos mercado a tu casa.",
+        "Hacemos las filas por ti.",
+        "Madrugamos para que tú no tengas que hacerlo.",
+    ],
+}
+
+
+def emoji_para_producto(nombre):
+    """Asigna un emoji según el nombre del producto."""
+    n = nombre.lower()
+    mapa = {
+        ("manzana",): "🍎", ("plátano", "platano"): "🍌", ("uva",): "🍇",
+        ("naranja",): "🍊", ("mandarina", "tangerina"): "🍊", ("limón", "limon"): "🍋",
+        ("piña", "pina"): "🍍", ("mango",): "🥭", ("pera",): "🍐",
+        ("durazno",): "🍑", ("fresa",): "🍓", ("mora", "blueberry"): "🫐",
+        ("sandía", "sandia"): "🍉", ("melón", "melon"): "🍈", ("cereza", "cherry"): "🍒",
+        ("kiwi",): "🥝", ("aguacate",): "🥑", ("jitomate", "tomate"): "🍅",
+        ("zanahoria",): "🥕", ("papa", "patata"): "🥔", ("camote", "batata"): "🍠",
+        ("brócoli", "brocoli"): "🥦", ("lechuga", "espinaca", "acelga"): "🥬",
+        ("cebolla",): "🧅", ("ajo",): "🧄", ("pepino",): "🥒", ("calabaza", "calabacita"): "🎃",
+        ("elote", "maíz", "maiz"): "🌽", ("chile", "jalapeño", "jalapeno"): "🌶️",
+        ("hongo", "champiñón", "champinon"): "🍄", ("apio",): "🥬",
+        ("huevo",): "🥚", ("queso",): "🧀", ("leche",): "🥛",
+        ("pan",): "🍞", ("miel",): "🍯", ("nuez", "almendra", "cacahuate"): "🥜",
+        ("coco",): "🥥", ("granada",): "🍎", ("papaya",): "🍈",
+        ("jamaica",): "🌺", ("nopal",): "🌵", ("cilantro", "perejil", "hierba"): "🌿",
+    }
+    for claves, emoji in mapa.items():
+        for k in claves:
+            if k in n:
+                return emoji
+    return "🥬"  # default: hoja verde
+
+
+def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entrega, frase, ancho=900, prods_por_pagina=10):
+    """Genera UNA imagen vertical bonita con los productos seleccionados.
+    Devuelve lista de imágenes (una por página si son muchos productos)."""
+
+    # Colores
+    BG = (250, 248, 243)         # crema suave
+    VERDE_OSCURO = (45, 90, 39)   # verde botánico
+    VERDE_CLARO = (140, 180, 100) # verde fresco
+    ACENTO = (220, 130, 50)       # naranja cálido
+    NEGRO = (40, 40, 40)
+    GRIS = (120, 120, 120)
+    BLANCO = (255, 255, 255)
+    TARJETA_BG = (255, 255, 255)
+
+    # Cargar fuentes
+    def font(size, bold=False):
+        candidatos_bold = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+        ]
+        candidatos_reg = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+        ]
+        candidatos = candidatos_bold if bold else candidatos_reg
+        for c in candidatos:
+            try:
+                return ImageFont.truetype(c, size)
+            except (OSError, IOError):
+                continue
+        return ImageFont.load_default()
+
+    f_title = font(46, bold=True)
+    f_subtitle = font(22)
+    f_frase = font(20, bold=True)
+    f_prod = font(24, bold=True)
+    f_precio = font(28, bold=True)
+    f_unidad = font(15)
+    f_info = font(17)
+    f_info_bold = font(17, bold=True)
+    f_footer = font(14)
+
+    # Particionar productos en páginas
+    paginas = [productos[i:i + prods_por_pagina] for i in range(0, len(productos), prods_por_pagina)]
+    if not paginas:
+        paginas = [[]]
+
+    imagenes = []
+    for idx_pag, prods_pagina in enumerate(paginas):
+        # Calcular altura dinámica
+        header_h = 200
+        frase_h = 80
+        info_compra_h = 280  # más alto para incluir mensaje de búsqueda
+        footer_h = 50
+        # Cada tarjeta es ~120 px de alto, en 2 columnas
+        filas = (len(prods_pagina) + 1) // 2
+        tarjetas_h = filas * 135 + 30
+        alto = header_h + frase_h + tarjetas_h + info_compra_h + footer_h
+        if alto < 1200:
+            alto = 1200
+
+        img = Image.new("RGB", (ancho, alto), BG)
+        draw = ImageDraw.Draw(img)
+
+        # ---- Header con franja verde ----
+        draw.rectangle([0, 0, ancho, header_h], fill=VERDE_OSCURO)
+        # Decoración: línea naranja debajo del header
+        draw.rectangle([0, header_h, ancho, header_h + 5], fill=ACENTO)
+
+        # Título grande centrado
+        titulo = "FRUTIVERDURA"
+        bbox = draw.textbbox((0, 0), titulo, font=f_title)
+        tw = bbox[2] - bbox[0]
+        draw.text(((ancho - tw) // 2, 50), titulo, fill=BLANCO, font=f_title)
+
+        subtitulo = "a Domicilio"
+        bbox = draw.textbbox((0, 0), subtitulo, font=f_subtitle)
+        tw = bbox[2] - bbox[0]
+        draw.text(((ancho - tw) // 2, 110), subtitulo, fill=(220, 220, 200), font=f_subtitle)
+
+        # Día de entrega
+        dia_txt = f"📅 Entrega: {dia_entrega}"
+        bbox = draw.textbbox((0, 0), dia_txt, font=f_info)
+        tw = bbox[2] - bbox[0]
+        draw.text(((ancho - tw) // 2, 150), dia_txt, fill=BLANCO, font=f_info)
+
+        # Numero de página si hay varias
+        if len(paginas) > 1:
+            pag_txt = f"Página {idx_pag + 1}/{len(paginas)}"
+            draw.text((ancho - 130, 15), pag_txt, fill=(180, 180, 180), font=f_footer)
+
+        y = header_h + 25
+
+        # ---- Frase pegadora ----
+        # Wrap manual si es larga
+        palabras = frase.split()
+        lineas_frase = []
+        linea_actual = ""
+        for w in palabras:
+            test = (linea_actual + " " + w).strip()
+            bbox = draw.textbbox((0, 0), test, font=f_frase)
+            if bbox[2] - bbox[0] > ancho - 80:
+                if linea_actual:
+                    lineas_frase.append(linea_actual)
+                linea_actual = w
+            else:
+                linea_actual = test
+        if linea_actual:
+            lineas_frase.append(linea_actual)
+
+        for ln in lineas_frase:
+            bbox = draw.textbbox((0, 0), ln, font=f_frase)
+            tw = bbox[2] - bbox[0]
+            draw.text(((ancho - tw) // 2, y), f'"{ln}"' if ln == lineas_frase[0] and len(lineas_frase) == 1 else ln, fill=VERDE_OSCURO, font=f_frase)
+            y += 28
+        y += 25
+
+        # ---- Tarjetas de productos (2 columnas) ----
+        tarjeta_w = (ancho - 60) // 2  # 20 padding lados + 20 espacio entre
+        tarjeta_h = 120
+        pad_x = 20
+        for i, prod in enumerate(prods_pagina):
+            col = i % 2
+            fila = i // 2
+            tx = pad_x + col * (tarjeta_w + 20)
+            ty = y + fila * (tarjeta_h + 15)
+
+            # Sombra suave
+            draw.rectangle([tx + 3, ty + 3, tx + tarjeta_w + 3, ty + tarjeta_h + 3], fill=(220, 215, 205))
+            # Tarjeta blanca con borde verde
+            draw.rectangle([tx, ty, tx + tarjeta_w, ty + tarjeta_h], fill=TARJETA_BG, outline=VERDE_CLARO, width=2)
+
+            # Emoji grande a la izquierda
+            emoji = prod.get("emoji", "🥬")
+            draw.text((tx + 15, ty + 25), emoji, fill=NEGRO, font=f_title)
+
+            # Nombre del producto
+            nombre = prod["nombre"].title()
+            # Wrap si es largo
+            bbox = draw.textbbox((0, 0), nombre, font=f_prod)
+            if bbox[2] - bbox[0] > tarjeta_w - 90:
+                # Recortar con elipsis
+                while nombre and draw.textbbox((0, 0), nombre + "...", font=f_prod)[2] > tarjeta_w - 90:
+                    nombre = nombre[:-1]
+                if not nombre.endswith("..."):
+                    nombre += "..."
+            draw.text((tx + 80, ty + 18), nombre, fill=NEGRO, font=f_prod)
+
+            # Unidad
+            unidad_txt = prod.get("unidad", "kg")
+            draw.text((tx + 80, ty + 50), unidad_txt, fill=GRIS, font=f_unidad)
+
+            # Precio destacado
+            precio_txt = f"${prod['precio']:.2f}"
+            bbox = draw.textbbox((0, 0), precio_txt, font=f_precio)
+            pw = bbox[2] - bbox[0]
+            draw.text((tx + tarjeta_w - pw - 15, ty + 70), precio_txt, fill=ACENTO, font=f_precio)
+
+        y += filas * (tarjeta_h + 15) + 30
+
+        # ---- Bloque de información de compra ----
+        info_y = alto - info_compra_h - footer_h
+        # Fondo verde claro
+        draw.rectangle([20, info_y, ancho - 20, info_y + info_compra_h - 20], fill=(235, 245, 225), outline=VERDE_OSCURO, width=2)
+
+        # Título "PARA ORDENAR"
+        ordenar_txt = "📲 PARA ORDENAR"
+        bbox = draw.textbbox((0, 0), ordenar_txt, font=f_prod)
+        tw = bbox[2] - bbox[0]
+        draw.text(((ancho - tw) // 2, info_y + 15), ordenar_txt, fill=VERDE_OSCURO, font=f_prod)
+
+        # Línea de contacto
+        contacto_txt = f"📱 {contacto_nombre}: {contacto_tel}"
+        bbox = draw.textbbox((0, 0), contacto_txt, font=f_info_bold)
+        tw = bbox[2] - bbox[0]
+        draw.text(((ancho - tw) // 2, info_y + 55), contacto_txt, fill=NEGRO, font=f_info_bold)
+
+        # Envío
+        envio_txt = f"🛵 Envío: $35"
+        bbox = draw.textbbox((0, 0), envio_txt, font=f_info)
+        tw = bbox[2] - bbox[0]
+        draw.text(((ancho - tw) // 2, info_y + 88), envio_txt, fill=NEGRO, font=f_info)
+
+        # Pago
+        pago_txt = "💳 Efectivo · Transferencia · Tarjeta débito/crédito"
+        bbox = draw.textbbox((0, 0), pago_txt, font=f_info)
+        tw = bbox[2] - bbox[0]
+        if tw > ancho - 60:
+            l1 = "💳 Efectivo · Transferencia"
+            l2 = "Tarjeta débito o crédito"
+            bbox1 = draw.textbbox((0, 0), l1, font=f_info)
+            bbox2 = draw.textbbox((0, 0), l2, font=f_info)
+            draw.text(((ancho - (bbox1[2] - bbox1[0])) // 2, info_y + 115), l1, fill=NEGRO, font=f_info)
+            draw.text(((ancho - (bbox2[2] - bbox2[0])) // 2, info_y + 140), l2, fill=NEGRO, font=f_info)
+        else:
+            draw.text(((ancho - tw) // 2, info_y + 115), pago_txt, fill=NEGRO, font=f_info)
+
+        # Mensaje destacado: si no está en el catálogo, lo buscamos
+        # Solo en la última página para no repetirlo
+        if idx_pag == len(paginas) - 1:
+            buscar_y = info_y + 165
+            # Fondo naranja suave para destacar
+            draw.rectangle(
+                [40, buscar_y, ancho - 40, buscar_y + 35],
+                fill=(255, 240, 220),
+                outline=ACENTO,
+                width=2,
+            )
+            buscar_txt = "🔎 ¿No ves tu producto? Lo buscamos y te lo llevamos."
+            bbox = draw.textbbox((0, 0), buscar_txt, font=f_info_bold)
+            tw = bbox[2] - bbox[0]
+            if tw > ancho - 80:
+                # Dos líneas si no cabe
+                l1 = "🔎 ¿No ves tu producto?"
+                l2 = "Lo buscamos y te lo llevamos."
+                draw.rectangle(
+                    [40, buscar_y, ancho - 40, buscar_y + 55],
+                    fill=(255, 240, 220),
+                    outline=ACENTO,
+                    width=2,
+                )
+                bbox1 = draw.textbbox((0, 0), l1, font=f_info_bold)
+                bbox2 = draw.textbbox((0, 0), l2, font=f_info_bold)
+                draw.text(((ancho - (bbox1[2] - bbox1[0])) // 2, buscar_y + 7), l1, fill=ACENTO, font=f_info_bold)
+                draw.text(((ancho - (bbox2[2] - bbox2[0])) // 2, buscar_y + 30), l2, fill=NEGRO, font=f_info_bold)
+            else:
+                draw.text(((ancho - tw) // 2, buscar_y + 8), buscar_txt, fill=ACENTO, font=f_info_bold)
+
+        # ---- Footer ----
+        fecha_gen = datetime.now(pytz.timezone(ZONA_HORARIA)).strftime("%d/%m/%Y")
+        footer_txt = f"Catálogo válido para entrega del {dia_entrega} · Generado {fecha_gen}"
+        bbox = draw.textbbox((0, 0), footer_txt, font=f_footer)
+        tw = bbox[2] - bbox[0]
+        draw.text(((ancho - tw) // 2, alto - 30), footer_txt, fill=GRIS, font=f_footer)
+
+        imagenes.append(img)
+
+    return imagenes
+
+
+with tab_catalogo:
+    st.subheader("🛍️ Generar catálogo para clientes")
+    st.caption("Selecciona productos, define unidades, día de entrega y genera un catálogo bonito en PNG o PDF para mandar por WhatsApp.")
+
+    if not st.session_state.precios_dict:
+        st.warning("⚠️ Carga el catálogo primero (desde Google Sheets o CSV) antes de generar.")
+    else:
+        # ---- CONFIGURACIÓN GENERAL ----
+        st.markdown("### ⚙️ Configuración del catálogo")
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            cat_contacto = st.selectbox(
+                "Contacto que aparece en el catálogo",
+                list(CONTACTOS.keys()),
+                key="cat_contacto",
+            )
+        with col_c2:
+            hoy_mx = datetime.now(pytz.timezone(ZONA_HORARIA)).date()
+            dia_entrega_date = st.date_input(
+                "Día de entrega",
+                value=hoy_mx,
+                key="cat_dia_entrega",
+            )
+
+        # Formateo bonito del día (ej: "Sábado 25 de abril")
+        DIAS_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+        MESES_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
+                    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+        dia_entrega_str = f"{DIAS_ES[dia_entrega_date.weekday()]} {dia_entrega_date.day} de {MESES_ES[dia_entrega_date.month - 1]}"
+
+        st.markdown("### 💬 Frase del catálogo")
+        st.caption("Elige una categoría para ver opciones de frase, o escribe la tuya.")
+
+        # Opción de escribir frase propia
+        usar_propia = st.checkbox("✍️ Escribir mi propia frase", key="usar_frase_propia")
+        if usar_propia:
+            frase_seleccionada = st.text_input(
+                "Tu frase",
+                value="",
+                placeholder="ej: Sabor del mercado, directo a tu casa.",
+                key="frase_propia",
+            )
+        else:
+            # Mostrar todas las categorías como expanders
+            frase_seleccionada = ""
+            categoria_elegida = st.session_state.get("cat_categoria_elegida", None)
+
+            for categoria, frases in FRASES_CATALOGO.items():
+                with st.expander(categoria, expanded=(categoria == categoria_elegida)):
+                    for i, fr in enumerate(frases):
+                        key_btn = f"frase_{categoria}_{i}"
+                        is_selected = (st.session_state.get("frase_actual", "") == fr)
+                        label = f"{'✅ ' if is_selected else ''}{fr}"
+                        if st.button(label, key=key_btn, use_container_width=True):
+                            st.session_state["frase_actual"] = fr
+                            st.session_state["cat_categoria_elegida"] = categoria
+                            st.rerun()
+
+            frase_seleccionada = st.session_state.get("frase_actual", "")
+            if frase_seleccionada:
+                st.success(f"Frase seleccionada: *{frase_seleccionada}*")
+            else:
+                st.info("Haz click en una frase para elegirla.")
+
+        # ---- SELECCIÓN DE PRODUCTOS ----
+        st.markdown("### 🥬 Productos a incluir")
+        st.caption("Marca los productos del día y elige la presentación.")
+
+        # Inicializar estado por producto
+        if "catalogo_productos_state" not in st.session_state:
+            st.session_state.catalogo_productos_state = {}
+
+        # Toggle URL de fotos (preparado pero apagado)
+        usar_fotos_url = st.checkbox(
+            "🖼️ Incluir foto del producto desde URL (no disponible aún, próximamente)",
+            value=False,
+            disabled=True,
+            key="usar_fotos_url",
+        )
+
+        # Botones grandes de selección masiva (para hacer un catálogo completo de un solo click)
+        st.markdown("**🎯 Selección rápida**")
+        col_a1, col_a2, col_a3 = st.columns([1, 1, 1])
+        with col_a1:
+            if st.button("✅ Seleccionar TODO el catálogo", use_container_width=True, type="primary"):
+                for prod in st.session_state.precios_dict.keys():
+                    st.session_state.catalogo_productos_state[prod] = {
+                        **st.session_state.catalogo_productos_state.get(prod, {}),
+                        "incluido": True,
+                        "unidad": st.session_state.catalogo_productos_state.get(prod, {}).get("unidad", "1 kg"),
+                    }
+                st.rerun()
+        with col_a2:
+            if st.button("❌ Deseleccionar todos", use_container_width=True):
+                for prod in st.session_state.precios_dict.keys():
+                    if prod in st.session_state.catalogo_productos_state:
+                        st.session_state.catalogo_productos_state[prod]["incluido"] = False
+                st.rerun()
+        with col_a3:
+            seleccionados = sum(
+                1 for p, s in st.session_state.catalogo_productos_state.items()
+                if s.get("incluido", False)
+            )
+            total_disponibles = len(st.session_state.precios_dict)
+            st.metric("Seleccionados", f"{seleccionados} / {total_disponibles}")
+
+        # Lista alfabética con checkbox + selector de unidad
+        productos_ordenados = sorted(st.session_state.precios_dict.keys())
+
+        for prod in productos_ordenados:
+            precio_kg = st.session_state.precios_dict[prod]
+            estado_prev = st.session_state.catalogo_productos_state.get(prod, {})
+            incluido_prev = estado_prev.get("incluido", False)
+            unidad_prev = estado_prev.get("unidad", "1 kg")
+
+            col_p1, col_p2, col_p3 = st.columns([3, 2, 2])
+            with col_p1:
+                incluido = st.checkbox(
+                    f"{emoji_para_producto(prod)} {prod.title()}",
+                    value=incluido_prev,
+                    key=f"chk_{prod}",
+                )
+            with col_p2:
+                unidad = st.selectbox(
+                    "Presentación",
+                    ["1/4 kg", "1/2 kg", "1 kg"],
+                    index=["1/4 kg", "1/2 kg", "1 kg"].index(unidad_prev),
+                    key=f"unit_{prod}",
+                    label_visibility="collapsed",
+                )
+            with col_p3:
+                # Calcular precio según unidad
+                factor = {"1/4 kg": 0.25, "1/2 kg": 0.5, "1 kg": 1.0}[unidad]
+                precio_final = precio_kg * factor
+                st.markdown(f"**${precio_final:,.2f}**")
+
+            # Actualizar estado
+            st.session_state.catalogo_productos_state[prod] = {
+                "incluido": incluido,
+                "unidad": unidad,
+            }
+
+        # ---- GENERAR CATÁLOGO ----
+        st.markdown("### 📤 Generar catálogo")
+        productos_incluidos = []
+        for prod in productos_ordenados:
+            estado = st.session_state.catalogo_productos_state.get(prod, {})
+            if estado.get("incluido", False):
+                unidad = estado.get("unidad", "1 kg")
+                factor = {"1/4 kg": 0.25, "1/2 kg": 0.5, "1 kg": 1.0}[unidad]
+                precio_final = st.session_state.precios_dict[prod] * factor
+                productos_incluidos.append({
+                    "nombre": prod,
+                    "unidad": unidad,
+                    "precio": precio_final,
+                    "emoji": emoji_para_producto(prod),
+                })
+
+        if not productos_incluidos:
+            st.warning("Selecciona al menos un producto.")
+        elif not frase_seleccionada:
+            st.warning("Elige o escribe una frase para el catálogo.")
+        else:
+            st.success(f"Listo para generar con {len(productos_incluidos)} productos.")
+
+            if st.button("🎨 Generar catálogo", type="primary", use_container_width=True):
+                with st.spinner("Generando catálogo..."):
+                    imagenes = generar_catalogo_imagen(
+                        productos_incluidos,
+                        cat_contacto,
+                        CONTACTOS[cat_contacto],
+                        dia_entrega_str,
+                        frase_seleccionada,
+                        ancho=900,
+                        prods_por_pagina=10,
+                    )
+                    st.session_state["catalogo_generado"] = imagenes
+
+            if "catalogo_generado" in st.session_state:
+                imagenes = st.session_state["catalogo_generado"]
+
+                st.markdown("#### 👁️ Vista previa")
+                for i, img in enumerate(imagenes):
+                    st.image(img, caption=f"Página {i+1}" if len(imagenes) > 1 else "Catálogo", use_container_width=True)
+
+                st.markdown("#### 📥 Descargar")
+                col_d1, col_d2 = st.columns(2)
+
+                # Descargar como PNG (ZIP si son varias páginas)
+                with col_d1:
+                    if len(imagenes) == 1:
+                        png_buf = io.BytesIO()
+                        imagenes[0].save(png_buf, format="PNG")
+                        png_buf.seek(0)
+                        st.download_button(
+                            "🖼️ Descargar PNG",
+                            data=png_buf.getvalue(),
+                            file_name=f"catalogo_{dia_entrega_date.strftime('%Y-%m-%d')}.png",
+                            mime="image/png",
+                            use_container_width=True,
+                        )
+                    else:
+                        zip_buf = io.BytesIO()
+                        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                            for i, img in enumerate(imagenes):
+                                png_b = io.BytesIO()
+                                img.save(png_b, format="PNG")
+                                zf.writestr(f"catalogo_pag{i+1}.png", png_b.getvalue())
+                        zip_buf.seek(0)
+                        st.download_button(
+                            "🖼️ Descargar PNGs (ZIP)",
+                            data=zip_buf.getvalue(),
+                            file_name=f"catalogo_{dia_entrega_date.strftime('%Y-%m-%d')}.zip",
+                            mime="application/zip",
+                            use_container_width=True,
+                        )
+
+                # Descargar como PDF
+                with col_d2:
+                    pdf_buf = io.BytesIO()
+                    imagenes[0].save(
+                        pdf_buf,
+                        format="PDF",
+                        save_all=True,
+                        append_images=imagenes[1:] if len(imagenes) > 1 else [],
+                        resolution=100,
+                    )
+                    pdf_buf.seek(0)
+                    st.download_button(
+                        "📄 Descargar PDF",
+                        data=pdf_buf.getvalue(),
+                        file_name=f"catalogo_{dia_entrega_date.strftime('%Y-%m-%d')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+
+                if st.button("🗑️ Limpiar y generar de nuevo"):
+                    del st.session_state["catalogo_generado"]
+                    st.rerun()
