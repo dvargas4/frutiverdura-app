@@ -32,7 +32,7 @@ SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1J3-J_evoyTJcLP94Gwixd
 
 CONTACTOS = {
     "IVAN": "55 3497 6860",
-    "JUAN PABLO": "55 3058 4417",
+    "MINISUPER DOS V": "220 647 7892",
     "DIEGO": "55 5056 2131",
 }
 
