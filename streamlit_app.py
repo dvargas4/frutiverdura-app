@@ -3510,6 +3510,27 @@ with tab_catalogo:
         if "catalogo_seleccionados" not in st.session_state:
             st.session_state.catalogo_seleccionados = {}
 
+        # Sincronizar la selección con el catálogo actual.
+        seleccionados = st.session_state.catalogo_seleccionados
+        precios = st.session_state.precios_dict
+
+        faltantes = [
+            producto
+            for producto in seleccionados
+            if producto not in precios
+            or "precio_venta_kg" not in precios[producto]
+        ]
+
+        if faltantes:
+            for producto in faltantes:
+                del seleccionados[producto]
+
+            st.warning(
+                "Se quitaron de la selección productos sin precio "
+                "en el catálogo actual: "
+                + ", ".join(faltantes)
+                + ". Revisa sus nombres y precios antes de agregarlos."
+            )
         # Toggle URL de fotos (preparado pero apagado)
         st.checkbox(
             "🖼️ Incluir foto del producto desde URL (próximamente)",
