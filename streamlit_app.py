@@ -381,7 +381,8 @@ def calcular_productos_factura(lineas, envio=0.0, comision=0.0):
     """Ajusta costos y prorratea cargos en centavos sin alterar el catálogo.
 
     Cada línea contiene nombre, gramos, costo_kg, precio_kg e incremento_pct.
-    El porcentaje modifica el costo; envío y comisión modifican solo la venta.
+    El incremento monetario del costo se traslada a la venta. Los dos cargos
+    adicionales se integran solo en la venta.
     """
     from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR
 
@@ -400,13 +401,18 @@ def calcular_productos_factura(lineas, envio=0.0, comision=0.0):
         if gramos <= 0:
             raise ValueError("Cada producto debe tener una cantidad mayor que cero.")
         cantidades.append(gramos)
-        costos.append(centavos(gramos * numero(linea["costo_kg"]) / 1000
-                               * (1 + numero(linea.get("incremento_pct", 0)) / 100)))
-        bases.append(centavos(gramos * numero(linea["precio_kg"]) / 1000))
+        costo_base = gramos * numero(linea["costo_kg"]) / 1000
+        tasa = numero(linea.get("incremento_pct", 0)) / 100
+        if tasa >= 1:
+            raise ValueError("El porcentaje de impuestos debe ser menor que 100%.")
+        costo_ajustado = centavos(costo_base / (1 - tasa))
+        aumento_costo = costo_ajustado - centavos(costo_base)
+        costos.append(costo_ajustado)
+        bases.append(centavos(gramos * numero(linea["precio_kg"]) / 1000) + aumento_costo)
     extras = centavos(numero(envio)) + centavos(numero(comision))
     if not lineas:
         if extras:
-            raise ValueError("Agrega productos antes de distribuir envío o comisión.")
+            raise ValueError("Agrega productos antes de distribuir el adicional a la venta o la comisión.")
         return []
     # Reparto proporcional a la venta base; si toda la venta es cero, por peso.
     pesos = list(map(Decimal, bases)) if sum(bases) else cantidades
@@ -1586,13 +1592,13 @@ with tab_factura:
 
     st.subheader("Factura")
     st.markdown("**Cómo se factura**")
-    st.caption("El porcentaje aumenta el costo del producto. La venta parte del precio del catálogo. "
-               "Envío y comisión se suman a la venta y a la utilidad, repartidos entre los productos. "
-               "Los ajustes se aplican solo a estos pedidos.")
+    st.caption("Costo ajustado = costo base ÷ (1 − impuestos/100). La diferencia se suma también a la venta. "
+               "El adicional a la venta y la comisión son montos separados por pedido: "
+               "se reparten entre los productos y aumentan la utilidad.")
     incremento_default = st.number_input(
-        "Incremento del costo por defecto (%)", min_value=0.0, value=0.0,
+        "1. Impuestos sobre el total (%)", min_value=0.0, max_value=99.99, value=0.0,
         step=1.0, key=f"factura_{rk}_incremento_default",
-        help="Se usa al procesar. Después puedes cambiar el porcentaje de cada producto.")
+        help="Ejemplo: $8,400 ÷ (1 − 16%) = $10,000. Se usa al procesar; puedes ajustarlo por producto.")
     st.caption(
         "Pega solo la lista de productos. El nombre del cliente y el contacto los pones aquí arriba. "
         "Si pegas varios clientes, sepáralos con línea en blanco y pon el nombre arriba de cada lista."
@@ -1777,13 +1783,13 @@ Laura Canales
                 ce, cc = st.columns(2)
                 with ce:
                     ped["envio_integrado"] = st.number_input(
-                        "Envío ($)", min_value=0.0, value=0.0, step=1.0,
+                        "2. Adicional a la venta ($)", min_value=0.0, value=0.0, step=1.0,
                         key=f"factura_{rk}_prev_envio_{i}")
                 with cc:
                     ped["comision_integrada"] = st.number_input(
-                        "Comisión ($)", min_value=0.0, value=0.0, step=1.0,
+                        "3. Comisión ($)", min_value=0.0, value=0.0, step=1.0,
                         key=f"factura_{rk}_prev_comision_{i}")
-                st.caption("Importes por pedido. Se integran proporcionalmente en la venta de los productos.")
+                st.caption("Ambos importes pueden ser $0. Se reparten proporcionalmente en la venta, sin aumentar el costo.")
 
                 for j, prod in enumerate(ped["productos"]):
                     col1, col2, col3 = st.columns([3, 3, 1])
@@ -1824,8 +1830,8 @@ Laura Canales
                         prod["gramos"] = nuevos_g
 
                     prod["incremento_pct"] = st.number_input(
-                        f"Incremento del costo (%) · {prod['descripcion_original']}",
-                        min_value=0.0, value=float(prod.get("incremento_pct", 0.0)), step=1.0,
+                        f"Impuestos sobre el total (%) · {prod['descripcion_original']}",
+                        min_value=0.0, max_value=99.99, value=min(99.99, float(prod.get("incremento_pct", 0.0))), step=1.0,
                         key=f"factura_{rk}_prev_incremento_{i}_{j}")
 
                     # Si el usuario eligió "Crear nuevo producto", mostrar formulario
@@ -2037,20 +2043,20 @@ with tab_modificar:
                 st.rerun()
 
             if pedido.get("tipo") == "factura":
-                st.caption("Ajusta la factura. Envío y comisión siguen integrados en los productos.")
+                st.caption("Costo ajustado = costo base ÷ (1 − impuestos/100). La diferencia sube también la venta; adicional y comisión aumentan la utilidad.")
                 rev_factura = pedido.get("revision_factura", 0)
                 with st.form(f"editar_factura_{edit_key}_{rev_factura}"):
-                    envio_edit = st.number_input("Envío ($)", min_value=0.0,
+                    envio_edit = st.number_input("2. Adicional a la venta ($)", min_value=0.0,
                         value=float(pedido["envio_integrado"]), key=f"fe_env_{edit_key}_{rev_factura}")
-                    comision_edit = st.number_input("Comisión ($)", min_value=0.0,
+                    comision_edit = st.number_input("3. Comisión ($)", min_value=0.0,
                         value=float(pedido["comision_integrada"]), key=f"fe_com_{edit_key}_{rev_factura}")
                     lineas_edit = []
                     for j, linea in enumerate(pedido["lineas_factura"]):
                         st.write(linea["nombre"])
                         gramos_edit = st.number_input("Gramos (0 para quitar)", min_value=0.0,
                             value=float(linea["gramos"]), key=f"fe_gr_{edit_key}_{rev_factura}_{j}")
-                        pct_edit = st.number_input("Incremento del costo (%)", min_value=0.0,
-                            value=float(linea["incremento_pct"]), key=f"fe_pct_{edit_key}_{rev_factura}_{j}")
+                        pct_edit = st.number_input("Impuestos sobre el total (%)", min_value=0.0, max_value=99.99,
+                            value=min(99.99, float(linea["incremento_pct"])), key=f"fe_pct_{edit_key}_{rev_factura}_{j}")
                         if gramos_edit > 0:
                             lineas_edit.append({**linea, "gramos": gramos_edit, "incremento_pct": pct_edit})
                     if st.form_submit_button("Guardar cambios de factura"):
@@ -4138,4 +4144,3 @@ with tab_catalogo:
                 if st.button("🗑️ Limpiar y generar de nuevo"):
                     del st.session_state["catalogo_generado"]
                     st.rerun()
-
