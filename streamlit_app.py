@@ -10,6 +10,7 @@ import pytz
 import io
 import zipfile
 import os
+from uuid import uuid4
 
 # ============================
 # Configuración de página
@@ -92,9 +93,24 @@ if "pegar_reset_count" not in st.session_state:
 def limpiar_valor(valor):
     """Conserva la lógica original: coma decimal -> punto decimal."""
     try:
-        return float(str(valor).replace("$", "").replace(",", ".").strip())
+        import math
+        numero = float(str(valor).replace("$", "").replace(",", ".").strip())
+        return numero if math.isfinite(numero) else 0.0
     except (ValueError, AttributeError):
         return 0.0
+
+
+def catalogo_desde_filas(filas):
+    precios, costos = {}, {}
+    for numero_fila, fila in enumerate(filas, start=2):
+        nombre = str(fila[1]).strip().lower() if len(fila) > 1 else ""
+        if not nombre:
+            continue
+        if len(fila) < 9 or not str(fila[7]).strip() or not str(fila[8]).strip():
+            raise ValueError(f"Falta costo o precio de {nombre} en la fila {numero_fila} del catálogo.")
+        precios[nombre] = {"precio_venta_kg": limpiar_valor(fila[8])}
+        costos[nombre] = {"costo_kg": limpiar_valor(fila[7])}
+    return precios, costos
 
 
 @st.cache_data(ttl=300, show_spinner="Cargando catálogo desde Google Sheets...")
@@ -110,18 +126,8 @@ def cargar_catalogo_gsheets():
     client = gspread.authorize(creds)
     sheet = client.open_by_url(SPREADSHEET_URL).worksheet("PRECIOS")
 
-    productos_lista = [p.strip().lower() for p in sheet.col_values(2)[1:] if p.strip()]
-    costos_lista = [limpiar_valor(v) for v in sheet.col_values(8)[1:] if v.strip()]
-    precios_lista = [limpiar_valor(v) for v in sheet.col_values(9)[1:] if v.strip()]
-
-    precios = {
-        p: {"precio_venta_kg": pv}
-        for p, pv in zip(productos_lista, precios_lista)
-    }
-    costos = {
-        p: {"costo_kg": c}
-        for p, c in zip(productos_lista, costos_lista)
-    }
+    # Leer filas completas: los huecos nunca deben desplazar costos/precios.
+    precios, costos = catalogo_desde_filas(sheet.get_all_values()[1:])
     return precios, costos
 
 
@@ -133,6 +139,8 @@ def cargar_catalogo_csv(archivo):
     precios = {}
     costos = {}
     for _, row in df.iterrows():
+        if pd.isna(row.get("producto")):
+            continue
         nombre = str(row.get("producto", "")).strip().lower()
         if not nombre:
             continue
@@ -341,13 +349,18 @@ def cargar_historico():
 # Cálculo de totales
 # ============================
 def calcular_totales(productos, lleva_envio, descuento=0.0):
-    subtotal_costo = sum(p[2] for p in productos)
-    subtotal_venta = sum(p[3] for p in productos)
-    costo_envio = COSTO_ENVIO if lleva_envio else 0
+    from decimal import Decimal, ROUND_HALF_UP
+    def dinero(valor):
+        return Decimal(str(valor)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    subtotal_costo = sum((dinero(p[2]) for p in productos), Decimal(0))
+    subtotal_venta = sum((dinero(p[3]) for p in productos), Decimal(0))
+    costo_envio = dinero(COSTO_ENVIO if lleva_envio else 0)
     total_venta = subtotal_venta + costo_envio
-    nuevo_total = total_venta - descuento
+    nuevo_total = total_venta - dinero(descuento)
     utilidad = nuevo_total - subtotal_costo
-    utilidad_pct = (utilidad / subtotal_costo * 100) if subtotal_costo > 0 else 0
+    utilidad_pct = float(utilidad / subtotal_costo * 100) if subtotal_costo > 0 else 0
+    subtotal_costo, subtotal_venta, costo_envio, total_venta, nuevo_total, utilidad = map(
+        float, (subtotal_costo, subtotal_venta, costo_envio, total_venta, nuevo_total, utilidad))
     return {
         "subtotal_costo": subtotal_costo,
         "subtotal_venta": subtotal_venta,
@@ -362,6 +375,65 @@ def calcular_totales(productos, lleva_envio, descuento=0.0):
 # ============================
 # Generación del ticket PNG (en memoria, sin escribir a disco)
 # ============================
+
+# Factura: importes internos, integrados en las líneas de producto.
+def calcular_productos_factura(lineas, envio=0.0, comision=0.0):
+    """Ajusta costos y prorratea cargos en centavos sin alterar el catálogo.
+
+    Cada línea contiene nombre, gramos, costo_kg, precio_kg e incremento_pct.
+    El porcentaje modifica el costo; envío y comisión modifican solo la venta.
+    """
+    from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR
+
+    def numero(valor):
+        resultado = Decimal(str(valor))
+        if not resultado.is_finite() or resultado < 0:
+            raise ValueError("Los importes, porcentajes y cantidades deben ser finitos y no negativos.")
+        return resultado
+
+    def centavos(valor):
+        return int((valor * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+    bases, costos, cantidades = [], [], []
+    for linea in lineas:
+        gramos = numero(linea["gramos"])
+        if gramos <= 0:
+            raise ValueError("Cada producto debe tener una cantidad mayor que cero.")
+        cantidades.append(gramos)
+        costos.append(centavos(gramos * numero(linea["costo_kg"]) / 1000
+                               * (1 + numero(linea.get("incremento_pct", 0)) / 100)))
+        bases.append(centavos(gramos * numero(linea["precio_kg"]) / 1000))
+    extras = centavos(numero(envio)) + centavos(numero(comision))
+    if not lineas:
+        if extras:
+            raise ValueError("Agrega productos antes de distribuir envío o comisión.")
+        return []
+    # Reparto proporcional a la venta base; si toda la venta es cero, por peso.
+    pesos = list(map(Decimal, bases)) if sum(bases) else cantidades
+    total_pesos = sum(pesos)
+    cuotas = [Decimal(extras) * peso / total_pesos for peso in pesos]
+    reparto = [int(cuota.to_integral_value(rounding=ROUND_FLOOR)) for cuota in cuotas]
+    orden = sorted(range(len(lineas)), key=lambda i: cuotas[i] - reparto[i], reverse=True)
+    for i in orden[:extras - sum(reparto)]:
+        reparto[i] += 1
+    return [(linea["nombre"], float(cantidades[i]), costos[i] / 100,
+             (bases[i] + reparto[i]) / 100) for i, linea in enumerate(lineas)]
+
+
+def mostrar_resumen_factura(productos):
+    st.dataframe(pd.DataFrame([
+        {"Producto": n, "Gramos": g, "Costo ajustado ($)": c,
+         "Precio venta/kg ($)": round(v * 1000 / g, 4),
+         "Venta final ($)": v, "Utilidad ($)": round(v - c, 2)}
+        for n, g, c, v in productos
+    ]), use_container_width=True, hide_index=True)
+    totales = calcular_totales(productos, False)
+    a, b, c = st.columns(3)
+    a.metric("Costo ajustado", f"${totales['subtotal_costo']:,.2f}")
+    b.metric("Venta final", f"${totales['nuevo_total']:,.2f}")
+    c.metric("Utilidad", f"${totales['utilidad']:,.2f}")
+
+
 def generar_ticket_png(pedido):
     """Genera la imagen del ticket y devuelve los bytes PNG.
     Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
@@ -615,6 +687,10 @@ with st.sidebar:
         st.session_state.productos_actuales = []
         st.session_state.gastos_sesion = []
         st.session_state["historico_guardado_sesion"] = False
+        st.session_state.pop("preview_pedidos", None)
+        st.session_state.pop("factura_preview_pedidos", None)
+        st.session_state.pegar_reset_count += 1
+        st.session_state["factura_reset_count"] = st.session_state.get("factura_reset_count", 0) + 1
         st.rerun()
 
 
@@ -627,156 +703,10 @@ if not st.session_state.precios_dict:
     st.warning("⚠️ Primero carga el catálogo desde el panel lateral.")
     st.stop()
 
-tab_capturar, tab_pegar, tab_modificar, tab_resumen, tab_analisis, tab_mayoreo, tab_catalogo = st.tabs(
-    ["📝 Capturar", "📋 Pegar pedido", "✏️ Modificar", "📊 Resumen y Descarga",
+tab_pegar, tab_factura, tab_modificar, tab_resumen, tab_analisis, tab_mayoreo, tab_catalogo = st.tabs(
+    ["Tickets sin factura", "Factura", "✏️ Modificar", "📊 Resumen y Descarga",
      "📈 Análisis de clientes", "🛒 Lista de compra", "🛍️ Catálogo"]
 )
-
-
-# ============================
-# Tab 1: Capturar
-# ============================
-with tab_capturar:
-    st.subheader("Nuevo ticket")
-
-    col1, col2, col3 = st.columns([2, 2, 1])
-    with col1:
-        nombre_cliente = st.text_input("Nombre del cliente", key="in_cliente")
-    with col2:
-        nombre_contacto = st.selectbox("Contacto", list(CONTACTOS.keys()), key="in_contacto")
-    with col3:
-        lleva_envio = st.checkbox("Envío (+$35)", value=False, key="in_envio")
-
-    st.divider()
-    st.markdown("**Agregar productos**")
-
-    productos_catalogo = sorted(st.session_state.precios_dict.keys())
-
-    col_p, col_g, col_b = st.columns([3, 1, 1])
-    with col_p:
-        producto_sel = st.selectbox(
-            "Producto",
-            [""] + productos_catalogo,
-            format_func=lambda x: x.title() if x else "-- selecciona --",
-            key="in_producto",
-        )
-    with col_g:
-        gramos = st.number_input("Gramos", min_value=0, value=500, step=50, key="in_gramos")
-    with col_b:
-        st.write("")
-        st.write("")
-        agregar = st.button("➕ Agregar", use_container_width=True)
-
-    with st.expander("¿Producto no está en el catálogo? Agregar manualmente"):
-        col_mp, col_mc, col_mv, col_mb = st.columns([2, 1, 1, 1])
-        with col_mp:
-            nuevo_nombre = st.text_input("Nombre", key="in_manual_nombre")
-        with col_mc:
-            nuevo_costo = st.number_input("Costo/kg", min_value=0.0, step=1.0, key="in_manual_costo")
-        with col_mv:
-            nuevo_precio = st.number_input("Precio/kg", min_value=0.0, step=1.0, key="in_manual_precio")
-        with col_mb:
-            st.write("")
-            st.write("")
-            if st.button("Agregar al catálogo", use_container_width=True):
-                if nuevo_nombre.strip() and nuevo_costo > 0 and nuevo_precio > 0:
-                    key = nuevo_nombre.strip().lower()
-                    st.session_state.precios_dict[key] = {"precio_venta_kg": nuevo_precio}
-                    st.session_state.costos_dict[key] = {"costo_kg": nuevo_costo}
-                    st.success(f"✅ {key.title()} agregado al catálogo")
-                    st.rerun()
-
-    if agregar and producto_sel and gramos > 0:
-        precio_kg = st.session_state.precios_dict[producto_sel]["precio_venta_kg"]
-        costo_kg = st.session_state.costos_dict[producto_sel]["costo_kg"]
-        precio_final = (gramos * precio_kg) / 1000
-        costo_final = (gramos * costo_kg) / 1000
-
-        st.session_state.productos_actuales.append(
-            (producto_sel.title(), float(gramos), round(costo_final, 2), round(precio_final, 2))
-        )
-        st.success(f"✓ {producto_sel.title()} {gramos}g agregado")
-        st.rerun()
-
-    # Mostrar productos actuales
-    if st.session_state.productos_actuales:
-        st.divider()
-        st.markdown("**Productos del ticket actual**")
-
-        df_actual = pd.DataFrame(
-            st.session_state.productos_actuales,
-            columns=["Producto", "Gramos", "Costo", "Venta"],
-        )
-        df_actual["Gramos"] = df_actual["Gramos"].astype(int)
-        df_actual["Costo"] = df_actual["Costo"].apply(lambda x: f"${x:,.2f}")
-        df_actual["Venta"] = df_actual["Venta"].apply(lambda x: f"${x:,.2f}")
-        st.dataframe(df_actual, use_container_width=True, hide_index=False)
-
-        # Botones para quitar productos
-        cols_quitar = st.columns(min(len(st.session_state.productos_actuales), 6))
-        for i, prod in enumerate(st.session_state.productos_actuales):
-            with cols_quitar[i % len(cols_quitar)]:
-                if st.button(f"🗑️ {prod[0][:10]}", key=f"quit_{i}"):
-                    st.session_state.productos_actuales.pop(i)
-                    st.rerun()
-
-        # Totales y descuento
-        totales = calcular_totales(st.session_state.productos_actuales, lleva_envio)
-
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("Costo", f"${totales['subtotal_costo']:,.2f}")
-        mc2.metric("Venta", f"${totales['subtotal_venta']:,.2f}")
-        mc3.metric("Envío", f"${totales['costo_envio']:,.2f}")
-        mc4.metric("Utilidad", f"${totales['utilidad']:,.2f}", f"{totales['utilidad_pct']:.1f}%")
-
-        descuento = 0.0
-        if len(st.session_state.productos_actuales) >= MIN_PRODUCTOS_DESCUENTO:
-            util_min = totales["subtotal_costo"] * UTILIDAD_MINIMA_PCT
-            max_desc = totales["utilidad"] - util_min
-            if max_desc > 0:
-                descuento = st.number_input(
-                    f"Descuento (máx. ${max_desc:.2f})",
-                    min_value=0.0,
-                    max_value=float(max_desc),
-                    value=0.0,
-                    step=5.0,
-                )
-
-        totales_final = calcular_totales(st.session_state.productos_actuales, lleva_envio, descuento)
-        st.markdown(f"### TOTAL: ${totales_final['nuevo_total']:,.2f}")
-
-        col_gen, col_cancel = st.columns(2)
-        with col_gen:
-            if st.button("✅ Generar ticket", type="primary", use_container_width=True):
-                if not nombre_cliente.strip():
-                    st.error("Falta el nombre del cliente")
-                else:
-                    pedido = {
-                        "cliente": nombre_cliente.strip(),
-                        "contacto": nombre_contacto,
-                        "telefono": CONTACTOS[nombre_contacto],
-                        "lleva_envio": lleva_envio,
-                        "descuento": descuento,
-                        "productos": list(st.session_state.productos_actuales),
-                        **totales_final,
-                    }
-                    st.session_state.pedidos.append(pedido)
-                    st.session_state.productos_actuales = []
-                    st.success(f"✅ Ticket de {pedido['cliente']} generado")
-                    st.rerun()
-        with col_cancel:
-            if st.button("🚫 Cancelar ticket", use_container_width=True):
-                st.session_state.productos_actuales = []
-                st.rerun()
-
-    # Vista previa de tickets generados en esta sesión
-    if st.session_state.pedidos:
-        st.divider()
-        st.markdown(f"**Tickets generados: {len(st.session_state.pedidos)}**")
-        ultimo = st.session_state.pedidos[-1]
-        with st.expander(f"Ver último ticket: {ultimo['cliente']}"):
-            png_bytes = generar_ticket_png(ultimo)
-            st.image(png_bytes, width=400)
 
 
 # ============================
@@ -1239,8 +1169,9 @@ with tab_pegar:
     # Sufijo dinámico para los keys de los widgets. Al incrementar el contador
     # (después de generar tickets), los widgets se reinstancian vacíos.
     rk = st.session_state.pegar_reset_count
+    revision_preview = st.session_state.get("pegar_preview_revision", 0)
 
-    st.subheader("Pegar pedido")
+    st.subheader("Tickets sin factura")
     st.caption(
         "Pega solo la lista de productos. El nombre del cliente y el contacto los pones aquí arriba. "
         "Si pegas varios clientes, sepáralos con línea en blanco y pon el nombre arriba de cada lista."
@@ -1380,6 +1311,8 @@ Laura Canales
             if not preview:
                 st.error("No se pudieron detectar productos. Revisa que cada línea termine con (gramos).")
             else:
+                revision_preview += 1
+                st.session_state["pegar_preview_revision"] = revision_preview
                 st.session_state["preview_pedidos"] = preview
                 # Si TODO matcheó perfecto, mostrar mensaje verde
                 total_prods = sum(len(p["productos"]) for p in preview)
@@ -1423,7 +1356,7 @@ Laura Canales
                 ped["lleva_envio"] = st.checkbox(
                     "Lleva envío",
                     value=ped["lleva_envio"],
-                    key=f"prev_envio_{i}",
+                    key=f"pegar_{rk}_{revision_preview}_prev_envio_{i}",
                 )
 
                 for j, prod in enumerate(ped["productos"]):
@@ -1444,7 +1377,7 @@ Laura Canales
                             "Mapear a",
                             opciones,
                             index=idx_default,
-                            key=f"prev_match_{i}_{j}",
+                            key=f"pegar_{rk}_{revision_preview}_prev_match_{i}_{j}",
                             label_visibility="collapsed",
                         )
                         if nuevo_match == "(omitir)":
@@ -1459,7 +1392,7 @@ Laura Canales
                             min_value=0,
                             value=int(prod["gramos"]),
                             step=10,
-                            key=f"prev_gr_{i}_{j}",
+                            key=f"pegar_{rk}_{revision_preview}_prev_gr_{i}_{j}",
                             label_visibility="collapsed",
                         )
                         prod["gramos"] = nuevos_g
@@ -1474,28 +1407,29 @@ Laura Canales
                             nuevo_nombre = st.text_input(
                                 "Nombre del producto",
                                 value=sugerencia,
-                                key=f"new_name_{i}_{j}",
+                                key=f"pegar_{rk}_{revision_preview}_new_name_{i}_{j}",
                             )
                         with sub2:
                             nuevo_costo = st.number_input(
                                 "Costo/kg",
                                 min_value=0.0,
                                 step=1.0,
-                                key=f"new_costo_{i}_{j}",
+                                key=f"pegar_{rk}_{revision_preview}_new_costo_{i}_{j}",
                             )
                         with sub3:
                             nuevo_precio = st.number_input(
                                 "Precio/kg",
                                 min_value=0.0,
                                 step=1.0,
-                                key=f"new_precio_{i}_{j}",
+                                key=f"pegar_{rk}_{revision_preview}_new_precio_{i}_{j}",
                             )
-                        if st.button("Guardar nuevo", key=f"save_new_{i}_{j}"):
+                        if st.button("Guardar nuevo", key=f"pegar_{rk}_{revision_preview}_save_new_{i}_{j}"):
                             if nuevo_nombre.strip() and nuevo_costo > 0 and nuevo_precio > 0:
                                 key = nuevo_nombre.strip().lower()
                                 st.session_state.precios_dict[key] = {"precio_venta_kg": nuevo_precio}
                                 st.session_state.costos_dict[key] = {"costo_kg": nuevo_costo}
                                 prod["match"] = key
+                                del st.session_state[f"pegar_{rk}_{revision_preview}_prev_match_{i}_{j}"]
                                 st.success(f"✅ {key.title()} agregado al catálogo")
                                 st.rerun()
                             else:
@@ -1507,6 +1441,7 @@ Laura Canales
                     if p["match"]
                     and p["match"] != "__nuevo__"
                     and p["match"] in st.session_state.precios_dict
+                    and p["match"] in st.session_state.costos_dict
                     and p["gramos"] > 0
                 ]
 
@@ -1536,7 +1471,7 @@ Laura Canales
                             max_value=float(max_descuento),
                             value=float(ped.get("descuento", 0.0)) if ped.get("descuento", 0.0) <= max_descuento else 0.0,
                             step=5.0,
-                            key=f"prev_desc_{i}",
+                            key=f"pegar_{rk}_{revision_preview}_prev_desc_{i}",
                         )
                     else:
                         ped["descuento"] = 0.0
@@ -1552,7 +1487,8 @@ Laura Canales
             for prod in ped["productos"]:
                 if (not prod["match"]
                     or prod["match"] == "__nuevo__"
-                    or prod["match"] not in st.session_state.precios_dict):
+                    or prod["match"] not in st.session_state.precios_dict
+                    or prod["match"] not in st.session_state.costos_dict):
                     productos_sin_asignar.append({
                         "cliente": ped["cliente"],
                         "descripcion": prod["descripcion_original"],
@@ -1593,7 +1529,8 @@ Laura Canales
                     for prod in ped["productos"]:
                         if not prod["match"] or prod["match"] == "__nuevo__" or prod["gramos"] <= 0:
                             continue
-                        if prod["match"] not in st.session_state.precios_dict:
+                        if (prod["match"] not in st.session_state.precios_dict
+                                or prod["match"] not in st.session_state.costos_dict):
                             continue
                         precio_kg = st.session_state.precios_dict[prod["match"]]["precio_venta_kg"]
                         costo_kg = st.session_state.costos_dict[prod["match"]]["costo_kg"]
@@ -1640,6 +1577,409 @@ Laura Canales
                 st.rerun()
 
 
+with tab_factura:
+    # Sufijo dinámico para los keys de los widgets. Al incrementar el contador
+    # (después de generar tickets), los widgets se reinstancian vacíos.
+    if "factura_reset_count" not in st.session_state:
+        st.session_state.factura_reset_count = 0
+    rk = st.session_state.factura_reset_count
+
+    st.subheader("Factura")
+    st.markdown("**Cómo se factura**")
+    st.caption("El porcentaje aumenta el costo del producto. La venta parte del precio del catálogo. "
+               "Envío y comisión se suman a la venta y a la utilidad, repartidos entre los productos. "
+               "Los ajustes se aplican solo a estos pedidos.")
+    incremento_default = st.number_input(
+        "Incremento del costo por defecto (%)", min_value=0.0, value=0.0,
+        step=1.0, key=f"factura_{rk}_incremento_default",
+        help="Se usa al procesar. Después puedes cambiar el porcentaje de cada producto.")
+    st.caption(
+        "Pega solo la lista de productos. El nombre del cliente y el contacto los pones aquí arriba. "
+        "Si pegas varios clientes, sepáralos con línea en blanco y pon el nombre arriba de cada lista."
+    )
+
+    # Selector de fecha del pedido (para registrar pedidos pasados al histórico)
+    col_f1, col_f2 = st.columns([1, 2])
+    with col_f1:
+        opcion_fecha = st.radio(
+            "Fecha del pedido",
+            ["Hoy", "Fecha anterior"],
+            horizontal=True,
+            key=f"factura_{rk}_opcion_fecha_pedido",
+        )
+    with col_f2:
+        hoy_mx = datetime.now(pytz.timezone(ZONA_HORARIA)).date()
+        if opcion_fecha == "Fecha anterior":
+            fecha_pedido = st.date_input(
+                "Selecciona la fecha",
+                value=hoy_mx,
+                max_value=hoy_mx,
+                key=f"factura_{rk}_fecha_pedido_custom",
+            )
+            st.caption("⚠️ Los tickets se guardarán con esta fecha en el histórico.")
+        else:
+            fecha_pedido = hoy_mx
+            st.caption(f"📅 Usando fecha actual: {hoy_mx.strftime('%d/%m/%Y')}")
+
+    # Campos rápidos arriba
+    col_n, col_c, col_e = st.columns([2, 1, 1])
+    with col_n:
+        nombre_rapido = st.text_input(
+            "Nombre del cliente (si pegas un solo pedido)",
+            key=f"factura_{rk}_rapido_cliente_{rk}",
+            placeholder="ej: Abue Lucero",
+        )
+    with col_c:
+        contacto_default = st.selectbox(
+            "Contacto",
+            list(CONTACTOS.keys()),
+            key=f"factura_{rk}_pegar_contacto",
+        )
+    with col_e:
+        envio_rapido = False
+
+    ejemplo_simple = """* 1k dominico 🍏 (1130)
+* 6 manzanas golden 🍏 (772)
+* 4 zanahorias 🧑🏿‍🌾 (529)"""
+
+    ejemplo_multi = """Abue Lucero
+* 1k dominico (1130)
+* 4 zanahorias (529)
+
+Laura Canales
+* 2 Kg Limón (2029)
+* 1 Kg Jitomate (1025)"""
+
+    with st.expander("Ver formatos aceptados"):
+        st.markdown("**Un solo pedido (escribe el nombre arriba):**")
+        st.code(ejemplo_simple, language="text")
+        st.markdown("**Varios pedidos (nombres dentro del texto):**")
+        st.code(ejemplo_multi, language="text")
+
+    texto_pegado = st.text_area(
+        "Pega aquí",
+        height=300,
+        placeholder=ejemplo_simple,
+        key=f"factura_{rk}_texto_pegado_{rk}",
+    )
+
+    clientes_con_envio = ""
+
+    # Auto-procesar en cuanto haya texto suficiente
+    procesar = st.button("🔍 Procesar pedido(s)", type="primary", key=f"factura_{rk}_procesar")
+
+    if procesar:
+        if not texto_pegado.strip():
+            st.warning("Pega al menos un pedido.")
+        else:
+            texto = texto_pegado.strip()
+            envios_set = {
+                e.strip().lower() for e in clientes_con_envio.split(",") if e.strip()
+            }
+            catalogo_keys = list(st.session_state.precios_dict.keys())
+            preview = []
+
+            # Detectar formato: ¿empieza con viñeta? -> es un solo cliente y el nombre está arriba
+            primera_linea = texto.split("\n", 1)[0].strip()
+            es_pedido_unico = bool(re.match(r"^(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX\s]?\s*\]\s*)?", primera_linea))
+
+            if es_pedido_unico:
+                # Modo simple: un solo cliente, nombre del campo de arriba
+                cliente_final = nombre_rapido.strip() or "Cliente"
+                # Inyectar el nombre al inicio para que el parser funcione igual
+                bloque = f"{cliente_final}\n{texto}"
+                cliente, productos_raw = parsear_bloque_pedido(bloque)
+                if cliente and productos_raw:
+                    productos_match = []
+                    for desc, gramos in productos_raw:
+                        match = buscar_match_catalogo(desc, catalogo_keys)
+                        productos_match.append({
+                            "descripcion_original": desc,
+                            "gramos": gramos,
+                            "match": match,
+                        })
+                    preview.append({
+                        "cliente": cliente,
+                        "lleva_envio": envio_rapido,
+                        "productos": productos_match,
+                    })
+            else:
+                # Modo multi: separar por línea en blanco, primera línea de cada bloque es el nombre
+                bloques = [b for b in re.split(r"\n\s*\n", texto) if b.strip()]
+                for bloque in bloques:
+                    cliente, productos_raw = parsear_bloque_pedido(bloque)
+                    if not cliente or not productos_raw:
+                        continue
+                    lleva_envio = any(e in cliente.lower() for e in envios_set)
+                    productos_match = []
+                    for desc, gramos in productos_raw:
+                        match = buscar_match_catalogo(desc, catalogo_keys)
+                        productos_match.append({
+                            "descripcion_original": desc,
+                            "gramos": gramos,
+                            "match": match,
+                        })
+                    preview.append({
+                        "cliente": cliente,
+                        "lleva_envio": lleva_envio,
+                        "productos": productos_match,
+                    })
+
+            if not preview:
+                st.error("No se pudieron detectar productos. Revisa que cada línea termine con (gramos).")
+            else:
+                for ped in preview:
+                    for prod in ped["productos"]:
+                        prod["incremento_pct"] = incremento_default
+                # Limpiar editores anteriores al procesar un texto nuevo.
+                for widget_key in list(st.session_state):
+                    if widget_key.startswith(f"factura_{rk}_prev_") or widget_key.startswith(f"factura_{rk}_new_"):
+                        del st.session_state[widget_key]
+                st.session_state["factura_preview_pedidos"] = preview
+                # Si TODO matcheó perfecto, mostrar mensaje verde
+                total_prods = sum(len(p["productos"]) for p in preview)
+                no_match = sum(
+                    1 for p in preview for prod in p["productos"] if not prod["match"]
+                )
+                if no_match == 0:
+                    st.success(
+                        f"✅ {total_prods} productos detectados, todos con match. "
+                        "Revisa abajo y dale 'Generar' si todo está bien."
+                    )
+                else:
+                    st.warning(
+                        f"⚠️ {total_prods - no_match}/{total_prods} productos con match. "
+                        f"Faltan {no_match} por asignar (corrige abajo)."
+                    )
+
+    # Mostrar y editar preview
+    if "factura_preview_pedidos" in st.session_state and st.session_state["factura_preview_pedidos"]:
+        st.divider()
+        st.markdown("### Vista previa - corrige los matches incorrectos")
+        st.caption(
+            "Si algún producto quedó mal asignado, cámbialo del dropdown. "
+            "Los productos sin match (rojo) se omitirán al generar el ticket."
+        )
+
+        catalogo_keys = sorted(st.session_state.precios_dict.keys())
+
+        for i, ped in enumerate(st.session_state["factura_preview_pedidos"]):
+            no_match = sum(1 for p in ped["productos"] if not p["match"])
+            con_match = len(ped["productos"]) - no_match
+
+            label = f"**{ped['cliente']}** — {con_match} productos OK"
+            if no_match > 0:
+                label += f", ⚠️ {no_match} sin match"
+            if ped["lleva_envio"]:
+                label += " 🚚 envío"
+
+            with st.expander(label, expanded=True):
+                ce, cc = st.columns(2)
+                with ce:
+                    ped["envio_integrado"] = st.number_input(
+                        "Envío ($)", min_value=0.0, value=0.0, step=1.0,
+                        key=f"factura_{rk}_prev_envio_{i}")
+                with cc:
+                    ped["comision_integrada"] = st.number_input(
+                        "Comisión ($)", min_value=0.0, value=0.0, step=1.0,
+                        key=f"factura_{rk}_prev_comision_{i}")
+                st.caption("Importes por pedido. Se integran proporcionalmente en la venta de los productos.")
+
+                for j, prod in enumerate(ped["productos"]):
+                    col1, col2, col3 = st.columns([3, 3, 1])
+                    with col1:
+                        etiqueta = f"{prod['descripcion_original']} ({int(prod['gramos'])}g)"
+                        if tiene_indicador_empaque(prod['descripcion_original']):
+                            etiqueta = "📦 " + etiqueta
+                        st.text(etiqueta)
+                    with col2:
+                        opciones = ["(omitir)", "➕ Crear nuevo producto"] + catalogo_keys
+                        idx_default = (
+                            opciones.index(prod["match"])
+                            if prod["match"] in opciones
+                            else 0
+                        )
+                        nuevo_match = st.selectbox(
+                            "Mapear a",
+                            opciones,
+                            index=idx_default,
+                            key=f"factura_{rk}_prev_match_{i}_{j}",
+                            label_visibility="collapsed",
+                        )
+                        if nuevo_match == "(omitir)":
+                            prod["match"] = None
+                        elif nuevo_match == "➕ Crear nuevo producto":
+                            prod["match"] = "__nuevo__"
+                        else:
+                            prod["match"] = nuevo_match
+                    with col3:
+                        nuevos_g = st.number_input(
+                            "g",
+                            min_value=0,
+                            value=int(prod["gramos"]),
+                            step=10,
+                            key=f"factura_{rk}_prev_gr_{i}_{j}",
+                            label_visibility="collapsed",
+                        )
+                        prod["gramos"] = nuevos_g
+
+                    prod["incremento_pct"] = st.number_input(
+                        f"Incremento del costo (%) · {prod['descripcion_original']}",
+                        min_value=0.0, value=float(prod.get("incremento_pct", 0.0)), step=1.0,
+                        key=f"factura_{rk}_prev_incremento_{i}_{j}")
+
+                    # Si el usuario eligió "Crear nuevo producto", mostrar formulario
+                    if prod["match"] == "__nuevo__":
+                        sub1, sub2, sub3 = st.columns([2, 1, 1])
+                        with sub1:
+                            sugerencia = re.sub(
+                                r"^[\d\.\,/]+\s*\w*\s*", "", prod["descripcion_original"].lower()
+                            ).strip()
+                            nuevo_nombre = st.text_input(
+                                "Nombre del producto",
+                                value=sugerencia,
+                                key=f"factura_{rk}_new_name_{i}_{j}",
+                            )
+                        with sub2:
+                            nuevo_costo = st.number_input(
+                                "Costo/kg",
+                                min_value=0.0,
+                                step=1.0,
+                                key=f"factura_{rk}_new_costo_{i}_{j}",
+                            )
+                        with sub3:
+                            nuevo_precio = st.number_input(
+                                "Precio/kg",
+                                min_value=0.0,
+                                step=1.0,
+                                key=f"factura_{rk}_new_precio_{i}_{j}",
+                            )
+                        if st.button("Guardar nuevo", key=f"factura_{rk}_save_new_{i}_{j}"):
+                            if nuevo_nombre.strip() and nuevo_costo > 0 and nuevo_precio > 0:
+                                key = nuevo_nombre.strip().lower()
+                                st.session_state.precios_dict[key] = {"precio_venta_kg": nuevo_precio}
+                                st.session_state.costos_dict[key] = {"costo_kg": nuevo_costo}
+                                prod["match"] = key
+                                del st.session_state[f"factura_{rk}_prev_match_{i}_{j}"]
+                                st.success(f"✅ {key.title()} agregado al catálogo")
+                                st.rerun()
+                            else:
+                                st.error("Completa nombre, costo y precio")
+
+                lineas_factura = []
+                for prod in ped["productos"]:
+                    nombre = prod["match"]
+                    if nombre in st.session_state.precios_dict and prod["gramos"] > 0:
+                        if nombre not in st.session_state.costos_dict:
+                            st.error(f"Falta el costo de {nombre}. Carga o corrige el catálogo.")
+                            continue
+                        lineas_factura.append({
+                            "nombre": nombre.title(), "gramos": prod["gramos"],
+                            "costo_kg": st.session_state.costos_dict[nombre]["costo_kg"],
+                            "precio_kg": st.session_state.precios_dict[nombre]["precio_venta_kg"],
+                            "incremento_pct": prod["incremento_pct"],
+                        })
+                ped["lineas_factura"] = lineas_factura
+                ped["productos_calculados"] = []
+                ped["error_calculo"] = False
+                try:
+                    ped["productos_calculados"] = calcular_productos_factura(
+                        lineas_factura, ped["envio_integrado"], ped["comision_integrada"])
+                    if ped["productos_calculados"]:
+                        mostrar_resumen_factura(ped["productos_calculados"])
+                except ValueError as error:
+                    ped["error_calculo"] = True
+                    st.error(str(error))
+
+        st.divider()
+
+        # Detectar productos sin asignar ANTES de mostrar botón de generar
+        productos_sin_asignar = []
+        for ped in st.session_state["factura_preview_pedidos"]:
+            for prod in ped["productos"]:
+                if (not prod["match"]
+                    or prod["match"] == "__nuevo__"
+                    or prod["match"] not in st.session_state.precios_dict
+                    or prod["match"] not in st.session_state.costos_dict):
+                    productos_sin_asignar.append({
+                        "cliente": ped["cliente"],
+                        "descripcion": prod["descripcion_original"],
+                        "gramos": prod["gramos"],
+                    })
+
+        if productos_sin_asignar:
+            st.error(
+                f"⚠️ Hay {len(productos_sin_asignar)} productos sin asignar. "
+                "Si generas los tickets ahora, esos productos NO se cobrarán al cliente. "
+                "Asigna cada uno a un producto del catálogo o créalo como nuevo."
+            )
+            with st.expander("Ver productos sin asignar", expanded=True):
+                for sa in productos_sin_asignar:
+                    st.markdown(
+                        f"- **{sa['cliente']}**: `{sa['descripcion']}` ({int(sa['gramos'])}g)"
+                    )
+            forzar_generar = st.checkbox(
+                "Sé que faltan productos por asignar y aún así quiero generar los tickets "
+                "(los productos sin asignar NO se cobrarán)",
+                key=f"factura_{rk}_forzar_generar",
+            )
+        else:
+            forzar_generar = True
+
+        col_g1, col_g2 = st.columns(2)
+        with col_g1:
+            puede_generar = ((not productos_sin_asignar) or forzar_generar) and not any(
+                p.get("error_calculo") for p in st.session_state["factura_preview_pedidos"])
+            puede_generar = puede_generar and any(
+                p.get("productos_calculados") for p in st.session_state["factura_preview_pedidos"])
+            if st.button(
+                "✅ Generar todos los tickets",
+                type="primary",
+                use_container_width=True,
+                disabled=not puede_generar,
+                key=f"factura_{rk}_generar",
+            ):
+                generados = 0
+                for ped in st.session_state["factura_preview_pedidos"]:
+                    productos_finales = ped["productos_calculados"]
+                    if not productos_finales:
+                        continue
+                    descuento_aplicar = 0.0
+                    totales = calcular_totales(productos_finales, False)
+                    pedido = {
+                        "tipo": "factura",
+                        "lineas_factura": ped["lineas_factura"],
+                        "envio_integrado": ped["envio_integrado"],
+                        "comision_integrada": ped["comision_integrada"],
+                        "cliente": ped["cliente"],
+                        "contacto": contacto_default,
+                        "telefono": CONTACTOS[contacto_default],
+                        "lleva_envio": ped["lleva_envio"],
+                        "descuento": descuento_aplicar,
+                        "productos": productos_finales,
+                        "fecha_custom": fecha_pedido.strftime("%Y-%m-%d %H:%M"),
+                        **totales,
+                    }
+                    st.session_state.pedidos.append(pedido)
+                    generados += 1
+
+                del st.session_state["factura_preview_pedidos"]
+                # Forzar reset de los widgets del tab Pegar incrementando el contador.
+                # Esto cambia los keys de los widgets, así que se recrean vacíos.
+                if generados > 0:
+                    st.session_state.factura_reset_count += 1
+                msg = f"✅ Se generaron {generados} tickets."
+                if productos_sin_asignar:
+                    msg += f" ⚠️ {len(productos_sin_asignar)} productos quedaron sin cobrar."
+                st.success(msg)
+                st.rerun()
+        with col_g2:
+            if st.button("🚫 Descartar vista previa", use_container_width=True, key=f"factura_{rk}_descartar"):
+                del st.session_state["factura_preview_pedidos"]
+                st.rerun()
+
+
+
 # ============================
 # Tab 3: Modificar
 # ============================
@@ -1649,17 +1989,24 @@ with tab_modificar:
     else:
         st.subheader("Modificar ticket existente")
 
-        idx_sel = st.selectbox(
+        for ticket in st.session_state.pedidos:
+            ticket.setdefault("_ui_id", uuid4().hex)
+        indices_tickets = {ticket["_ui_id"]: i for i, ticket in enumerate(st.session_state.pedidos)}
+        etiquetas_tickets = {
+            ticket["_ui_id"]: (
+                f"{i+1}. {ticket['cliente']} ({ticket['contacto']}) - ${ticket['nuevo_total']:,.2f}"
+            ) for i, ticket in enumerate(st.session_state.pedidos)
+        }
+        ticket_seleccionado = st.selectbox(
             "Selecciona el ticket",
-            range(len(st.session_state.pedidos)),
-            format_func=lambda i: (
-                f"{i+1}. {st.session_state.pedidos[i]['cliente']} "
-                f"({st.session_state.pedidos[i]['contacto']}) - "
-                f"${st.session_state.pedidos[i]['nuevo_total']:,.2f}"
-            ),
+            list(indices_tickets),
+            key="modificar_ticket_seleccionado",
+            format_func=etiquetas_tickets.get,
         )
 
+        idx_sel = indices_tickets[ticket_seleccionado]
         pedido = st.session_state.pedidos[idx_sel]
+        edit_key = f"{pedido['_ui_id']}_{pedido.get('_ui_revision', 0)}"
 
         col_vista, col_edit = st.columns([1, 1])
 
@@ -1681,163 +2028,205 @@ with tab_modificar:
                 "Contacto asignado",
                 contactos_list,
                 index=idx_contacto_actual,
-                key=f"contacto_mod_{idx_sel}",
+                key=f"contacto_mod_{edit_key}",
             )
             if nuevo_contacto != pedido["contacto"]:
                 pedido["contacto"] = nuevo_contacto
                 pedido["telefono"] = CONTACTOS[nuevo_contacto]
+                pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
                 st.rerun()
 
-            # Cambiar envío
-            nuevo_envio = st.checkbox(
-                "Lleva envío (+$35)", value=pedido["lleva_envio"], key=f"envio_{idx_sel}"
-            )
-            if nuevo_envio != pedido["lleva_envio"]:
-                pedido["lleva_envio"] = nuevo_envio
-                totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
-                pedido.update(totales)
-                pedido["descuento"] = 0.0
-                st.rerun()
-
-            st.markdown("**Productos del ticket**")
-            if pedido["productos"]:
-                for i, (nombre, gr, cto, vta) in enumerate(pedido["productos"]):
-                    col_p, col_g, col_b = st.columns([3, 2, 1])
-                    col_p.write(f"{nombre}")
-                    with col_g:
-                        nuevos_gr = st.number_input(
-                            "g",
-                            min_value=0,
-                            value=int(gr),
-                            step=50,
-                            key=f"gr_{idx_sel}_{i}",
-                            label_visibility="collapsed",
-                        )
-                    with col_b:
-                        if st.button("🗑️", key=f"del_{idx_sel}_{i}"):
-                            pedido["productos"].pop(i)
-                            totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
-                            pedido.update(totales)
-                            pedido["descuento"] = 0.0
-                            if not pedido["productos"]:
-                                st.session_state.pedidos.pop(idx_sel)
-                            st.rerun()
-
-                    if nuevos_gr != int(gr) and nuevos_gr > 0:
-                        key = nombre.lower()
-                        if key in st.session_state.precios_dict:
-                            precio_kg = st.session_state.precios_dict[key]["precio_venta_kg"]
-                            costo_kg = st.session_state.costos_dict[key]["costo_kg"]
-                            pedido["productos"][i] = (
-                                nombre,
-                                float(nuevos_gr),
-                                round(nuevos_gr * costo_kg / 1000, 2),
-                                round(nuevos_gr * precio_kg / 1000, 2),
-                            )
-                            totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
-                            pedido.update(totales)
-                            pedido["descuento"] = 0.0
-                            st.rerun()
-
-            # Agregar producto
-            st.markdown("**Agregar producto**")
-            col_np, col_ng, col_nb = st.columns([3, 1, 1])
-            with col_np:
-                opciones_prod = [""] + ["➕ Crear nuevo producto"] + sorted(st.session_state.precios_dict.keys())
-                nuevo_prod = st.selectbox(
-                    "Producto",
-                    opciones_prod,
-                    format_func=lambda x: x.title() if x and not x.startswith("➕") else (x or "-- selecciona --"),
-                    key=f"nuevo_prod_{idx_sel}",
-                    label_visibility="collapsed",
+            if pedido.get("tipo") == "factura":
+                st.caption("Ajusta la factura. Envío y comisión siguen integrados en los productos.")
+                rev_factura = pedido.get("revision_factura", 0)
+                with st.form(f"editar_factura_{edit_key}_{rev_factura}"):
+                    envio_edit = st.number_input("Envío ($)", min_value=0.0,
+                        value=float(pedido["envio_integrado"]), key=f"fe_env_{edit_key}_{rev_factura}")
+                    comision_edit = st.number_input("Comisión ($)", min_value=0.0,
+                        value=float(pedido["comision_integrada"]), key=f"fe_com_{edit_key}_{rev_factura}")
+                    lineas_edit = []
+                    for j, linea in enumerate(pedido["lineas_factura"]):
+                        st.write(linea["nombre"])
+                        gramos_edit = st.number_input("Gramos (0 para quitar)", min_value=0.0,
+                            value=float(linea["gramos"]), key=f"fe_gr_{edit_key}_{rev_factura}_{j}")
+                        pct_edit = st.number_input("Incremento del costo (%)", min_value=0.0,
+                            value=float(linea["incremento_pct"]), key=f"fe_pct_{edit_key}_{rev_factura}_{j}")
+                        if gramos_edit > 0:
+                            lineas_edit.append({**linea, "gramos": gramos_edit, "incremento_pct": pct_edit})
+                    if st.form_submit_button("Guardar cambios de factura"):
+                        if not lineas_edit:
+                            st.error("Conserva al menos un producto o elimina el ticket completo.")
+                        else:
+                            try:
+                                productos_edit = calcular_productos_factura(lineas_edit, envio_edit, comision_edit)
+                            except ValueError as error:
+                                st.error(str(error))
+                            else:
+                                pedido.update(lineas_factura=lineas_edit, productos=productos_edit,
+                                    envio_integrado=envio_edit, comision_integrada=comision_edit,
+                                    lleva_envio=False, descuento=0.0)
+                                pedido["revision_factura"] = rev_factura + 1
+                                pedido.update(calcular_totales(productos_edit, False))
+                                pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
+                                st.rerun()
+                mostrar_resumen_factura(pedido["productos"])
+            else:
+                # Cambiar envío
+                nuevo_envio = st.checkbox(
+                    "Lleva envío (+$35)", value=pedido["lleva_envio"], key=f"envio_{edit_key}"
                 )
-            with col_ng:
-                nuevos_g = st.number_input(
-                    "g",
-                    min_value=0,
-                    value=500,
-                    step=50,
-                    key=f"nuevo_g_{idx_sel}",
-                    label_visibility="collapsed",
-                )
-            with col_nb:
-                if st.button("➕", key=f"add_{idx_sel}"):
-                    if nuevo_prod and nuevo_prod != "➕ Crear nuevo producto" and nuevos_g > 0:
-                        precio_kg = st.session_state.precios_dict[nuevo_prod]["precio_venta_kg"]
-                        costo_kg = st.session_state.costos_dict[nuevo_prod]["costo_kg"]
-                        pedido["productos"].append(
-                            (
-                                nuevo_prod.title(),
-                                float(nuevos_g),
-                                round(nuevos_g * costo_kg / 1000, 2),
-                                round(nuevos_g * precio_kg / 1000, 2),
-                            )
-                        )
-                        totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
-                        pedido.update(totales)
-                        pedido["descuento"] = 0.0
-                        st.rerun()
+                if nuevo_envio != pedido["lleva_envio"]:
+                    pedido["lleva_envio"] = nuevo_envio
+                    totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
+                    pedido.update(totales)
+                    pedido["descuento"] = 0.0
+                    pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
+                    st.rerun()
 
-            # Si eligió "Crear nuevo producto", mostrar formulario inline
-            if nuevo_prod == "➕ Crear nuevo producto":
-                st.markdown("**Crear producto nuevo y agregarlo al ticket:**")
-                sub_n, sub_c, sub_v, sub_g, sub_btn = st.columns([2, 1, 1, 1, 1])
-                with sub_n:
-                    nuevo_nombre = st.text_input(
-                        "Nombre",
-                        key=f"new_name_mod_{idx_sel}",
-                        placeholder="ej: papas fritas",
+                st.markdown("**Productos del ticket**")
+                if pedido["productos"]:
+                    for i, (nombre, gr, cto, vta) in enumerate(pedido["productos"]):
+                        col_p, col_g, col_b = st.columns([3, 2, 1])
+                        col_p.write(f"{nombre}")
+                        with col_g:
+                            nuevos_gr = st.number_input(
+                                "g",
+                                min_value=1,
+                                value=max(1, int(gr)),
+                                step=50,
+                                key=f"gr_{edit_key}_{i}",
+                                label_visibility="collapsed",
+                            )
+                        with col_b:
+                            if st.button("🗑️", key=f"del_{edit_key}_{i}"):
+                                pedido["productos"].pop(i)
+                                totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
+                                pedido.update(totales)
+                                pedido["descuento"] = 0.0
+                                if not pedido["productos"]:
+                                    st.session_state.pedidos.pop(idx_sel)
+                                pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
+                                st.rerun()
+
+                        if nuevos_gr != int(gr) and nuevos_gr > 0:
+                            key = nombre.lower()
+                            if gr > 0:
+                                precio_kg = st.session_state.precios_dict.get(key, {}).get("precio_venta_kg", vta * 1000 / gr)
+                                costo_kg = st.session_state.costos_dict.get(key, {}).get("costo_kg", cto * 1000 / gr)
+                                pedido["productos"][i] = (
+                                    nombre,
+                                    float(nuevos_gr),
+                                    round(nuevos_gr * costo_kg / 1000, 2),
+                                    round(nuevos_gr * precio_kg / 1000, 2),
+                                )
+                                totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
+                                pedido.update(totales)
+                                pedido["descuento"] = 0.0
+                                pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
+                                st.rerun()
+
+                # Agregar producto
+                st.markdown("**Agregar producto**")
+                col_np, col_ng, col_nb = st.columns([3, 1, 1])
+                with col_np:
+                    opciones_prod = [""] + ["➕ Crear nuevo producto"] + sorted(st.session_state.precios_dict.keys())
+                    nuevo_prod = st.selectbox(
+                        "Producto",
+                        opciones_prod,
+                        format_func=lambda x: x.title() if x and not x.startswith("➕") else (x or "-- selecciona --"),
+                        key=f"nuevo_prod_{edit_key}",
+                        label_visibility="collapsed",
                     )
-                with sub_c:
-                    nuevo_costo_kg = st.number_input(
-                        "Costo/kg",
-                        min_value=0.0,
-                        step=1.0,
-                        key=f"new_costo_mod_{idx_sel}",
-                    )
-                with sub_v:
-                    nuevo_precio_kg = st.number_input(
-                        "Precio/kg",
-                        min_value=0.0,
-                        step=1.0,
-                        key=f"new_precio_mod_{idx_sel}",
-                    )
-                with sub_g:
-                    nuevo_g_mod = st.number_input(
-                        "Gramos",
+                with col_ng:
+                    nuevos_g = st.number_input(
+                        "g",
                         min_value=0,
                         value=500,
                         step=50,
-                        key=f"new_g_mod_{idx_sel}",
+                        key=f"nuevo_g_{edit_key}",
+                        label_visibility="collapsed",
                     )
-                with sub_btn:
-                    st.write("")
-                    st.write("")
-                    if st.button("Guardar", key=f"save_new_mod_{idx_sel}", use_container_width=True):
-                        if (nuevo_nombre.strip() and nuevo_costo_kg > 0
-                                and nuevo_precio_kg > 0 and nuevo_g_mod > 0):
-                            key = nuevo_nombre.strip().lower()
-                            # Agregar al catálogo en sesión
-                            st.session_state.precios_dict[key] = {"precio_venta_kg": nuevo_precio_kg}
-                            st.session_state.costos_dict[key] = {"costo_kg": nuevo_costo_kg}
-                            # Agregar al ticket
-                            pedido["productos"].append((
-                                key.title(),
-                                float(nuevo_g_mod),
-                                round(nuevo_g_mod * nuevo_costo_kg / 1000, 2),
-                                round(nuevo_g_mod * nuevo_precio_kg / 1000, 2),
-                            ))
+                with col_nb:
+                    if st.button("➕", key=f"add_{edit_key}"):
+                        if nuevo_prod and nuevo_prod != "➕ Crear nuevo producto" and nuevos_g > 0:
+                            precio_kg = st.session_state.precios_dict[nuevo_prod]["precio_venta_kg"]
+                            costo_kg = st.session_state.costos_dict[nuevo_prod]["costo_kg"]
+                            pedido["productos"].append(
+                                (
+                                    nuevo_prod.title(),
+                                    float(nuevos_g),
+                                    round(nuevos_g * costo_kg / 1000, 2),
+                                    round(nuevos_g * precio_kg / 1000, 2),
+                                )
+                            )
                             totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
                             pedido.update(totales)
                             pedido["descuento"] = 0.0
-                            st.success(f"✅ {key.title()} creado y agregado al ticket")
+                            pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
                             st.rerun()
-                        else:
-                            st.error("Completa todos los campos (nombre, costo, precio, gramos)")
+
+                # Si eligió "Crear nuevo producto", mostrar formulario inline
+                if nuevo_prod == "➕ Crear nuevo producto":
+                    st.markdown("**Crear producto nuevo y agregarlo al ticket:**")
+                    sub_n, sub_c, sub_v, sub_g, sub_btn = st.columns([2, 1, 1, 1, 1])
+                    with sub_n:
+                        nuevo_nombre = st.text_input(
+                            "Nombre",
+                            key=f"new_name_mod_{edit_key}",
+                            placeholder="ej: papas fritas",
+                        )
+                    with sub_c:
+                        nuevo_costo_kg = st.number_input(
+                            "Costo/kg",
+                            min_value=0.0,
+                            step=1.0,
+                            key=f"new_costo_mod_{edit_key}",
+                        )
+                    with sub_v:
+                        nuevo_precio_kg = st.number_input(
+                            "Precio/kg",
+                            min_value=0.0,
+                            step=1.0,
+                            key=f"new_precio_mod_{edit_key}",
+                        )
+                    with sub_g:
+                        nuevo_g_mod = st.number_input(
+                            "Gramos",
+                            min_value=0,
+                            value=500,
+                            step=50,
+                            key=f"new_g_mod_{edit_key}",
+                        )
+                    with sub_btn:
+                        st.write("")
+                        st.write("")
+                        if st.button("Guardar", key=f"save_new_mod_{edit_key}", use_container_width=True):
+                            if (nuevo_nombre.strip() and nuevo_costo_kg > 0
+                                    and nuevo_precio_kg > 0 and nuevo_g_mod > 0):
+                                key = nuevo_nombre.strip().lower()
+                                # Agregar al catálogo en sesión
+                                st.session_state.precios_dict[key] = {"precio_venta_kg": nuevo_precio_kg}
+                                st.session_state.costos_dict[key] = {"costo_kg": nuevo_costo_kg}
+                                # Agregar al ticket
+                                pedido["productos"].append((
+                                    key.title(),
+                                    float(nuevo_g_mod),
+                                    round(nuevo_g_mod * nuevo_costo_kg / 1000, 2),
+                                    round(nuevo_g_mod * nuevo_precio_kg / 1000, 2),
+                                ))
+                                totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
+                                pedido.update(totales)
+                                pedido["descuento"] = 0.0
+                                st.success(f"✅ {key.title()} creado y agregado al ticket")
+                                pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
+                                st.rerun()
+                            else:
+                                st.error("Completa todos los campos (nombre, costo, precio, gramos)")
 
             st.divider()
-            if st.button("🗑️ Eliminar ticket completo", key=f"del_ticket_{idx_sel}"):
+            if st.button("🗑️ Eliminar ticket completo", key=f"del_ticket_{edit_key}"):
                 st.session_state.pedidos.pop(idx_sel)
+                pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
                 st.rerun()
 
 
@@ -1903,7 +2292,7 @@ with tab_resumen:
                 columns=["Producto", "Gramos", "Kilos"],
             )
             df_gramos.loc["TOTAL"] = ["TOTAL", df_gramos["Gramos"].sum(), df_gramos["Kilos"].sum()]
-            st.dataframe(df_gramos, use_container_width=True, hide_index=True)
+            st.dataframe(df_gramos.reset_index(drop=True), use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("📥 Descargar")
@@ -2093,8 +2482,8 @@ with tab_analisis:
 
     if df_tickets is None or df_tickets.empty:
         st.info(
-            "Aún no hay datos en el histórico. Genera tickets en la pestaña Capturar o "
-            "Pegar pedido, y dale 'Guardar al histórico' en la pestaña Resumen."
+            "Aún no hay datos en el histórico. Genera tickets en Tickets sin factura o "
+            "Factura, y dale 'Guardar al histórico' en la pestaña Resumen."
         )
         st.stop()
 
@@ -3749,3 +4138,4 @@ with tab_catalogo:
                 if st.button("🗑️ Limpiar y generar de nuevo"):
                     del st.session_state["catalogo_generado"]
                     st.rerun()
+
