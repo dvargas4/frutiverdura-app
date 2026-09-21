@@ -414,8 +414,8 @@ def calcular_productos_factura(lineas, envio=0.0, comision=0.0):
         if extras:
             raise ValueError("Agrega productos antes de distribuir el adicional a la venta o la comisión.")
         return []
-    # Reparto proporcional a la venta base; si toda la venta es cero, por peso.
-    pesos = list(map(Decimal, bases)) if sum(bases) else cantidades
+    # Cada línea de producto recibe la misma parte; diferencia máxima: un centavo.
+    pesos = [Decimal(1)] * len(lineas)
     total_pesos = sum(pesos)
     cuotas = [Decimal(extras) * peso / total_pesos for peso in pesos]
     reparto = [int(cuota.to_integral_value(rounding=ROUND_FLOOR)) for cuota in cuotas]
@@ -1583,6 +1583,14 @@ Laura Canales
                 st.rerun()
 
 
+def actualizar_cargo_factura(rk, campo, prefijo, origen):
+    """Sincroniza el monto general con los pedidos que ya están en vista previa."""
+    monto = float(st.session_state.get(origen, 0.0))
+    for i, pedido in enumerate(st.session_state.get("factura_preview_pedidos", [])):
+        pedido[campo] = monto
+        st.session_state[f"factura_{rk}_{prefijo}_{i}"] = monto
+
+
 with tab_factura:
     # Sufijo dinámico para los keys de los widgets. Al incrementar el contador
     # (después de generar tickets), los widgets se reinstancian vacíos.
@@ -1594,11 +1602,21 @@ with tab_factura:
     st.markdown("**Cómo se factura**")
     st.caption("Costo ajustado = costo base ÷ (1 − impuestos/100). La diferencia se suma también a la venta. "
                "El adicional a la venta y la comisión son montos separados por pedido: "
-               "se reparten entre los productos y aumentan la utilidad.")
+               "se reparten en partes iguales entre los productos y aumentan la utilidad.")
     incremento_default = st.number_input(
         "1. Impuestos sobre el total (%)", min_value=0.0, max_value=99.99, value=0.0,
         step=1.0, key=f"factura_{rk}_incremento_default",
         help="Ejemplo: $8,400 ÷ (1 − 16%) = $10,000. Se usa al procesar; puedes ajustarlo por producto.")
+    envio_default = st.number_input(
+        "2. Envío a integrar en los precios ($)", min_value=0.0, value=0.0, step=1.0,
+        key=f"factura_{rk}_envio_default", on_change=actualizar_cargo_factura,
+        args=(rk, "envio_integrado", "prev_envio", f"factura_{rk}_envio_default"))
+    comision_default = st.number_input(
+        "3. Comisión a integrar en los precios ($)", min_value=0.0, value=0.0, step=1.0,
+        key=f"factura_{rk}_comision_default", on_change=actualizar_cargo_factura,
+        args=(rk, "comision_integrada", "prev_comision", f"factura_{rk}_comision_default"))
+    st.caption("Envío y comisión pueden ser $0. Los montos se aplican a cada pedido y se reparten "
+               "en partes iguales entre sus productos, aumentando venta y utilidad. Puedes ajustarlos por cliente en la vista previa.")
     st.caption(
         "Pega solo la lista de productos. El nombre del cliente y el contacto los pones aquí arriba. "
         "Si pegas varios clientes, sepáralos con línea en blanco y pon el nombre arriba de cada lista."
@@ -1735,6 +1753,8 @@ Laura Canales
                 st.error("No se pudieron detectar productos. Revisa que cada línea termine con (gramos).")
             else:
                 for ped in preview:
+                    ped["envio_integrado"] = envio_default
+                    ped["comision_integrada"] = comision_default
                     for prod in ped["productos"]:
                         prod["incremento_pct"] = incremento_default
                 # Limpiar editores anteriores al procesar un texto nuevo.
@@ -1783,13 +1803,13 @@ Laura Canales
                 ce, cc = st.columns(2)
                 with ce:
                     ped["envio_integrado"] = st.number_input(
-                        "2. Adicional a la venta ($)", min_value=0.0, value=0.0, step=1.0,
+                        "Envío de este pedido ($)", min_value=0.0, value=float(ped.get("envio_integrado", envio_default)), step=1.0,
                         key=f"factura_{rk}_prev_envio_{i}")
                 with cc:
                     ped["comision_integrada"] = st.number_input(
-                        "3. Comisión ($)", min_value=0.0, value=0.0, step=1.0,
+                        "Comisión de este pedido ($)", min_value=0.0, value=float(ped.get("comision_integrada", comision_default)), step=1.0,
                         key=f"factura_{rk}_prev_comision_{i}")
-                st.caption("Ambos importes pueden ser $0. Se reparten proporcionalmente en la venta, sin aumentar el costo.")
+                st.caption("Ambos importes pueden ser $0. Se reparten en partes iguales entre las líneas de producto, sin aumentar el costo.")
 
                 for j, prod in enumerate(ped["productos"]):
                     col1, col2, col3 = st.columns([3, 3, 1])
@@ -2046,7 +2066,7 @@ with tab_modificar:
                 st.caption("Costo ajustado = costo base ÷ (1 − impuestos/100). La diferencia sube también la venta; adicional y comisión aumentan la utilidad.")
                 rev_factura = pedido.get("revision_factura", 0)
                 with st.form(f"editar_factura_{edit_key}_{rev_factura}"):
-                    envio_edit = st.number_input("2. Adicional a la venta ($)", min_value=0.0,
+                    envio_edit = st.number_input("2. Envío a integrar en los precios ($)", min_value=0.0,
                         value=float(pedido["envio_integrado"]), key=f"fe_env_{edit_key}_{rev_factura}")
                     comision_edit = st.number_input("3. Comisión ($)", min_value=0.0,
                         value=float(pedido["comision_integrada"]), key=f"fe_com_{edit_key}_{rev_factura}")
