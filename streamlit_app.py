@@ -30,6 +30,9 @@ UTILIDAD_MINIMA_PCT = 0.25
 MIN_PRODUCTOS_DESCUENTO = 5
 ZONA_HORARIA = "America/Mexico_City"
 DOMICILIO_EMISOR_PREDETERMINADO = {
+    "nombre": "LAURA GONZALEZ ARGUELLO",
+    "rfc": "GOAL7212217T2",
+    "regimen": "RESICO",
     "domicilio": "Ghana núm. 36, colonia Residencial Chimali",
     "lugar": "Tlalpan, Ciudad de México",
     "cp": "14370",
@@ -997,7 +1000,7 @@ with st.sidebar:
     st.title("🥬 Frutiverdura")
 
     with st.expander("Datos del emisor para Factura / remisión", expanded=False):
-        st.caption("El domicilio está precargado. Completa los demás datos del vendedor; se conservan en esta sesión y en los tickets generados.")
+        st.caption("Los datos del emisor están precargados. Puedes revisarlos o corregirlos; se conservan en esta sesión y en los tickets generados.")
         emisor_config = dict(st.session_state.get("emisor_remision", {}))
         for campo, valor in DOMICILIO_EMISOR_PREDETERMINADO.items():
             if not emisor_config.get(campo):
