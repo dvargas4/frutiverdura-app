@@ -472,6 +472,37 @@ def generar_ticket_png(pedido):
     interlinea = 26
     interlinea_pequena = 22
 
+    # Medir y envolver cada descripción dentro de su columna, sin mover importes.
+    medidor = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    def medir(texto):
+        bbox = medidor.textbbox((0, 0), texto, font=f_reg)
+        return bbox[2] - bbox[0]
+
+    productos_ord = sorted(productos, key=lambda p: p[3], reverse=True)
+    ancho_venta = max([medir(f"${p[3]:,.2f}") for p in productos_ord] + [medir("VENTA")])
+    ancho_producto = max(1, ancho - margen_x - ancho_venta - 12 - 130)
+    filas_producto = []
+    paso_texto = max(18, f_reg.getbbox("Ágj")[3] - f_reg.getbbox("Ágj")[1] + 4)
+    for nombre, gramos, costo, venta in productos_ord:
+        lineas, linea = [], ""
+        for palabra in f"{nombre} {int(gramos)}g".split():
+            candidato = f"{linea} {palabra}".strip()
+            if medir(candidato) <= ancho_producto:
+                linea = candidato
+                continue
+            if linea:
+                lineas.append(linea)
+                linea = ""
+            # También soportar nombres largos sin espacios.
+            for caracter in palabra:
+                if linea and medir(linea + caracter) > ancho_producto:
+                    lineas.append(linea)
+                    linea = ""
+                linea += caracter
+        if linea:
+            lineas.append(linea)
+        filas_producto.append((costo, venta, lineas, max(interlinea, len(lineas) * paso_texto + 8)))
+
     # Calcular altura dinámicamente
     alto = 50  # margen superior + título
     alto += interlinea  # fecha
@@ -480,7 +511,7 @@ def generar_ticket_png(pedido):
     alto += interlinea  # línea separadora
     alto += interlinea  # header columnas
     alto += 10  # espacio
-    alto += len(productos) * interlinea  # productos
+    alto += sum(fila[3] for fila in filas_producto)  # filas con altura variable
     alto += 18  # línea separadora
     alto += 70  # bloque compacto COSTO + DIF (5 líneas pequeñas)
     alto += interlinea  # Subtotal venta
@@ -556,22 +587,15 @@ def generar_ticket_png(pedido):
     y += interlinea
 
     # ---- Productos (ordenados por venta descendente) ----
-    productos_ord = sorted(productos, key=lambda p: p[3], reverse=True)
-    for nombre, gramos, costo, venta in productos_ord:
-        # Costo (rojo, izquierda)
+    for costo, venta, lineas, alto_fila in filas_producto:
         draw.text((col_costo_x, y), f"${costo:,.2f}", font=f_reg, fill=c_costo)
-        # Producto (negro, centro)
-        draw.text(
-            (col_producto_x, y),
-            f"{nombre} {int(gramos)}g",
-            font=f_reg,
-            fill=c_titulo,
-        )
-        # Venta (azul, derecha)
+        for indice_linea, linea in enumerate(lineas):
+            draw.text((col_producto_x, y + indice_linea * paso_texto), linea,
+                      font=f_reg, fill=c_titulo)
         venta_txt = f"${venta:,.2f}"
         tw = text_width(venta_txt, f_reg)
         draw.text((col_venta_x - tw, y), venta_txt, font=f_reg, fill=c_venta)
-        y += interlinea
+        y += alto_fila
 
     y += 4
     draw.line([(margen_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
@@ -1606,7 +1630,7 @@ with tab_factura:
     incremento_default = st.number_input(
         "1. Impuestos sobre el total (%)", min_value=0.0, max_value=99.99, value=0.0,
         step=1.0, key=f"factura_{rk}_incremento_default",
-        help="Ejemplo: $8,400 ÷ (1 − 16%) = $10,000. Se usa al procesar; puedes ajustarlo por producto.")
+        help="Ejemplo: $8,400 ÷ (1 − 16%) = $10,000. Se aplica a todos los productos del pedido.")
     envio_default = st.number_input(
         "2. Envío a integrar en los precios ($)", min_value=0.0, value=0.0, step=1.0,
         key=f"factura_{rk}_envio_default", on_change=actualizar_cargo_factura,
@@ -1849,10 +1873,7 @@ Laura Canales
                         )
                         prod["gramos"] = nuevos_g
 
-                    prod["incremento_pct"] = st.number_input(
-                        f"Impuestos sobre el total (%) · {prod['descripcion_original']}",
-                        min_value=0.0, max_value=99.99, value=min(99.99, float(prod.get("incremento_pct", 0.0))), step=1.0,
-                        key=f"factura_{rk}_prev_incremento_{i}_{j}")
+                    prod["incremento_pct"] = incremento_default
 
                     # Si el usuario eligió "Crear nuevo producto", mostrar formulario
                     if prod["match"] == "__nuevo__":
@@ -2070,13 +2091,15 @@ with tab_modificar:
                         value=float(pedido["envio_integrado"]), key=f"fe_env_{edit_key}_{rev_factura}")
                     comision_edit = st.number_input("3. Comisión ($)", min_value=0.0,
                         value=float(pedido["comision_integrada"]), key=f"fe_com_{edit_key}_{rev_factura}")
+                    pct_edit = st.number_input("Impuestos sobre el total (%)", min_value=0.0, max_value=99.99,
+                        value=min(99.99, float(pedido["lineas_factura"][0]["incremento_pct"])),
+                        key=f"fe_pct_{edit_key}_{rev_factura}")
                     lineas_edit = []
                     for j, linea in enumerate(pedido["lineas_factura"]):
                         st.write(linea["nombre"])
                         gramos_edit = st.number_input("Gramos (0 para quitar)", min_value=0.0,
                             value=float(linea["gramos"]), key=f"fe_gr_{edit_key}_{rev_factura}_{j}")
-                        pct_edit = st.number_input("Impuestos sobre el total (%)", min_value=0.0, max_value=99.99,
-                            value=min(99.99, float(linea["incremento_pct"])), key=f"fe_pct_{edit_key}_{rev_factura}_{j}")
+
                         if gramos_edit > 0:
                             lineas_edit.append({**linea, "gramos": gramos_edit, "incremento_pct": pct_edit})
                     if st.form_submit_button("Guardar cambios de factura"):
