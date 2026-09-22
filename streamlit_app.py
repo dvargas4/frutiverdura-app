@@ -440,11 +440,22 @@ def mostrar_resumen_factura(productos):
     c.metric("Utilidad", f"${totales['utilidad']:,.2f}")
 
 
+def preparar_remision(pedido):
+    """Folio y fecha estables; los datos del emisor quedan en cada pedido."""
+    pedido.setdefault("folio_remision", "REM-" + uuid4().hex[:12].upper())
+    pedido.setdefault("fecha_emision", datetime.now(pytz.timezone(ZONA_HORARIA)).strftime("%Y-%m-%d %H:%M"))
+    # Permite completar documentos previos que todavía no tenían emisor.
+    if not pedido.get("emisor_remision") or not all(pedido["emisor_remision"].values()):
+        pedido["emisor_remision"] = dict(st.session_state.get("emisor_remision", {}))
+    pedido.setdefault("estado_pago", "Por confirmar")
+
+
 def generar_ticket_png(pedido):
     """Genera la imagen del ticket y devuelve los bytes PNG.
     Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
     totales abajo a la derecha.
     """
+    preparar_remision(pedido)
     productos = pedido["productos"]
     totales = calcular_totales(productos, pedido["lleva_envio"], pedido["descuento"])
 
@@ -478,6 +489,62 @@ def generar_ticket_png(pedido):
         bbox = medidor.textbbox((0, 0), texto, font=f_reg)
         return bbox[2] - bbox[0]
 
+    def envolver(texto, fuente=f_reg, limite=290):
+        lineas, linea = [], ""
+        for palabra in str(texto).split():
+            candidato = (linea + " " + palabra).strip()
+            if medidor.textbbox((0, 0), candidato, font=fuente)[2] <= limite:
+                linea = candidato
+            else:
+                if linea:
+                    lineas.append(linea)
+                linea = ""
+                for caracter in palabra:
+                    if linea and medidor.textbbox((0, 0), linea + caracter, font=fuente)[2] > limite:
+                        lineas.append(linea)
+                        linea = ""
+                    linea += caracter
+        if linea:
+            lineas.append(linea)
+        return lineas
+
+    emisor = pedido.get("emisor_remision", {})
+    faltantes = [k for k in ("nombre", "rfc", "regimen", "domicilio", "lugar", "cp") if not emisor.get(k)]
+    encabezado = ["NOTA DE REMISIÓN"]
+    if faltantes:
+        encabezado.append("BORRADOR: completar datos del emisor")
+    encabezado += [
+        emisor.get("nombre") or "Emisor: pendiente",
+        "RFC: " + (emisor.get("rfc") or "pendiente"),
+        "Régimen fiscal: " + (emisor.get("regimen") or "pendiente"),
+        "Domicilio: " + (emisor.get("domicilio") or "pendiente"),
+        "Lugar de expedición: " + (emisor.get("lugar") or "pendiente"),
+        "C.P.: " + (emisor.get("cp") or "pendiente"),
+        "Folio interno: " + pedido["folio_remision"],
+        "Expedición: " + pedido["fecha_emision"],
+        "Cliente: " + pedido["cliente"],
+        "Contacto: " + pedido["contacto"] + " (" + pedido.get("telefono", "") + ")",
+        "Moneda: MXN (pesos mexicanos)",
+    ]
+    if pedido.get("domicilio_entrega"):
+        encabezado.append("Entrega en: " + pedido["domicilio_entrega"])
+    if pedido.get("fecha_custom"):
+        encabezado.append("Fecha del pedido: " + pedido["fecha_custom"].split()[0])
+    lineas_encabezado = [linea for texto in encabezado for linea in envolver(texto)]
+    pie = ["Estado de pago: " + pedido.get("estado_pago", "Por confirmar")]
+    if pedido.get("medio_pago"):
+        pie.append("Medio de pago: " + pedido["medio_pago"])
+    if pedido.get("cfdi_referencia"):
+        pie.append("CFDI relacionado: " + pedido["cfdi_referencia"])
+    if pedido.get("observaciones_remision"):
+        pie.append("Observaciones: " + pedido["observaciones_remision"])
+    pie += ["Recibió (nombre): __________________",
+            "Firma: ___________________________",
+            "Fecha y hora de entrega: ____________",
+            "Este documento no es un CFDI.",
+            "La recepción no acredita el pago."]
+    lineas_pie = [linea for texto in pie for linea in envolver(texto)]
+
     productos_ord = sorted(productos, key=lambda p: p[3], reverse=True)
     ancho_venta = max([medir(f"${p[3]:,.2f}") for p in productos_ord] + [medir("VENTA")])
     ancho_producto = max(1, ancho - margen_x - ancho_venta - 12 - 130)
@@ -501,10 +568,12 @@ def generar_ticket_png(pedido):
                 linea += caracter
         if linea:
             lineas.append(linea)
+        if gramos > 0:
+            lineas.extend(envolver(f"P. unitario: ${venta * 1000 / gramos:,.4f}/kg", limite=ancho_producto))
         filas_producto.append((costo, venta, lineas, max(interlinea, len(lineas) * paso_texto + 8)))
 
     # Calcular altura dinámicamente
-    alto = 50  # margen superior + título
+    alto = 50 + len(lineas_encabezado) * 20 + len(lineas_pie) * 20 + 60  # datos y firmas
     alto += interlinea  # fecha
     alto += interlinea  # PEDIDO
     alto += interlinea + 12  # CONTACTO + espacio antes de la línea
@@ -553,26 +622,10 @@ def generar_ticket_png(pedido):
     centro_cliente = (col_producto_x + (ancho - margen_x)) // 2
 
     y = 18
-    titulo = "FRUTIVERDURA A DOMICILIO"
-    tw = text_width(titulo, f_titulo)
-    draw.text((centro_cliente - tw // 2, y), titulo, font=f_titulo, fill=c_titulo)
-    y += interlinea + 4
-
-    mx_time = datetime.now(pytz.timezone(ZONA_HORARIA))
-    fecha = mx_time.strftime("%d/%m/%Y")
-    tw = text_width(fecha, f_reg)
-    draw.text((centro_cliente - tw // 2, y), fecha, font=f_reg, fill=c_titulo)
-    y += interlinea + 4
-
-    pedido_txt = f"PEDIDO : {pedido['cliente'].upper()}"
-    tw = text_width(pedido_txt, f_reg)
-    draw.text((ancho - margen_x - tw, y), pedido_txt, font=f_reg, fill=c_titulo)
-    y += interlinea
-
-    contacto_txt = f"CONTACTO : {pedido['contacto']} ({pedido['telefono']})"
-    tw = text_width(contacto_txt, f_reg)
-    draw.text((ancho - margen_x - tw, y), contacto_txt, font=f_reg, fill=c_titulo)
-    y += interlinea + 4
+    for linea in lineas_encabezado:
+        draw.text((col_producto_x, y), linea, font=f_reg, fill=c_titulo)
+        y += 20
+    y += 8
 
     # Línea separadora
     draw.line([(margen_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
@@ -666,6 +719,12 @@ def generar_ticket_png(pedido):
     # Centrado en zona cliente (entre col_producto_x y borde derecho), no en ancho total
     draw.text((centro_cliente - tw // 2, y), gracias, font=f_total_bold, fill=c_titulo)
 
+    y += 30
+    for linea in lineas_pie:
+        draw.text((col_producto_x, y), linea, font=f_reg, fill=c_titulo)
+        y += 20
+    img = img.crop((0, 0, ancho, min(alto, y + 20)))
+
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -676,6 +735,21 @@ def generar_ticket_png(pedido):
 # ============================
 with st.sidebar:
     st.title("🥬 Frutiverdura")
+
+    with st.expander("Datos del emisor para la remisión", expanded=True):
+        st.caption("Captura los datos reales del vendedor. Se conservan en esta sesión y en los tickets generados.")
+        emisor_config = st.session_state.get("emisor_remision", {})
+        emisor_nuevo = {}
+        for campo, etiqueta in [("nombre", "Nombre completo o razón social"), ("rfc", "RFC del emisor"),
+                                ("regimen", "Régimen fiscal"), ("domicilio", "Domicilio del establecimiento"),
+                                ("lugar", "Municipio y estado de expedición"), ("cp", "Código postal de expedición")]:
+            emisor_nuevo[campo] = st.text_input(etiqueta, value=emisor_config.get(campo, ""),
+                                               key=f"remision_emisor_{campo}").strip()
+        emisor_nuevo["rfc"] = emisor_nuevo["rfc"].upper()
+        st.session_state["emisor_remision"] = emisor_nuevo
+        if not all(emisor_nuevo.values()):
+            st.info("El documento mostrará BORRADOR mientras falten datos del emisor.")
+        st.caption("La nota de remisión no sustituye la factura fiscal (CFDI).")
 
     st.subheader("Catálogo")
     fuente = st.radio(
@@ -1588,6 +1662,7 @@ Laura Canales
                         "fecha_custom": fecha_pedido.strftime("%Y-%m-%d %H:%M"),
                         **totales,
                     }
+                    preparar_remision(pedido)
                     st.session_state.pedidos.append(pedido)
                     generados += 1
 
@@ -2007,6 +2082,7 @@ Laura Canales
                         "fecha_custom": fecha_pedido.strftime("%Y-%m-%d %H:%M"),
                         **totales,
                     }
+                    preparar_remision(pedido)
                     st.session_state.pedidos.append(pedido)
                     generados += 1
 
@@ -2064,6 +2140,28 @@ with tab_modificar:
 
         with col_edit:
             st.markdown("**Acciones**")
+
+            with st.expander("Datos de la remisión y entrega"):
+                with st.form(f"remision_datos_{edit_key}"):
+                    folio_edit = st.text_input("Folio interno", value=pedido["folio_remision"])
+                    direccion_edit = st.text_input("Domicilio de entrega (opcional)", value=pedido.get("domicilio_entrega", ""))
+                    estados_pago = ["Por confirmar", "Pendiente", "Pagado", "Pago parcial"]
+                    estado_edit = st.selectbox("Estado de pago", estados_pago,
+                        index=estados_pago.index(pedido.get("estado_pago", "Por confirmar")))
+                    medio_edit = st.text_input("Medio de pago (opcional)", value=pedido.get("medio_pago", ""))
+                    cfdi_edit = st.text_input("Folio fiscal del CFDI relacionado (opcional)", value=pedido.get("cfdi_referencia", ""))
+                    observaciones_edit = st.text_area("Observaciones de entrega (opcional)", value=pedido.get("observaciones_remision", ""))
+                    if st.form_submit_button("Guardar datos de remisión"):
+                        if not folio_edit.strip():
+                            st.error("El folio no puede estar vacío.")
+                        elif any(p is not pedido and p.get("folio_remision") == folio_edit.strip() for p in st.session_state.pedidos):
+                            st.error("Ese folio ya existe en otro pedido de esta sesión.")
+                        else:
+                            pedido.update(folio_remision=folio_edit.strip(), domicilio_entrega=direccion_edit.strip(),
+                                estado_pago=estado_edit, medio_pago=medio_edit.strip(), cfdi_referencia=cfdi_edit.strip(),
+                                observaciones_remision=observaciones_edit.strip())
+                            st.rerun()
+
 
             # Cambiar contacto asignado
             contactos_list = list(CONTACTOS.keys())
