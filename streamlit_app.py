@@ -442,6 +442,8 @@ def mostrar_resumen_factura(productos):
 
 def preparar_remision(pedido):
     """Folio y fecha estables; los datos del emisor quedan en cada pedido."""
+    if pedido.get("tipo") != "factura":
+        return
     pedido.setdefault("folio_remision", "REM-" + uuid4().hex[:12].upper())
     pedido.setdefault("fecha_emision", datetime.now(pytz.timezone(ZONA_HORARIA)).strftime("%Y-%m-%d %H:%M"))
     # Permite completar documentos previos que todavía no tenían emisor.
@@ -451,11 +453,16 @@ def preparar_remision(pedido):
 
 
 def generar_ticket_png(pedido):
+    if pedido.get("tipo") == "factura":
+        return generar_remision_png(pedido)
+    return generar_ticket_normal_png(pedido)
+
+
+def generar_ticket_normal_png(pedido):
     """Genera la imagen del ticket y devuelve los bytes PNG.
     Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
     totales abajo a la derecha.
     """
-    preparar_remision(pedido)
     productos = pedido["productos"]
     totales = calcular_totales(productos, pedido["lleva_envio"], pedido["descuento"])
 
@@ -489,62 +496,6 @@ def generar_ticket_png(pedido):
         bbox = medidor.textbbox((0, 0), texto, font=f_reg)
         return bbox[2] - bbox[0]
 
-    def envolver(texto, fuente=f_reg, limite=290):
-        lineas, linea = [], ""
-        for palabra in str(texto).split():
-            candidato = (linea + " " + palabra).strip()
-            if medidor.textbbox((0, 0), candidato, font=fuente)[2] <= limite:
-                linea = candidato
-            else:
-                if linea:
-                    lineas.append(linea)
-                linea = ""
-                for caracter in palabra:
-                    if linea and medidor.textbbox((0, 0), linea + caracter, font=fuente)[2] > limite:
-                        lineas.append(linea)
-                        linea = ""
-                    linea += caracter
-        if linea:
-            lineas.append(linea)
-        return lineas
-
-    emisor = pedido.get("emisor_remision", {})
-    faltantes = [k for k in ("nombre", "rfc", "regimen", "domicilio", "lugar", "cp") if not emisor.get(k)]
-    encabezado = ["NOTA DE REMISIÓN"]
-    if faltantes:
-        encabezado.append("BORRADOR: completar datos del emisor")
-    encabezado += [
-        emisor.get("nombre") or "Emisor: pendiente",
-        "RFC: " + (emisor.get("rfc") or "pendiente"),
-        "Régimen fiscal: " + (emisor.get("regimen") or "pendiente"),
-        "Domicilio: " + (emisor.get("domicilio") or "pendiente"),
-        "Lugar de expedición: " + (emisor.get("lugar") or "pendiente"),
-        "C.P.: " + (emisor.get("cp") or "pendiente"),
-        "Folio interno: " + pedido["folio_remision"],
-        "Expedición: " + pedido["fecha_emision"],
-        "Cliente: " + pedido["cliente"],
-        "Contacto: " + pedido["contacto"] + " (" + pedido.get("telefono", "") + ")",
-        "Moneda: MXN (pesos mexicanos)",
-    ]
-    if pedido.get("domicilio_entrega"):
-        encabezado.append("Entrega en: " + pedido["domicilio_entrega"])
-    if pedido.get("fecha_custom"):
-        encabezado.append("Fecha del pedido: " + pedido["fecha_custom"].split()[0])
-    lineas_encabezado = [linea for texto in encabezado for linea in envolver(texto)]
-    pie = ["Estado de pago: " + pedido.get("estado_pago", "Por confirmar")]
-    if pedido.get("medio_pago"):
-        pie.append("Medio de pago: " + pedido["medio_pago"])
-    if pedido.get("cfdi_referencia"):
-        pie.append("CFDI relacionado: " + pedido["cfdi_referencia"])
-    if pedido.get("observaciones_remision"):
-        pie.append("Observaciones: " + pedido["observaciones_remision"])
-    pie += ["Recibió (nombre): __________________",
-            "Firma: ___________________________",
-            "Fecha y hora de entrega: ____________",
-            "Este documento no es un CFDI.",
-            "La recepción no acredita el pago."]
-    lineas_pie = [linea for texto in pie for linea in envolver(texto)]
-
     productos_ord = sorted(productos, key=lambda p: p[3], reverse=True)
     ancho_venta = max([medir(f"${p[3]:,.2f}") for p in productos_ord] + [medir("VENTA")])
     ancho_producto = max(1, ancho - margen_x - ancho_venta - 12 - 130)
@@ -568,19 +519,17 @@ def generar_ticket_png(pedido):
                 linea += caracter
         if linea:
             lineas.append(linea)
-        if gramos > 0:
-            lineas.extend(envolver(f"P. unitario: ${venta * 1000 / gramos:,.4f}/kg", limite=ancho_producto))
         filas_producto.append((costo, venta, lineas, max(interlinea, len(lineas) * paso_texto + 8)))
 
     # Calcular altura dinámicamente
-    alto = 50 + len(lineas_encabezado) * 20 + len(lineas_pie) * 20 + 60  # datos y firmas
+    alto = 50  # margen superior + título
     alto += interlinea  # fecha
     alto += interlinea  # PEDIDO
     alto += interlinea + 12  # CONTACTO + espacio antes de la línea
     alto += interlinea  # línea separadora
     alto += interlinea  # header columnas
     alto += 10  # espacio
-    alto += sum(fila[3] for fila in filas_producto)  # filas con altura variable
+    alto += sum(fila[3] for fila in filas_producto)  # nombres largos
     alto += 18  # línea separadora
     alto += 70  # bloque compacto COSTO + DIF (5 líneas pequeñas)
     alto += interlinea  # Subtotal venta
@@ -622,10 +571,26 @@ def generar_ticket_png(pedido):
     centro_cliente = (col_producto_x + (ancho - margen_x)) // 2
 
     y = 18
-    for linea in lineas_encabezado:
-        draw.text((col_producto_x, y), linea, font=f_reg, fill=c_titulo)
-        y += 20
-    y += 8
+    titulo = "FRUTIVERDURA A DOMICILIO"
+    tw = text_width(titulo, f_titulo)
+    draw.text((centro_cliente - tw // 2, y), titulo, font=f_titulo, fill=c_titulo)
+    y += interlinea + 4
+
+    mx_time = datetime.now(pytz.timezone(ZONA_HORARIA))
+    fecha = mx_time.strftime("%d/%m/%Y")
+    tw = text_width(fecha, f_reg)
+    draw.text((centro_cliente - tw // 2, y), fecha, font=f_reg, fill=c_titulo)
+    y += interlinea + 4
+
+    pedido_txt = f"PEDIDO : {pedido['cliente'].upper()}"
+    tw = text_width(pedido_txt, f_reg)
+    draw.text((ancho - margen_x - tw, y), pedido_txt, font=f_reg, fill=c_titulo)
+    y += interlinea
+
+    contacto_txt = f"CONTACTO : {pedido['contacto']} ({pedido['telefono']})"
+    tw = text_width(contacto_txt, f_reg)
+    draw.text((ancho - margen_x - tw, y), contacto_txt, font=f_reg, fill=c_titulo)
+    y += interlinea + 4
 
     # Línea separadora
     draw.line([(margen_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
@@ -719,10 +684,300 @@ def generar_ticket_png(pedido):
     # Centrado en zona cliente (entre col_producto_x y borde derecho), no en ancho total
     draw.text((centro_cliente - tw // 2, y), gracias, font=f_total_bold, fill=c_titulo)
 
-    y += 30
-    for linea in lineas_pie:
-        draw.text((col_producto_x, y), linea, font=f_reg, fill=c_titulo)
-        y += 20
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def generar_remision_png(pedido):
+    """Genera la imagen del ticket y devuelve los bytes PNG.
+    Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
+    totales abajo a la derecha.
+    """
+    preparar_remision(pedido)
+    productos = pedido["productos"]
+    totales = calcular_totales(productos, pedido["lleva_envio"], pedido["descuento"])
+
+    # ---- Configuración de fuentes ----
+    try:
+        if FUENTE_REG and FUENTE_BOLD:
+            f_titulo = ImageFont.truetype(FUENTE_BOLD, 16)
+            f_header = ImageFont.truetype(FUENTE_BOLD, 13)
+            f_reg = ImageFont.truetype(FUENTE_REG, 13)
+            f_total_bold = ImageFont.truetype(FUENTE_BOLD, 14)
+            f_compacta = ImageFont.truetype(FUENTE_REG, 10)  # para COSTO/DIF en zona estrecha
+        else:
+            raise IOError("Fuentes no encontradas")
+    except (IOError, OSError):
+        default = ImageFont.load_default()
+        f_titulo = default
+        f_header = default
+        f_reg = default
+        f_total_bold = default
+        f_compacta = default
+
+    # ---- Dimensiones ----
+    ancho = 440
+    margen_x = 20
+    interlinea = 26
+    interlinea_pequena = 22
+
+    # Medir y envolver cada descripción dentro de su columna, sin mover importes.
+    medidor = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    def medir(texto):
+        bbox = medidor.textbbox((0, 0), texto, font=f_reg)
+        return bbox[2] - bbox[0]
+
+    def envolver(texto, fuente=f_reg, limite=290):
+        lineas, linea = [], ""
+        for palabra in str(texto).split():
+            candidato = (linea + " " + palabra).strip()
+            if medidor.textbbox((0, 0), candidato, font=fuente)[2] <= limite:
+                linea = candidato
+            else:
+                if linea:
+                    lineas.append(linea)
+                linea = ""
+                for caracter in palabra:
+                    if linea and medidor.textbbox((0, 0), linea + caracter, font=fuente)[2] > limite:
+                        lineas.append(linea)
+                        linea = ""
+                    linea += caracter
+        if linea:
+            lineas.append(linea)
+        return lineas
+
+    emisor = pedido.get("emisor_remision", {})
+    faltantes = [k for k in ("nombre", "rfc", "regimen", "domicilio", "lugar", "cp") if not emisor.get(k)]
+    # Bloques visuales medidos en el ancho que conserva el cliente al recortar.
+    lineas_encabezado = []
+    lineas_pie = []
+    def agregar_texto(destino, texto, fuente=f_reg, centrado=False):
+        for linea in envolver(texto, fuente):
+            destino.append((linea, fuente, centrado))
+    def separar(destino):
+        destino.append((None, None, False))
+
+    agregar_texto(lineas_encabezado, emisor.get("nombre") or "NOMBRE DEL NEGOCIO", f_titulo, True)
+    agregar_texto(lineas_encabezado, emisor.get("domicilio") or "Domicilio: pendiente", centrado=True)
+    agregar_texto(lineas_encabezado,
+                  (emisor.get("lugar") or "Lugar: pendiente") + " · C.P. " + (emisor.get("cp") or "pendiente"), centrado=True)
+    agregar_texto(lineas_encabezado, "RFC: " + (emisor.get("rfc") or "pendiente"), centrado=True)
+    agregar_texto(lineas_encabezado, "Régimen fiscal: " + (emisor.get("regimen") or "pendiente"), centrado=True)
+    if faltantes:
+        agregar_texto(lineas_encabezado, "BORRADOR: completar datos del emisor", centrado=True)
+    separar(lineas_encabezado)
+    agregar_texto(lineas_encabezado, "DATOS DEL CLIENTE", f_header, True)
+    agregar_texto(lineas_encabezado, pedido["cliente"], centrado=True)
+    if pedido.get("domicilio_entrega"):
+        agregar_texto(lineas_encabezado, "Entrega: " + pedido["domicilio_entrega"], centrado=True)
+    separar(lineas_encabezado)
+    agregar_texto(lineas_encabezado, "NOTA DE REMISIÓN", f_titulo, True)
+    agregar_texto(lineas_encabezado, "Folio: " + pedido["folio_remision"], centrado=True)
+    agregar_texto(lineas_encabezado, "Expedición: " + pedido["fecha_emision"], centrado=True)
+    if pedido.get("fecha_custom"):
+        agregar_texto(lineas_encabezado, "Fecha del pedido: " + pedido["fecha_custom"].split()[0], centrado=True)
+    agregar_texto(lineas_encabezado, "Contacto de venta: " + pedido["contacto"], centrado=True)
+    agregar_texto(lineas_encabezado, "Tel.: " + pedido.get("telefono", ""), centrado=True)
+    agregar_texto(lineas_encabezado, "Importes en MXN", centrado=True)
+
+    separar(lineas_pie)
+    agregar_texto(lineas_pie, "PAGO", f_header)
+    agregar_texto(lineas_pie, "Estado: " + pedido.get("estado_pago", "Por confirmar"))
+    if pedido.get("medio_pago"):
+        agregar_texto(lineas_pie, "Medio: " + pedido["medio_pago"])
+    if pedido.get("cfdi_referencia"):
+        agregar_texto(lineas_pie, "CFDI relacionado: " + pedido["cfdi_referencia"])
+    separar(lineas_pie)
+    agregar_texto(lineas_pie, "RECEPCIÓN DE MERCANCÍA", f_header)
+    if pedido.get("observaciones_remision"):
+        agregar_texto(lineas_pie, "Observaciones: " + pedido["observaciones_remision"])
+    for texto in ["Recibió: __________________________", "Firma: ___________________________",
+                  "Fecha y hora: _____________________"]:
+        agregar_texto(lineas_pie, texto)
+    separar(lineas_pie)
+    agregar_texto(lineas_pie, "GRACIAS POR TU COMPRA", f_total_bold, True)
+    agregar_texto(lineas_pie, "Este documento no es un CFDI.", f_compacta, True)
+    agregar_texto(lineas_pie, "La recepción no acredita el pago.", f_compacta, True)
+
+    productos_ord = sorted(productos, key=lambda p: p[3], reverse=True)
+    ancho_venta = max([medir(f"${p[3]:,.2f}") for p in productos_ord] + [medir("VENTA")])
+    ancho_producto = max(1, ancho - margen_x - ancho_venta - 12 - 130)
+    filas_producto = []
+    paso_texto = max(18, f_reg.getbbox("Ágj")[3] - f_reg.getbbox("Ágj")[1] + 4)
+    for nombre, gramos, costo, venta in productos_ord:
+        lineas, linea = [], ""
+        for palabra in f"{nombre} {int(gramos)}g".split():
+            candidato = f"{linea} {palabra}".strip()
+            if medir(candidato) <= ancho_producto:
+                linea = candidato
+                continue
+            if linea:
+                lineas.append(linea)
+                linea = ""
+            # También soportar nombres largos sin espacios.
+            for caracter in palabra:
+                if linea and medir(linea + caracter) > ancho_producto:
+                    lineas.append(linea)
+                    linea = ""
+                linea += caracter
+        if linea:
+            lineas.append(linea)
+        if gramos > 0:
+            lineas.extend(envolver(f"P. unitario: ${venta * 1000 / gramos:,.4f}/kg", limite=ancho_producto))
+        filas_producto.append((costo, venta, lineas, max(interlinea, len(lineas) * paso_texto + 8)))
+
+    # Calcular altura dinámicamente
+    alto = 50 + len(lineas_encabezado) * 22 + len(lineas_pie) * 22 + 60  # datos y firmas
+    alto += interlinea  # fecha
+    alto += interlinea  # PEDIDO
+    alto += interlinea + 12  # CONTACTO + espacio antes de la línea
+    alto += interlinea  # línea separadora
+    alto += interlinea  # header columnas
+    alto += 10  # espacio
+    alto += sum(fila[3] for fila in filas_producto)  # filas con altura variable
+    alto += 18  # línea separadora
+    alto += 70  # bloque compacto COSTO + DIF (5 líneas pequeñas)
+    alto += interlinea  # Subtotal venta
+    if totales["costo_envio"] > 0:
+        alto += interlinea
+    if pedido["descuento"] > 0:
+        alto += interlinea
+    alto += interlinea  # línea + total
+    alto += 30  # GRACIAS
+    alto += 20  # margen inferior
+
+    # ---- Colores ----
+    c_fondo = (255, 255, 255)
+    c_titulo = (0, 0, 0)
+    c_venta = (0, 102, 204)
+    c_costo = (204, 0, 0)
+    c_sec = (120, 120, 120)
+
+    img = Image.new("RGB", (ancho, alto), c_fondo)
+    draw = ImageDraw.Draw(img)
+
+    # Helper: medir ancho de texto (compatible con varias versiones de PIL)
+    def text_width(texto, fuente):
+        try:
+            bbox = draw.textbbox((0, 0), texto, font=fuente)
+            return bbox[2] - bbox[0]
+        except AttributeError:
+            return draw.textlength(texto, font=fuente)
+
+    # ---- Posiciones de columnas ----
+    col_costo_x = margen_x  # alineado izquierda
+    col_producto_x = 130  # alineado izquierda, cabe a partir de aquí
+    col_venta_x = ancho - margen_x  # alineado derecha
+
+    # ---- Encabezado ----
+    # El centro de los textos para el cliente es la zona entre col_producto_x y borde derecho.
+    # Esto es porque el ticket se recorta en col_producto_x (línea de corte): la izquierda
+    # es info para el contacto/proveedor, la derecha es lo que ve el cliente.
+    centro_cliente = (col_producto_x + (ancho - margen_x)) // 2
+
+    y = 18
+    def dibujar_bloques(lineas, y_actual):
+        for texto, fuente, centrado in lineas:
+            if texto is None:
+                draw.line([(col_producto_x, y_actual + 8), (col_venta_x, y_actual + 8)], fill=c_sec, width=1)
+            else:
+                x = centro_cliente - text_width(texto, fuente) / 2 if centrado else col_producto_x
+                draw.text((x, y_actual), texto, font=fuente, fill=c_titulo)
+            y_actual += 22
+        return y_actual
+
+    y = dibujar_bloques(lineas_encabezado, y)
+    y += 8
+
+    # Línea separadora
+    draw.line([(margen_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
+    y += 12
+
+    # Headers de columna
+    draw.text((col_costo_x, y), "COSTO", font=f_header, fill=c_sec)
+    draw.text((col_producto_x, y), "PRODUCTO", font=f_header, fill=c_titulo)
+    venta_h = "VENTA"
+    tw = text_width(venta_h, f_header)
+    draw.text((col_venta_x - tw, y), venta_h, font=f_header, fill=c_titulo)
+    y += interlinea
+
+    # ---- Productos (ordenados por venta descendente) ----
+    for costo, venta, lineas, alto_fila in filas_producto:
+        draw.text((col_costo_x, y), f"${costo:,.2f}", font=f_reg, fill=c_costo)
+        for indice_linea, linea in enumerate(lineas):
+            draw.text((col_producto_x, y + indice_linea * paso_texto), linea,
+                      font=f_reg, fill=c_titulo)
+        venta_txt = f"${venta:,.2f}"
+        tw = text_width(venta_txt, f_reg)
+        draw.text((col_venta_x - tw, y), venta_txt, font=f_reg, fill=c_venta)
+        y += alto_fila
+
+    y += 4
+    draw.line([(margen_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
+    y += 10
+
+    # ---- Totales ----
+    # Zona del PROVEEDOR (izquierda de la línea de corte en col_producto_x):
+    # COSTO y DIF compactos, sobre dos líneas cada uno para no rebasar la línea
+    # de corte. La imagen se recorta por col_producto_x al entregar al cliente.
+    y_izq_inicio = y
+    ancho_zona_izq = col_producto_x - col_costo_x - 8  # 8px de margen interno
+
+    def dibujar_compacto_izq(y_local, label, valor, color):
+        """Dibuja label y valor en la zona estrecha izquierda. Si no caben en una
+        sola línea las pone en dos líneas."""
+        linea_completa = f"{label} {valor}"
+        if text_width(linea_completa, f_compacta) <= ancho_zona_izq:
+            draw.text((col_costo_x, y_local), linea_completa, font=f_compacta, fill=color)
+            return y_local + 14
+        # No cabe: poner label arriba y valor abajo
+        draw.text((col_costo_x, y_local), label, font=f_compacta, fill=color)
+        draw.text((col_costo_x, y_local + 12), valor, font=f_compacta, fill=color)
+        return y_local + 26
+
+    y_izq = y_izq_inicio
+    y_izq = dibujar_compacto_izq(
+        y_izq, "COSTO:", f"${totales['subtotal_costo']:,.2f}", c_sec
+    )
+    y_izq = dibujar_compacto_izq(
+        y_izq,
+        "DIF:",
+        f"${totales['utilidad']:,.2f} ({totales['utilidad_pct']:.1f}%)",
+        c_sec,
+    )
+
+    # Zona del CLIENTE (derecha de la línea de corte): Subtotal / Envío / Descuento / TOTAL
+    sub_txt = f"Subtotal Venta : ${totales['subtotal_venta']:,.2f}"
+    tw = text_width(sub_txt, f_total_bold)
+    draw.text((col_venta_x - tw, y), sub_txt, font=f_total_bold, fill=c_venta)
+    y += interlinea
+
+    if totales["costo_envio"] > 0:
+        env_txt = f"Envio : ${totales['costo_envio']:,.2f}"
+        tw = text_width(env_txt, f_reg)
+        draw.text((col_venta_x - tw, y), env_txt, font=f_reg, fill=c_titulo)
+        y += interlinea
+
+    if pedido["descuento"] > 0:
+        desc_txt = f"Descuento : -${pedido['descuento']:,.2f}"
+        tw = text_width(desc_txt, f_reg)
+        draw.text((col_venta_x - tw, y), desc_txt, font=f_reg, fill=c_sec)
+        y += interlinea
+
+    # Línea fina antes del total (solo en zona cliente)
+    draw.line([(col_producto_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
+    y += 8
+
+    total_txt = f"TOTAL : ${totales['nuevo_total']:,.2f}"
+    tw = text_width(total_txt, f_total_bold)
+    draw.text((col_venta_x - tw, y), total_txt, font=f_total_bold, fill=c_venta)
+    y += interlinea + 8
+
+    # Asegurar que el ticket no termine antes de que acabe la zona izquierda
+    y = max(y, y_izq + 4)
+
+    y = dibujar_bloques(lineas_pie, y + 8)
     img = img.crop((0, 0, ancho, min(alto, y + 20)))
 
     buf = io.BytesIO()
@@ -736,7 +991,7 @@ def generar_ticket_png(pedido):
 with st.sidebar:
     st.title("🥬 Frutiverdura")
 
-    with st.expander("Datos del emisor para la remisión", expanded=True):
+    with st.expander("Datos del emisor para Factura / remisión", expanded=False):
         st.caption("Captura los datos reales del vendedor. Se conservan en esta sesión y en los tickets generados.")
         emisor_config = st.session_state.get("emisor_remision", {})
         emisor_nuevo = {}
@@ -2141,26 +2396,27 @@ with tab_modificar:
         with col_edit:
             st.markdown("**Acciones**")
 
-            with st.expander("Datos de la remisión y entrega"):
-                with st.form(f"remision_datos_{edit_key}"):
-                    folio_edit = st.text_input("Folio interno", value=pedido["folio_remision"])
-                    direccion_edit = st.text_input("Domicilio de entrega (opcional)", value=pedido.get("domicilio_entrega", ""))
-                    estados_pago = ["Por confirmar", "Pendiente", "Pagado", "Pago parcial"]
-                    estado_edit = st.selectbox("Estado de pago", estados_pago,
-                        index=estados_pago.index(pedido.get("estado_pago", "Por confirmar")))
-                    medio_edit = st.text_input("Medio de pago (opcional)", value=pedido.get("medio_pago", ""))
-                    cfdi_edit = st.text_input("Folio fiscal del CFDI relacionado (opcional)", value=pedido.get("cfdi_referencia", ""))
-                    observaciones_edit = st.text_area("Observaciones de entrega (opcional)", value=pedido.get("observaciones_remision", ""))
-                    if st.form_submit_button("Guardar datos de remisión"):
-                        if not folio_edit.strip():
-                            st.error("El folio no puede estar vacío.")
-                        elif any(p is not pedido and p.get("folio_remision") == folio_edit.strip() for p in st.session_state.pedidos):
-                            st.error("Ese folio ya existe en otro pedido de esta sesión.")
-                        else:
-                            pedido.update(folio_remision=folio_edit.strip(), domicilio_entrega=direccion_edit.strip(),
-                                estado_pago=estado_edit, medio_pago=medio_edit.strip(), cfdi_referencia=cfdi_edit.strip(),
-                                observaciones_remision=observaciones_edit.strip())
-                            st.rerun()
+            if pedido.get("tipo") == "factura":
+                with st.expander("Datos de la remisión y entrega"):
+                    with st.form(f"remision_datos_{edit_key}"):
+                        folio_edit = st.text_input("Folio interno", value=pedido["folio_remision"])
+                        direccion_edit = st.text_input("Domicilio de entrega (opcional)", value=pedido.get("domicilio_entrega", ""))
+                        estados_pago = ["Por confirmar", "Pendiente", "Pagado", "Pago parcial"]
+                        estado_edit = st.selectbox("Estado de pago", estados_pago,
+                            index=estados_pago.index(pedido.get("estado_pago", "Por confirmar")))
+                        medio_edit = st.text_input("Medio de pago (opcional)", value=pedido.get("medio_pago", ""))
+                        cfdi_edit = st.text_input("Folio fiscal del CFDI relacionado (opcional)", value=pedido.get("cfdi_referencia", ""))
+                        observaciones_edit = st.text_area("Observaciones de entrega (opcional)", value=pedido.get("observaciones_remision", ""))
+                        if st.form_submit_button("Guardar datos de remisión"):
+                            if not folio_edit.strip():
+                                st.error("El folio no puede estar vacío.")
+                            elif any(p is not pedido and p.get("folio_remision") == folio_edit.strip() for p in st.session_state.pedidos):
+                                st.error("Ese folio ya existe en otro pedido de esta sesión.")
+                            else:
+                                pedido.update(folio_remision=folio_edit.strip(), domicilio_entrega=direccion_edit.strip(),
+                                    estado_pago=estado_edit, medio_pago=medio_edit.strip(), cfdi_referencia=cfdi_edit.strip(),
+                                    observaciones_remision=observaciones_edit.strip())
+                                st.rerun()
 
 
             # Cambiar contacto asignado
