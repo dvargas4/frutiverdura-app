@@ -29,6 +29,11 @@ COSTO_ENVIO = 35
 UTILIDAD_MINIMA_PCT = 0.25
 MIN_PRODUCTOS_DESCUENTO = 5
 ZONA_HORARIA = "America/Mexico_City"
+DOMICILIO_EMISOR_PREDETERMINADO = {
+    "domicilio": "Ghana núm. 36, colonia Residencial Chimali",
+    "lugar": "Tlalpan, Ciudad de México",
+    "cp": "14370",
+}
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1J3-J_evoyTJcLP94GwixduwD-wFv3zuMjAQX_oBrcPQ/edit"
 
 CONTACTOS = {
@@ -992,8 +997,14 @@ with st.sidebar:
     st.title("🥬 Frutiverdura")
 
     with st.expander("Datos del emisor para Factura / remisión", expanded=False):
-        st.caption("Captura los datos reales del vendedor. Se conservan en esta sesión y en los tickets generados.")
-        emisor_config = st.session_state.get("emisor_remision", {})
+        st.caption("El domicilio está precargado. Completa los demás datos del vendedor; se conservan en esta sesión y en los tickets generados.")
+        emisor_config = dict(st.session_state.get("emisor_remision", {}))
+        for campo, valor in DOMICILIO_EMISOR_PREDETERMINADO.items():
+            if not emisor_config.get(campo):
+                emisor_config[campo] = valor
+            widget_key = f"remision_emisor_{campo}"
+            if not st.session_state.get(widget_key):
+                st.session_state[widget_key] = emisor_config[campo]
         emisor_nuevo = {}
         for campo, etiqueta in [("nombre", "Nombre completo o razón social"), ("rfc", "RFC del emisor"),
                                 ("regimen", "Régimen fiscal"), ("domicilio", "Domicilio del establecimiento"),
