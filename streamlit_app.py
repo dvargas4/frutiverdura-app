@@ -1343,25 +1343,8 @@ ALIASES_PRODUCTOS = {
     "ajonjoli garap": "AJONJOLI GARP",
     "ajonjolí garap": "AJONJOLI GARP",
     "garapiñado": "AJONJOLI GARP",
-}
 
-# Palabras que cuando aparecen indican que el producto viene EN BOLSA o EMPACADO,
-# lo cual lo hace un producto distinto al fresco/granel. La app no asigna alias
-# automático en estos casos: tú decides en la vista previa si crear nuevo o mapear.
-INDICADORES_EMPAQUE = [
-    "en bolsa",
-    "en bolsita",
-    "en bolsitas",
-    "bolsa de",
-    "bolsas de",
-    "bolsita de",
-    "bolsitas de",
-    "empacado",
-    "empacada",
-    "envasado",
-    "envasada",
-
-    # Queso Manchego Rallado Nochebuena
+        # Queso Manchego Rallado Nochebuena
     "queso manchego rallado nochebuena": "Queso Manchego Rallado Nochebuena",
     "queso manchego rallado noche buena": "Queso Manchego Rallado Nochebuena",
     "manchego rallado nochebuena": "Queso Manchego Rallado Nochebuena",
@@ -1542,6 +1525,24 @@ INDICADORES_EMPAQUE = [
     "pepperoni penaranda": "Pepperoni Peñaranda",
     "peperoni penaranda": "Pepperoni Peñaranda",
     "pepperonni penaranda": "Pepperoni Peñaranda",
+}
+
+# Palabras que cuando aparecen indican que el producto viene EN BOLSA o EMPACADO,
+# lo cual lo hace un producto distinto al fresco/granel. La app no asigna alias
+# automático en estos casos: tú decides en la vista previa si crear nuevo o mapear.
+INDICADORES_EMPAQUE = [
+    "en bolsa",
+    "en bolsita",
+    "en bolsitas",
+    "bolsa de",
+    "bolsas de",
+    "bolsita de",
+    "bolsitas de",
+    "empacado",
+    "empacada",
+    "envasado",
+    "envasada",
+
 ]
 
 
