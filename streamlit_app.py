@@ -1360,6 +1360,188 @@ INDICADORES_EMPAQUE = [
     "empacada",
     "envasado",
     "envasada",
+
+    # Queso Manchego Rallado Nochebuena
+    "queso manchego rallado nochebuena": "Queso Manchego Rallado Nochebuena",
+    "queso manchego rallado noche buena": "Queso Manchego Rallado Nochebuena",
+    "manchego rallado nochebuena": "Queso Manchego Rallado Nochebuena",
+    "manchego rallado noche buena": "Queso Manchego Rallado Nochebuena",
+    "queso manchego nochebuena rallado": "Queso Manchego Rallado Nochebuena",
+    "queso manchego noche buena rallado": "Queso Manchego Rallado Nochebuena",
+
+    # Almendra en hojuela
+    "almendra en hojuela": "Almendra En Hojuela",
+    "almendra en hojuelas": "Almendra En Hojuela",
+    "almendras en hojuela": "Almendra En Hojuela",
+    "almendras en hojuelas": "Almendra En Hojuela",
+    "almendra hojuela": "Almendra En Hojuela",
+    "almendra hojuelas": "Almendra En Hojuela",
+    "almendra laminada": "Almendra En Hojuela",
+    "almendras laminadas": "Almendra En Hojuela",
+
+    # Pistaches sin cáscara
+    "pistaches sin cascara": "Pistaches Sin Cascara",
+    "pistaches sin cáscara": "Pistaches Sin Cascara",
+    "pistache sin cascara": "Pistaches Sin Cascara",
+    "pistache sin cáscara": "Pistaches Sin Cascara",
+    "pistachos sin cascara": "Pistaches Sin Cascara",
+    "pistachos sin cáscara": "Pistaches Sin Cascara",
+    "pistaches pelados": "Pistaches Sin Cascara",
+    "pistache pelado": "Pistaches Sin Cascara",
+    "pistaches s/c": "Pistaches Sin Cascara",
+
+    # Calabaza de Castilla
+    "calabaza de castilla": "Calabaza De Castilla",
+    "calabazas de castilla": "Calabaza De Castilla",
+    "calabaza castilla": "Calabaza De Castilla",
+    "calabazas castilla": "Calabaza De Castilla",
+    "calab. de castilla": "Calabaza De Castilla",
+
+    # Uva pasa
+    "uva pasa": "Uva Pasa",
+    "uvas pasas": "Uva Pasa",
+    "uva pasas": "Uva Pasa",
+    "uvas pasa": "Uva Pasa",
+    "pasa": "Uva Pasa",
+    "pasas": "Uva Pasa",
+
+    # Mango niño
+    "mango niño": "Mango Niño",
+    "mangos niño": "Mango Niño",
+    "mangos niños": "Mango Niño",
+    "mango nino": "Mango Niño",
+    "mangos nino": "Mango Niño",
+    "mangos ninos": "Mango Niño",
+
+    # Papa cambray
+    "papa cambray": "Papa Cambray",
+    "papas cambray": "Papa Cambray",
+    "papita cambray": "Papa Cambray",
+    "papitas cambray": "Papa Cambray",
+    "papa de cambray": "Papa Cambray",
+    "papas de cambray": "Papa Cambray",
+
+    # Mango petacón
+    "mango petacon": "Mango Petacon",
+    "mango petacón": "Mango Petacon",
+    "mangos petacon": "Mango Petacon",
+    "mangos petacón": "Mango Petacon",
+    "mangos petacones": "Mango Petacon",
+    "mango petacones": "Mango Petacon",
+    "petacon": "Mango Petacon",
+    "petacón": "Mango Petacon",
+
+    # Azúcar blanca
+    "azucar": "Azucar Blanca",
+    "azúcar": "Azucar Blanca",
+    "azucar blanca": "Azucar Blanca",
+    "azúcar blanca": "Azucar Blanca",
+    "azucar blanco": "Azucar Blanca",
+    "azúcar blanco": "Azucar Blanca",
+
+    # Domo de fresas
+    "domo fresas": "Fresas",
+    "domo fresa": "Fresas",
+    "domo de fresas": "Fresas",
+    "domo de fresa": "Fresas",
+    "domos de fresas": "Fresas",
+    "domos de fresa": "Fresas",
+    "fresas en domo": "Fresas",
+    "fresa en domo": "Fresas",
+
+    # Ajo morado
+    "ajo morado": "Ajo Morado",
+    "ajos morados": "Ajo Morado",
+    "ajos morado": "Ajo Morado",
+    "ajo morados": "Ajo Morado",
+
+    # Queso Manchego Noche Buena
+    "queso manchego noche buena": "Queso Manchego Noche Buena",
+    "queso manchego nochebuena": "Queso Manchego Noche Buena",
+    "manchego noche buena": "Queso Manchego Noche Buena",
+    "manchego nochebuena": "Queso Manchego Noche Buena",
+    "queso tipo manchego noche buena": "Queso Manchego Noche Buena",
+    "queso tipo manchego nochebuena": "Queso Manchego Noche Buena",
+
+    # Queso Parmesano Kraft
+    "queso parmesano kraft": "Queso Parmesano Kraft",
+    "parmesano kraft": "Queso Parmesano Kraft",
+    "queso kraft parmesano": "Queso Parmesano Kraft",
+    "queso parmesan kraft": "Queso Parmesano Kraft",
+    "parmesan kraft": "Queso Parmesano Kraft",
+
+    # Queso Crema Philadelphia
+    "queso crema philadelphia": "Queso Crema Philadelphia",
+    "queso philadelphia": "Queso Crema Philadelphia",
+    "philadelphia": "Queso Crema Philadelphia",
+    "queso crema filadelfia": "Queso Crema Philadelphia",
+    "queso filadelfia": "Queso Crema Philadelphia",
+    "filadelfia": "Queso Crema Philadelphia",
+    "queso crema philadelfia": "Queso Crema Philadelphia",
+    "queso philadelfia": "Queso Crema Philadelphia",
+    "philadelfia": "Queso Crema Philadelphia",
+
+    # Flor de calabaza
+    "flor de calabaza": "Flor De Calabaza",
+    "flores de calabaza": "Flor De Calabaza",
+    "flor calabaza": "Flor De Calabaza",
+    "flores calabaza": "Flor De Calabaza",
+    "flor de calabazas": "Flor De Calabaza",
+
+    # Hierbabuena
+    "hierbabuena": "Hierbabuena",
+    "hierba buena": "Hierbabuena",
+    "yerbabuena": "Hierbabuena",
+    "yerba buena": "Hierbabuena",
+
+    # Hierba de olor
+    "hierba de olor": "Hierba De Olor",
+    "hierbas de olor": "Hierba De Olor",
+    "yerba de olor": "Hierba De Olor",
+    "yerbas de olor": "Hierba De Olor",
+    "hierba olor": "Hierba De Olor",
+    "hierbas olor": "Hierba De Olor",
+
+    # Fresa de granel
+    "fresa granel": "Fresa de Granel",
+    "fresas granel": "Fresa de Granel",
+    "fresa de granel": "Fresa de Granel",
+    "fresas de granel": "Fresa de Granel",
+    "fresa a granel": "Fresa de Granel",
+    "fresas a granel": "Fresa de Granel",
+
+    # Queso Panela Los Volcanes
+    "queso panela los volcanes": "Queso Panela Los Volcanes",
+    "panela los volcanes": "Queso Panela Los Volcanes",
+    "queso panela volcanes": "Queso Panela Los Volcanes",
+    "panela volcanes": "Queso Panela Los Volcanes",
+    "queso tipo panela los volcanes": "Queso Panela Los Volcanes",
+
+    # Mantequilla sin sal La Gloria
+    "mantequilla sin sal la gloria": "Mantequilla Sin Sal La Gloria",
+    "mantequilla la gloria sin sal": "Mantequilla Sin Sal La Gloria",
+    "mantequilla sin sal gloria": "Mantequilla Sin Sal La Gloria",
+    "mantequilla gloria sin sal": "Mantequilla Sin Sal La Gloria",
+    "mantequilla s/s la gloria": "Mantequilla Sin Sal La Gloria",
+    "mantequilla la gloria s/s": "Mantequilla Sin Sal La Gloria",
+
+    # Queso tipo Mozzarella Bonswiss
+    "queso tipo mozzarella bonswiss": "Queso Tipo Mozzarella Bonswiss",
+    "queso mozzarella bonswiss": "Queso Tipo Mozzarella Bonswiss",
+    "mozzarella bonswiss": "Queso Tipo Mozzarella Bonswiss",
+    "queso tipo mozarella bonswiss": "Queso Tipo Mozzarella Bonswiss",
+    "queso mozarella bonswiss": "Queso Tipo Mozzarella Bonswiss",
+    "mozarella bonswiss": "Queso Tipo Mozzarella Bonswiss",
+    "queso mozzarella bon swiss": "Queso Tipo Mozzarella Bonswiss",
+    "mozzarella bon swiss": "Queso Tipo Mozzarella Bonswiss",
+
+    # Pepperoni Peñaranda
+    "pepperoni peñaranda": "Pepperoni Peñaranda",
+    "peperoni peñaranda": "Pepperoni Peñaranda",
+    "pepperonni peñaranda": "Pepperoni Peñaranda",
+    "pepperoni penaranda": "Pepperoni Peñaranda",
+    "peperoni penaranda": "Pepperoni Peñaranda",
+    "pepperonni penaranda": "Pepperoni Peñaranda",
 ]
 
 
