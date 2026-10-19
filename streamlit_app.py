@@ -500,7 +500,7 @@ def generar_ticket_png(pedido):
     return generar_ticket_normal_png(pedido)
 
 
-def generar_ticket_normal_png(pedido):
+def generar_ticket_normal_png(pedido, _para_pdf=False):
     """Genera la imagen del ticket y devuelve los bytes PNG.
     Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
     totales abajo a la derecha.
@@ -646,6 +646,9 @@ def generar_ticket_normal_png(pedido):
     draw.text((col_venta_x - tw, y), venta_h, font=f_header, fill=c_titulo)
     y += interlinea
 
+    inicio_productos = y
+    cortes_pdf = [y]
+
     # ---- Productos (ordenados por venta descendente) ----
     for costo, venta, lineas, alto_fila in filas_producto:
         draw.text((col_costo_x, y), f"${costo:,.2f}", font=f_reg, fill=c_costo)
@@ -656,6 +659,7 @@ def generar_ticket_normal_png(pedido):
         tw = text_width(venta_txt, f_reg)
         draw.text((col_venta_x - tw, y), venta_txt, font=f_reg, fill=c_venta)
         y += alto_fila
+        cortes_pdf.append(y)
 
     y += 4
     draw.line([(margen_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
@@ -726,12 +730,18 @@ def generar_ticket_normal_png(pedido):
     # Centrado en zona cliente (entre col_producto_x y borde derecho), no en ancho total
     draw.text((centro_cliente - tw // 2, y), gracias, font=f_total_bold, fill=c_titulo)
 
+    if _para_pdf:
+        # Solo el PDF elimina el espacio vacío sobrante del pie.
+        fin = min(img.height, y + 40)
+        imagen_pdf = img.crop((0, 0, ancho, fin))
+        return imagen_pdf, cortes_pdf + [fin], inicio_productos, imagen_pdf.crop((0, 0, ancho, inicio_productos))
+
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
-def generar_remision_png(pedido):
+def generar_remision_png(pedido, _para_pdf=False):
     """Genera la imagen del ticket y devuelve los bytes PNG.
     Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
     totales abajo a la derecha.
@@ -944,6 +954,9 @@ def generar_remision_png(pedido):
     draw.text((col_venta_x - tw, y), venta_h, font=f_header, fill=c_titulo)
     y += interlinea
 
+    inicio_productos = y
+    cortes_pdf = [y]
+
     # ---- Productos (ordenados por venta descendente) ----
     for costo, venta, lineas, alto_fila in filas_producto:
         draw.text((col_costo_x, y), f"${costo:,.2f}", font=f_reg, fill=c_costo)
@@ -954,6 +967,7 @@ def generar_remision_png(pedido):
         tw = text_width(venta_txt, f_reg)
         draw.text((col_venta_x - tw, y), venta_txt, font=f_reg, fill=c_venta)
         y += alto_fila
+        cortes_pdf.append(y)
 
     y += 4
     draw.line([(margen_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
@@ -1022,10 +1036,129 @@ def generar_remision_png(pedido):
     y = dibujar_bloques(lineas_pie, y + 8)
     img = img.crop((0, 0, ancho, min(alto, y + 20)))
 
+    if _para_pdf:
+        # Solo el PDF elimina el espacio vacío sobrante del pie.
+        fin = min(img.height, y + 40)
+        imagen_pdf = img.crop((0, 0, ancho, fin))
+        # Repetir TODOS los datos de remisión en un encabezado compacto,
+        # usando también la zona izquierda para dejar espacio a los productos.
+        f_pdf = ImageFont.truetype(FUENTE_REG, 12) if FUENTE_REG else f_reg
+        encabezado_pdf = Image.new("RGB", (ancho, 18 + len(lineas_encabezado) * 14 + 36), "white")
+        d_pdf = ImageDraw.Draw(encabezado_pdf)
+        y_pdf = 10
+        for texto, _, _ in lineas_encabezado:
+            if texto is None:
+                d_pdf.line((20, y_pdf + 7, ancho - 20, y_pdf + 7), fill=c_sec)
+            else:
+                d_pdf.text((20, y_pdf), texto, font=f_pdf, fill=c_titulo)
+            y_pdf += 14
+        encabezado_pdf.paste(img.crop((0, inicio_productos - 26, ancho, inicio_productos)), (0, y_pdf + 8))
+        return imagen_pdf, cortes_pdf + [fin], inicio_productos, encabezado_pdf
+
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
+
+def componer_tickets_pdf(pedidos, _con_traza=False):
+    """Acomoda partes de tickets en dos columnas de carta horizontal.
+
+    Escala fija de 100 dpi: ancho de ticket 11.18 cm y texto de 9.36 pt.
+    Llena cada columna de arriba abajo, luego la derecha y la siguiente hoja.
+    Conserva íntegro el bloque final y todos los importes del pedido original.
+    """
+    ancho_hoja, alto_hoja = 1100, 850
+    margen, separacion, fondo_columna = 40, 40, 795
+    fuente = ImageFont.truetype(FUENTE_REG, 12) if FUENTE_REG else ImageFont.load_default()
+    paginas, registros = [], []
+    columna, y = 0, margen
+
+    def nueva_hoja():
+        pagina = Image.new("RGB", (ancho_hoja, alto_hoja), "white")
+        paginas.append(pagina)
+        return pagina
+
+    pagina = nueva_hoja()
+    for indice_pedido, pedido in enumerate(pedidos):
+        generador = generar_remision_png if pedido.get("tipo") == "factura" else generar_ticket_normal_png
+        imagen, cortes, inicio_productos, encabezado = generador(pedido, _para_pdf=True)
+        # Cada intervalo representa un producto completo; el último es todo el pie.
+        bloques = list(zip(cortes, cortes[1:]))
+        capacidad = fondo_columna - margen - encabezado.height - 26
+        if capacidad <= 0:
+            raise ValueError("Los datos del encabezado son demasiado extensos para el PDF en dos columnas. Acorta esos datos.")
+        # Caso extremo: una descripción/observación más alta que la columna.
+        # Dividir únicamente por espacios blancos entre líneas, nunca letras.
+        gris = imagen.convert("L")
+        ajustados = []
+        for inicio, fin in bloques:
+            while fin - inicio > capacidad:
+                corte = inicio + capacidad
+                while corte > inicio and gris.crop((0, corte - 1, imagen.width, corte)).getextrema()[0] < 250:
+                    corte -= 1
+                if corte <= inicio:
+                    raise ValueError("No se encontró un salto seguro para este ticket.")
+                ajustados.append((inicio, corte))
+                inicio = corte
+            if fin > inicio:
+                ajustados.append((inicio, fin))
+        bloques = ajustados
+        partes = []
+        while bloques:
+            espacio = fondo_columna - y - encabezado.height - 26
+            alto_pendiente = sum(fin - inicio for inicio, fin in bloques)
+            # Si un pedido corto cabe entero en una columna nueva, no partirlo
+            # solo para llenar un hueco pequeño y repetir todo su encabezado.
+            mover_corto = not partes and alto_pendiente <= capacidad and alto_pendiente > espacio
+            if mover_corto or bloques[0][1] - bloques[0][0] > espacio:
+                columna += 1
+                y = margen
+                if columna == 2:
+                    columna = 0
+                    pagina = nueva_hoja()
+                continue
+            elegidos = []
+            while bloques and bloques[0][1] - bloques[0][0] <= espacio:
+                bloque = bloques.pop(0)
+                elegidos.append(bloque)
+                espacio -= bloque[1] - bloque[0]
+            inicio, fin = elegidos[0][0], elegidos[-1][1]
+            x = margen + columna * (imagen.width + separacion)
+            draw = ImageDraw.Draw(pagina)
+            etiqueta_y = y
+            y += 24
+            pagina.paste(encabezado, (x, y))
+            y += encabezado.height
+            pagina.paste(imagen.crop((0, inicio, imagen.width, fin)), (x, y))
+            y += fin - inicio
+            registro = {"pedido": indice_pedido, "hoja": len(paginas), "columna": columna,
+                        "x": x, "etiqueta_y": etiqueta_y, "inicio": inicio, "fin": fin,
+                        "abajo": y, "encabezado": encabezado.height}
+            partes.append(registro)
+            registros.append(registro)
+            # Separación visible al acomodar otro pedido en el espacio restante.
+            draw.line((x + 20, y + 6, x + imagen.width - 20, y + 6), fill=(190, 190, 190))
+            y += 24
+        hojas_del_ticket = sorted({parte["hoja"] for parte in partes})
+        for numero, parte in enumerate(partes, 1):
+            draw = ImageDraw.Draw(paginas[parte["hoja"] - 1])
+            numero_pagina = hojas_del_ticket.index(parte["hoja"]) + 1
+            texto = f"Ticket {indice_pedido + 1} | Página {numero_pagina} de {len(hojas_del_ticket)} | Parte {numero} de {len(partes)}"
+            draw.text((parte["x"] + 20, parte["etiqueta_y"]), texto, font=fuente, fill=(90, 90, 90))
+    if not registros:
+        raise ValueError("Agrega al menos un pedido para descargar el PDF.")
+    for numero, pagina in enumerate(paginas, 1):
+        ImageDraw.Draw(pagina).text((margen + 20, 817), f"Hoja de impresión {numero} de {len(paginas)}", font=fuente, fill=(90, 90, 90))
+    return (paginas, registros) if _con_traza else paginas
+
+
+def generar_tickets_pdf(pedidos):
+    """Descarga conjunta o individual con el mismo acomodo automático."""
+    paginas = componer_tickets_pdf(pedidos)
+    buf = io.BytesIO()
+    paginas[0].save(buf, format="PDF", save_all=True, append_images=paginas[1:],
+                    resolution=100.0, quality=95, subsampling=0)
+    return buf.getvalue()
 
 # ============================
 # Sidebar: catálogo y status
@@ -3055,7 +3188,7 @@ with tab_resumen:
 
         st.divider()
 
-        col_zip, col_csv = st.columns(2)
+        col_zip, col_pdf, col_csv = st.columns(3)
         with col_zip:
             st.download_button(
                 "📦 Descargar ZIP con tickets",
@@ -3064,6 +3197,17 @@ with tab_resumen:
                 mime="application/zip",
                 use_container_width=True,
             )
+        with col_pdf:
+            st.download_button(
+                "📄 Descargar tickets en PDF",
+                data=generar_tickets_pdf(pedidos),
+                file_name="tickets_para_imprimir.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="descargar_tickets_pdf",
+            )
+        st.caption("PDF en carta horizontal: dos columnas y espacios compartidos para ahorrar papel. "
+                   "Lee de arriba abajo en la columna izquierda y después en la derecha. Al imprimir, usa tamaño real (100%) y una página por hoja.")
         with col_csv:
             st.download_button(
                 "📄 Descargar CSV de pedidos",
@@ -3106,6 +3250,14 @@ with tab_resumen:
             with cols_gal[i % 3]:
                 png = generar_ticket_png(p)
                 st.image(png, caption=f"{p['cliente']} - ${p['nuevo_total']:,.2f}", use_container_width=True)
+                st.download_button(
+                    "📄 Descargar este ticket en PDF",
+                    data=generar_tickets_pdf([p]),
+                    file_name=f"ticket_{i+1}.pdf",
+                    mime="application/pdf",
+                    key=f"pdf_ticket_galeria_{i}",
+                    use_container_width=True,
+                )
 
 
 # ============================
