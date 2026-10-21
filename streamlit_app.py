@@ -32,7 +32,6 @@ ZONA_HORARIA = "America/Mexico_City"
 DOMICILIO_EMISOR_PREDETERMINADO = {
     "nombre": "LAURA GONZALEZ ARGUELLO",
     "rfc": "GOAL7212217T2",
-    "regimen": "RESICO",
     "domicilio": "Ghana núm. 36, colonia Residencial Chimali",
     "lugar": "Tlalpan, Ciudad de México",
     "cp": "14370",
