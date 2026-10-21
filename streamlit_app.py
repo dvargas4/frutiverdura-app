@@ -1123,14 +1123,15 @@ def encabezado_continuacion_pdf(pedido, encabezado_original):
 def componer_tickets_pdf(pedidos, _con_traza=False):
     """Carta horizontal, dos columnas, escala fija de 100 dpi y margen >= 1 cm.
 
-    Cada recuadro es una parte del ticket. No se reordenan pedidos ni productos.
+    Cada recuadro es una parte del ticket y tiene el mismo tamaño de corte.
+    No se reordenan pedidos ni productos.
     Datos completos solo al inicio; encabezados breves en las continuaciones.
     """
     from collections import deque
     ancho_hoja, alto_hoja = 1100, 850
     margen_superior, fondo_columna = 40, 774
     margen_x, separacion, ancho_ticket = 90, 40, 440
-    alto_etiqueta, hueco_tickets = 24, 18
+    alto_etiqueta = 24
     fuente = ImageFont.truetype(FUENTE_REG, 12) if FUENTE_REG else ImageFont.load_default()
     paginas, registros = [], []
     columna, y = 0, margen_superior
@@ -1153,9 +1154,9 @@ def componer_tickets_pdf(pedidos, _con_traza=False):
             encabezado = encabezado_breve if partes else encabezado_inicial
             capacidad = fondo_columna - margen_superior - alto_etiqueta - encabezado.height
             espacio = fondo_columna - y - alto_etiqueta - encabezado.height
-            alto_pendiente = sum(b["imagen"].height for b in bloques)
-            mover_corto = not partes and alto_pendiente <= capacidad and alto_pendiente > espacio
-            if y > margen_superior and (mover_corto or bloques[0]["imagen"].height > espacio):
+            # Un recuadro por columna, incluso si el pedido es corto.
+            # El espacio sobrante permanece en blanco para recortar parejo.
+            if y > margen_superior:
                 columna += 1
                 y = margen_superior
                 if columna == 2:
@@ -1192,17 +1193,18 @@ def componer_tickets_pdf(pedidos, _con_traza=False):
                 y += bloque["imagen"].height
             registro = {"pedido": indice_pedido, "hoja": len(paginas), "columna": columna,
                         "x": x, "etiqueta_y": etiqueta_y, "abajo": y,
+                        "marco_abajo": fondo_columna + 6,
                         "encabezado": encabezado.height, "contenido_y": contenido_y,
                         "bloques": [(b["indice"], b["imagen"].height) for b in elegidos]}
             partes.append(registro)
             registros.append(registro)
-            y += hueco_tickets
+            y = fondo_columna + 1
         for numero, parte in enumerate(partes, 1):
             draw = ImageDraw.Draw(paginas[parte["hoja"] - 1])
             parte["pagina_ticket"] = numero
             parte["paginas_ticket"] = len(partes)
             draw.rectangle((parte["x"] + 4, parte["etiqueta_y"],
-                            parte["x"] + ancho_ticket - 4, parte["abajo"] + 6),
+                            parte["x"] + ancho_ticket - 4, parte["marco_abajo"]),
                            outline=(190, 190, 190), width=1)
             draw.text((parte["x"] + 130, parte["etiqueta_y"] + 5),
                       f"Parte {numero} de {len(partes)}", font=fuente, fill=(90, 90, 90))
@@ -3264,8 +3266,8 @@ with tab_resumen:
                 use_container_width=True,
                 key="descargar_tickets_pdf",
             )
-        st.caption("PDF en carta horizontal: dos columnas y espacios compartidos para ahorrar papel. Cada recuadro indica Parte 1 de 2, Parte 2 de 2, etc. Datos completos al inicio y encabezado breve en continuaciones; márgenes de al menos 1 cm. "
-                   "Lee de arriba abajo en la columna izquierda y después en la derecha. Al imprimir, usa tamaño real (100%) y una página por hoja.")
+        st.caption("PDF en carta horizontal: dos recuadros del mismo tamaño por hoja, listos para recortar y engrapar. Cada recuadro indica Parte 1 de 2, Parte 2 de 2, etc. Datos completos al inicio y encabezado breve en continuaciones; márgenes de al menos 1 cm. "
+                   "Lee primero el recuadro izquierdo y después el derecho. Al imprimir, usa tamaño real (100%) y una página por hoja.")
         with col_csv:
             st.download_button(
                 "📄 Descargar CSV de pedidos",
