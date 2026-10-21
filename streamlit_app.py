@@ -4216,9 +4216,52 @@ def unidad_default_producto(nombre):
 CATEGORIAS_CATALOGO = [
     "FRUTAS", "VERDURAS", "CHILES", "HIERBAS Y AROMÁTICOS",
     "LÁCTEOS Y HUEVO", "CARNES Y EMBUTIDOS", "PESCADOS Y MARISCOS",
-    "LEGUMBRES Y SEMILLAS", "ABARROTES", "BOTANAS", "BEBIDAS",
+    "GRANOS, LEGUMBRES Y SEMILLAS", "ABARROTES Y REPOSTERÍA", "ADEREZOS Y CONSERVAS", "ESPECIAS Y CONDIMENTOS",
+    "PAN Y TORTILLAS", "BOTANAS", "DULCES TRADICIONALES", "BEBIDAS",
+    "MASCOTAS", "SERVICIOS",
 ]
 
+
+# Rubros confirmados por el usuario; prevalecen sobre reglas por ingredientes.
+CATEGORIAS_CONFIRMADAS = {
+    "aderezo cesar": "ADEREZOS Y CONSERVAS",
+    "pepinillos": "ADEREZOS Y CONSERVAS",
+    "alcachofa": "VERDURAS",
+    "germen de alfalfa": "VERDURAS",
+    "germen de soya": "VERDURAS",
+    "plato verduras": "VERDURAS",
+    "cebollin": "HIERBAS Y AROMÁTICOS",
+    "hinojo": "HIERBAS Y AROMÁTICOS",
+    "lima": "FRUTAS",
+    "lychee": "FRUTAS",
+    "canela importada": "ESPECIAS Y CONDIMENTOS",
+    "canela natural polvo": "ESPECIAS Y CONDIMENTOS",
+    "canela sintetica polvo": "ESPECIAS Y CONDIMENTOS",
+    "paprika": "ESPECIAS Y CONDIMENTOS",
+    "pimienta blanca molido": "ESPECIAS Y CONDIMENTOS",
+    "pimienta negra": "ESPECIAS Y CONDIMENTOS",
+    "bicarbonato de sodio": "ABARROTES Y REPOSTERÍA",
+    "cocoa": "ABARROTES Y REPOSTERÍA",
+    "grenetina": "ABARROTES Y REPOSTERÍA",
+    "maizena": "ABARROTES Y REPOSTERÍA",
+    "panko": "ABARROTES Y REPOSTERÍA",
+    "piloncillo": "ABARROTES Y REPOSTERÍA",
+    "alpiste": "GRANOS, LEGUMBRES Y SEMILLAS",
+    "quinoa": "GRANOS, LEGUMBRES Y SEMILLAS",
+    "alegrias": "DULCES TRADICIONALES",
+    "tortillinas": "PAN Y TORTILLAS",
+    "nupec adulto": "MASCOTAS",
+    "envio a domicilio": "SERVICIOS",
+    "japones enchilado": "BOTANAS",
+    "fruta mixta": "BOTANAS",
+    "canela natural en polvo": "ESPECIAS Y CONDIMENTOS",
+    "canela sintetica en polvo": "ESPECIAS Y CONDIMENTOS",
+    "pimienta blanca molida": "ESPECIAS Y CONDIMENTOS",
+    "pimienta blanca molida en polvo": "ESPECIAS Y CONDIMENTOS",
+    "cacahuate japones enchilado": "BOTANAS",
+    "fruta deshidratada": "BOTANAS",
+    "plato de verduras": "VERDURAS"
+}
 
 def normalizar_categoria_nombre(nombre):
     import unicodedata
@@ -4231,6 +4274,9 @@ def categorizar_producto(nombre):
     Devuelve (categoria, orden_categoria) donde orden_categoria sirve para mostrar primero
     las categorías más importantes."""
     n = normalizar_categoria_nombre(nombre)
+    if n in CATEGORIAS_CONFIRMADAS:
+        cat = CATEGORIAS_CONFIRMADAS[n]
+        return cat, CATEGORIAS_CATALOGO.index(cat) + 1
     # Reutilizar equivalencias ya confirmadas del catálogo, solo coincidencia exacta.
     alias = {normalizar_categoria_nombre(k): normalizar_categoria_nombre(v)
              for k, v in ALIASES_PRODUCTOS.items()}
@@ -4248,7 +4294,7 @@ def categorizar_producto(nombre):
     if contiene(["papas fritas", "miel", "pan", "azucar", "tortilla", "tortillas", "crema de cacahuate", "crema de almendra", "crema de coco", "granola", "avena", "cereal", "cereales", "maiz palomero",
                  "palomitas", "mermelada", "conserva", "conservas", "salsa", "salsas", "aceite",
                  "vinagre", "harina", "galleta", "galletas", "pasta", "arroz", "chocolate", "cafe"]):
-        return categoria("ABARROTES")
+        return categoria("ABARROTES Y REPOSTERÍA")
     if contiene(["leche de almendra", "leche de coco", "leche de avena", "bebida vegetal"]):
         return categoria("BEBIDAS")
     if contiene(["queso", "quesos", "leche", "yogur", "yogurt", "yoghurt", "crema", "huevo", "huevos"]):
@@ -4321,7 +4367,7 @@ def categorizar_producto(nombre):
         "pistache", "pistaches", "semilla", "semillas", "pepita", "pepitas",
         "ajonjolí", "ajonjoli", "chía", "chia", "linaza", "amaranto"
     ]):
-        return ("LEGUMBRES Y SEMILLAS", 6)
+        return ("GRANOS, LEGUMBRES Y SEMILLAS", 6)
 
     # 6. Abarrotes (productos específicos, no por substring)
     if any(re.search(rf"\b{k}\b", n) for k in [
@@ -4329,7 +4375,7 @@ def categorizar_producto(nombre):
         "aceite", "vinagre", "azúcar", "azucar", "café", "cafe",
         "chocolate", "harina", "arroz", "pasta"
     ]):
-        return ("ABARROTES", 7)
+        return ("ABARROTES Y REPOSTERÍA", 7)
 
     # 7. Verduras (cualquier vegetal restante)
     verduras = ["jitomate", "jitomates", "tomate", "tomates", "tomatillo", "tomatillos",
