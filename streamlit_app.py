@@ -1060,97 +1060,146 @@ def generar_remision_png(pedido, _para_pdf=False):
     return buf.getvalue()
 
 
-def componer_tickets_pdf(pedidos, _con_traza=False):
-    """Acomoda partes de tickets en dos columnas de carta horizontal.
+def preparar_bloques_ticket_pdf(pedido):
+    """Recorta solo espacios blancos; conserva textos, colores y orden del PNG."""
+    from PIL import ImageChops
+    generador = generar_remision_png if pedido.get("tipo") == "factura" else generar_ticket_normal_png
+    imagen, cortes, inicio_productos, _ = generador(pedido, _para_pdf=True)
+    encabezado = imagen.crop((0, 0, imagen.width, inicio_productos))
+    bloques = []
+    for indice, (inicio, fin) in enumerate(zip(cortes, cortes[1:])):
+        recorte = imagen.crop((0, inicio, imagen.width, fin))
+        caja = ImageChops.difference(recorte, Image.new("RGB", recorte.size, "white")).getbbox()
+        # En el pie se conservan todos los espacios internos de totales y firmas.
+        es_pie = indice == len(cortes) - 2
+        altura = min(recorte.height, (caja[3] + (10 if es_pie else 5)) if caja else 10)
+        recorte = recorte.crop((0, 0, recorte.width, altura))
+        bloques.append({"imagen": recorte, "indice": indice, "es_pie": es_pie})
+    return encabezado, bloques
 
-    Escala fija de 100 dpi: ancho de ticket 11.18 cm y texto de 9.36 pt.
-    Llena cada columna de arriba abajo, luego la derecha y la siguiente hoja.
-    Conserva íntegro el bloque final y todos los importes del pedido original.
+
+def encabezado_continuacion_pdf(pedido, encabezado_original):
+    """Identificación breve; los datos completos ya están en el primer recuadro."""
+    fuente = ImageFont.truetype(FUENTE_REG, 13) if FUENTE_REG else ImageFont.load_default()
+    medidor = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    lineas = []
+    textos = ["PEDIDO: " + str(pedido["cliente"]).upper()]
+    if pedido.get("folio_remision"):
+        textos.append("Folio: " + str(pedido["folio_remision"]))
+    for texto in textos:
+        linea = ""
+        for caracter in texto:
+            if linea and medidor.textlength(linea + caracter, font=fuente) > 290:
+                lineas.append(linea)
+                linea = ""
+            linea += caracter
+        if linea:
+            lineas.append(linea)
+    alto = 8 + len(lineas) * 18 + 34
+    imagen = Image.new("RGB", (440, alto), "white")
+    draw = ImageDraw.Draw(imagen)
+    for i, linea in enumerate(lineas):
+        draw.text((130, 4 + i * 18), linea, font=fuente, fill="black")
+    y = 8 + len(lineas) * 18
+    draw.line((20, y, 420, y), fill=(120, 120, 120))
+    imagen.paste(encabezado_original.crop((0, encabezado_original.height - 26, 440, encabezado_original.height)), (0, y + 8))
+    return imagen
+
+
+def componer_tickets_pdf(pedidos, _con_traza=False):
+    """Carta horizontal, dos columnas, escala fija de 100 dpi y margen >= 1 cm.
+
+    Cada recuadro es una parte del ticket. No se reordenan pedidos ni productos.
+    Datos completos solo al inicio; encabezados breves en las continuaciones.
     """
+    from collections import deque
     ancho_hoja, alto_hoja = 1100, 850
-    margen, separacion, fondo_columna = 40, 40, 795
+    margen_superior, fondo_columna = 40, 774
+    margen_x, separacion, ancho_ticket = 90, 40, 440
+    alto_etiqueta, hueco_tickets = 24, 18
     fuente = ImageFont.truetype(FUENTE_REG, 12) if FUENTE_REG else ImageFont.load_default()
     paginas, registros = [], []
-    columna, y = 0, margen
+    columna, y = 0, margen_superior
 
     def nueva_hoja():
-        pagina = Image.new("RGB", (ancho_hoja, alto_hoja), "white")
-        paginas.append(pagina)
-        return pagina
+        imagen = Image.new("RGB", (ancho_hoja, alto_hoja), "white")
+        paginas.append(imagen)
+        return imagen
 
     pagina = nueva_hoja()
     for indice_pedido, pedido in enumerate(pedidos):
-        generador = generar_remision_png if pedido.get("tipo") == "factura" else generar_ticket_normal_png
-        imagen, cortes, inicio_productos, encabezado = generador(pedido, _para_pdf=True)
-        # Cada intervalo representa un producto completo; el último es todo el pie.
-        bloques = list(zip(cortes, cortes[1:]))
-        capacidad = fondo_columna - margen - encabezado.height - 26
-        if capacidad <= 0:
-            raise ValueError("Los datos del encabezado son demasiado extensos para el PDF en dos columnas. Acorta esos datos.")
-        # Caso extremo: una descripción/observación más alta que la columna.
-        # Dividir únicamente por espacios blancos entre líneas, nunca letras.
-        gris = imagen.convert("L")
-        ajustados = []
-        for inicio, fin in bloques:
-            while fin - inicio > capacidad:
-                corte = inicio + capacidad
-                while corte > inicio and gris.crop((0, corte - 1, imagen.width, corte)).getextrema()[0] < 250:
-                    corte -= 1
-                if corte <= inicio:
-                    raise ValueError("No se encontró un salto seguro para este ticket.")
-                ajustados.append((inicio, corte))
-                inicio = corte
-            if fin > inicio:
-                ajustados.append((inicio, fin))
-        bloques = ajustados
-        partes = []
+        encabezado_inicial, originales = preparar_bloques_ticket_pdf(pedido)
+        encabezado_breve = encabezado_continuacion_pdf(pedido, encabezado_inicial)
+        capacidad_breve = fondo_columna - margen_superior - alto_etiqueta - encabezado_breve.height
+        capacidad_inicial = fondo_columna - margen_superior - alto_etiqueta - encabezado_inicial.height
+        if min(capacidad_inicial, capacidad_breve) <= 0:
+            raise ValueError("Los datos del encabezado son demasiado extensos para el PDF. Acorta esos datos.")
+        bloques, partes = deque(originales), []
         while bloques:
-            espacio = fondo_columna - y - encabezado.height - 26
-            alto_pendiente = sum(fin - inicio for inicio, fin in bloques)
-            # Si un pedido corto cabe entero en una columna nueva, no partirlo
-            # solo para llenar un hueco pequeño y repetir todo su encabezado.
+            encabezado = encabezado_breve if partes else encabezado_inicial
+            capacidad = fondo_columna - margen_superior - alto_etiqueta - encabezado.height
+            espacio = fondo_columna - y - alto_etiqueta - encabezado.height
+            alto_pendiente = sum(b["imagen"].height for b in bloques)
             mover_corto = not partes and alto_pendiente <= capacidad and alto_pendiente > espacio
-            if mover_corto or bloques[0][1] - bloques[0][0] > espacio:
+            if y > margen_superior and (mover_corto or bloques[0]["imagen"].height > espacio):
                 columna += 1
-                y = margen
+                y = margen_superior
                 if columna == 2:
                     columna = 0
                     pagina = nueva_hoja()
                 continue
             elegidos = []
-            while bloques and bloques[0][1] - bloques[0][0] <= espacio:
-                bloque = bloques.pop(0)
+            while bloques and bloques[0]["imagen"].height <= espacio:
+                bloque = bloques.popleft()
                 elegidos.append(bloque)
-                espacio -= bloque[1] - bloque[0]
-            inicio, fin = elegidos[0][0], elegidos[-1][1]
-            x = margen + columna * (imagen.width + separacion)
-            draw = ImageDraw.Draw(pagina)
+                espacio -= bloque["imagen"].height
+            if not elegidos:
+                # Excepción: una sola descripción o pie mayor que la columna.
+                # Cortar solo en un renglón blanco, sin perder contenido.
+                bloque = bloques.popleft()
+                imagen = bloque["imagen"]
+                gris = imagen.convert("L")
+                corte = min(espacio, imagen.height)
+                while corte > 0 and gris.crop((0, corte - 1, imagen.width, corte)).getextrema()[0] < 250:
+                    corte -= 1
+                if corte <= 0:
+                    raise ValueError("No se encontró un salto seguro para este ticket.")
+                elegidos.append(dict(bloque, imagen=imagen.crop((0, 0, 440, corte))))
+                if corte < imagen.height:
+                    bloques.appendleft(dict(bloque, imagen=imagen.crop((0, corte, 440, imagen.height))))
+            # Evitar que solo los totales queden en otra parte si el último
+            # producto y el pie pueden acompañarse en una columna nueva.
+            if len(bloques) == 1 and bloques[0]["es_pie"] and len(elegidos) > 1:
+                if elegidos[-1]["imagen"].height + bloques[0]["imagen"].height <= capacidad_breve:
+                    bloques.appendleft(elegidos.pop())
+            x = margen_x + columna * (ancho_ticket + separacion)
             etiqueta_y = y
-            y += 24
+            y += alto_etiqueta
             pagina.paste(encabezado, (x, y))
             y += encabezado.height
-            pagina.paste(imagen.crop((0, inicio, imagen.width, fin)), (x, y))
-            y += fin - inicio
+            contenido_y = y
+            for bloque in elegidos:
+                pagina.paste(bloque["imagen"], (x, y))
+                y += bloque["imagen"].height
             registro = {"pedido": indice_pedido, "hoja": len(paginas), "columna": columna,
-                        "x": x, "etiqueta_y": etiqueta_y, "inicio": inicio, "fin": fin,
-                        "abajo": y, "encabezado": encabezado.height}
+                        "x": x, "etiqueta_y": etiqueta_y, "abajo": y,
+                        "encabezado": encabezado.height, "contenido_y": contenido_y,
+                        "bloques": [(b["indice"], b["imagen"].height) for b in elegidos]}
             partes.append(registro)
             registros.append(registro)
-            # Separación visible al acomodar otro pedido en el espacio restante.
-            draw.line((x + 20, y + 6, x + imagen.width - 20, y + 6), fill=(190, 190, 190))
-            y += 24
-        hojas_del_ticket = sorted({parte["hoja"] for parte in partes})
+            y += hueco_tickets
         for numero, parte in enumerate(partes, 1):
             draw = ImageDraw.Draw(paginas[parte["hoja"] - 1])
-            numero_pagina = hojas_del_ticket.index(parte["hoja"]) + 1
-            texto = f"Ticket {indice_pedido + 1} | Página {numero_pagina} de {len(hojas_del_ticket)} | Parte {numero} de {len(partes)}"
-            draw.text((parte["x"] + 20, parte["etiqueta_y"]), texto, font=fuente, fill=(90, 90, 90))
+            parte["pagina_ticket"] = numero
+            parte["paginas_ticket"] = len(partes)
+            draw.rectangle((parte["x"] + 4, parte["etiqueta_y"],
+                            parte["x"] + ancho_ticket - 4, parte["abajo"] + 6),
+                           outline=(190, 190, 190), width=1)
+            draw.text((parte["x"] + 130, parte["etiqueta_y"] + 5),
+                      f"Parte {numero} de {len(partes)}", font=fuente, fill=(90, 90, 90))
     if not registros:
         raise ValueError("Agrega al menos un pedido para descargar el PDF.")
-    for numero, pagina in enumerate(paginas, 1):
-        ImageDraw.Draw(pagina).text((margen + 20, 817), f"Hoja de impresión {numero} de {len(paginas)}", font=fuente, fill=(90, 90, 90))
     return (paginas, registros) if _con_traza else paginas
-
 
 def generar_tickets_pdf(pedidos):
     """Descarga conjunta o individual con el mismo acomodo automático."""
@@ -3206,7 +3255,7 @@ with tab_resumen:
                 use_container_width=True,
                 key="descargar_tickets_pdf",
             )
-        st.caption("PDF en carta horizontal: dos columnas y espacios compartidos para ahorrar papel. "
+        st.caption("PDF en carta horizontal: dos columnas y espacios compartidos para ahorrar papel. Cada recuadro indica Parte 1 de 2, Parte 2 de 2, etc. Datos completos al inicio y encabezado breve en continuaciones; márgenes de al menos 1 cm. "
                    "Lee de arriba abajo en la columna izquierda y después en la derecha. Al imprimir, usa tamaño real (100%) y una página por hoja.")
         with col_csv:
             st.download_button(
