@@ -574,6 +574,7 @@ def generar_ticket_normal_png(pedido, _para_pdf=False):
     alto += sum(fila[3] for fila in filas_producto)  # nombres largos
     alto += 18  # línea separadora
     alto += 70  # bloque compacto COSTO + DIF (5 líneas pequeñas)
+    alto += interlinea  # Número de productos en zona cliente
     alto += interlinea  # Subtotal venta
     if totales["costo_envio"] > 0:
         alto += interlinea
@@ -695,7 +696,13 @@ def generar_ticket_normal_png(pedido, _para_pdf=False):
         c_sec,
     )
 
-    # Zona del CLIENTE (derecha de la línea de corte): Subtotal / Envío / Descuento / TOTAL
+    # Zona del CLIENTE (derecha de la línea de corte): Productos / Subtotal / Envío / Descuento / TOTAL
+    # Se cuentan renglones del pedido completo, incluidos productos repetidos.
+    productos_txt = f"Productos: {len(productos)}"
+    tw = text_width(productos_txt, f_reg)
+    draw.text((col_venta_x - tw, y), productos_txt, font=f_reg, fill=c_titulo)
+    y += interlinea
+
     sub_txt = f"Subtotal Venta : ${totales['subtotal_venta']:,.2f}"
     tw = text_width(sub_txt, f_total_bold)
     draw.text((col_venta_x - tw, y), sub_txt, font=f_total_bold, fill=c_venta)
@@ -890,6 +897,7 @@ def generar_remision_png(pedido, _para_pdf=False):
     alto += sum(fila[3] for fila in filas_producto)  # filas con altura variable
     alto += 18  # línea separadora
     alto += 70  # bloque compacto COSTO + DIF (5 líneas pequeñas)
+    alto += interlinea  # Número de productos en zona cliente
     alto += interlinea  # Subtotal venta
     if totales["costo_envio"] > 0:
         alto += interlinea
@@ -1003,7 +1011,13 @@ def generar_remision_png(pedido, _para_pdf=False):
         c_sec,
     )
 
-    # Zona del CLIENTE (derecha de la línea de corte): Subtotal / Envío / Descuento / TOTAL
+    # Zona del CLIENTE (derecha de la línea de corte): Productos / Subtotal / Envío / Descuento / TOTAL
+    # Se cuentan renglones del pedido completo, incluidos productos repetidos.
+    productos_txt = f"Productos: {len(productos)}"
+    tw = text_width(productos_txt, f_reg)
+    draw.text((col_venta_x - tw, y), productos_txt, font=f_reg, fill=c_titulo)
+    y += interlinea
+
     sub_txt = f"Subtotal Venta : ${totales['subtotal_venta']:,.2f}"
     tw = text_width(sub_txt, f_total_bold)
     draw.text((col_venta_x - tw, y), sub_txt, font=f_total_bold, fill=c_venta)
@@ -1167,11 +1181,6 @@ def componer_tickets_pdf(pedidos, _con_traza=False):
                 elegidos.append(dict(bloque, imagen=imagen.crop((0, 0, 440, corte))))
                 if corte < imagen.height:
                     bloques.appendleft(dict(bloque, imagen=imagen.crop((0, corte, 440, imagen.height))))
-            # Evitar que solo los totales queden en otra parte si el último
-            # producto y el pie pueden acompañarse en una columna nueva.
-            if len(bloques) == 1 and bloques[0]["es_pie"] and len(elegidos) > 1:
-                if elegidos[-1]["imagen"].height + bloques[0]["imagen"].height <= capacidad_breve:
-                    bloques.appendleft(elegidos.pop())
             x = margen_x + columna * (ancho_ticket + separacion)
             etiqueta_y = y
             y += alto_etiqueta
