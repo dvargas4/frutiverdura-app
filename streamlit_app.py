@@ -32,6 +32,7 @@ ZONA_HORARIA = "America/Mexico_City"
 DOMICILIO_EMISOR_PREDETERMINADO = {
     "nombre": "LAURA GONZALEZ ARGUELLO",
     "rfc": "GOAL7212217T2",
+    "regimen": "RESICO",
     "domicilio": "Ghana núm. 36, colonia Residencial Chimali",
     "lugar": "Tlalpan, Ciudad de México",
     "cp": "14370",
@@ -371,14 +372,21 @@ def calcular_linea_catalogo(nombre, gramos, precios, costos):
 
 def lineas_desde_preview(productos, precios, costos):
     return [calcular_linea_catalogo(p["match"], p["gramos"], precios, costos)
-            for p in productos if p["match"] in precios
+            for p in productos if not p.get("omitido", False) and p["match"] in precios
             and p["match"] in costos and p["gramos"] > 0]
+
+
+def producto_pendiente_preview(prod, precios, costos):
+    return not prod.get("omitido", False) and (
+        prod.get("match") not in precios or prod.get("match") not in costos
+        or prod.get("gramos", 0) <= 0)
 
 
 def seleccionar_producto_preview(prod, opciones, clave):
     # Valores iniciales estables: una edición no cambia el valor por defecto.
     if clave not in st.session_state:
-        st.session_state[clave] = prod["match"] if prod["match"] in opciones else "(omitir)"
+        st.session_state[clave] = ("(omitir)" if prod.get("omitido") else
+            prod["match"] if prod["match"] in opciones else "Producto no encontrado")
     return st.selectbox("Mapear a", opciones, key=clave, label_visibility="collapsed")
 
 
@@ -1336,7 +1344,7 @@ def parsear_bloque_pedido(texto):
         return None, []
 
     # Regex para detectar viñetas, incluyendo checkboxes tipo Markdown [x] [ ] [X]
-    patron_viñeta = r"^(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX\s]?\s*\]\s*)?"
+    patron_viñeta = r"^(?:(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX]?\s*\]\s*)?|\[\s*[xX]?\s*\]\s*)"
 
     cliente = None
     productos_raw = []
@@ -1345,10 +1353,6 @@ def parsear_bloque_pedido(texto):
         if not es_viñeta and cliente is None:
             cliente = linea
             continue
-        if not es_viñeta:
-            # Línea sin viñeta después del cliente: la ignoramos
-            continue
-
         # Quitar la viñeta y el checkbox
         contenido = re.sub(patron_viñeta, "", linea).strip()
         if not contenido:
@@ -1375,8 +1379,9 @@ def parsear_bloque_pedido(texto):
                         gramos = posibles_gramos
                         contenido = contenido[: m.start()].strip()
 
-        if gramos is None or gramos <= 0:
-            continue
+        # Conservar la línea para que se corrija el peso en la vista previa.
+        if gramos is None:
+            gramos = 0
 
         # Limpiar descripción: quitar precios ($X), emojis, normalizar espacios
         desc = re.sub(r"\$\s*[\d.,]+", "", contenido)
@@ -1385,8 +1390,7 @@ def parsear_bloque_pedido(texto):
         # Quitar puntos sueltos al final
         desc = re.sub(r"[\.\,]+$", "", desc).strip()
 
-        if desc:
-            productos_raw.append((desc, gramos))
+        productos_raw.append((desc or contenido or linea, gramos))
 
     return cliente, productos_raw
 
@@ -2068,7 +2072,7 @@ Laura Canales
 
             # Detectar formato: ¿empieza con viñeta? -> es un solo cliente y el nombre está arriba
             primera_linea = texto.split("\n", 1)[0].strip()
-            es_pedido_unico = bool(re.match(r"^(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX\s]?\s*\]\s*)?", primera_linea))
+            es_pedido_unico = bool(nombre_rapido.strip()) or bool(re.match(r"^(?:(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX]?\s*\]\s*)?|\[\s*[xX]?\s*\]\s*)", primera_linea))
 
             if es_pedido_unico:
                 # Modo simple: un solo cliente, nombre del campo de arriba
@@ -2121,17 +2125,18 @@ Laura Canales
                 # Si TODO matcheó perfecto, mostrar mensaje verde
                 total_prods = sum(len(p["productos"]) for p in preview)
                 no_match = sum(
-                    1 for p in preview for prod in p["productos"] if not prod["match"]
+                    1 for p in preview for prod in p["productos"]
+                    if producto_pendiente_preview(prod, st.session_state.precios_dict, st.session_state.costos_dict)
                 )
                 if no_match == 0:
                     st.success(
-                        f"✅ {total_prods} productos detectados, todos con match. "
+                        f"✅ {total_prods} productos detectados, todos con producto y peso. "
                         "Revisa abajo y dale 'Generar' si todo está bien."
                     )
                 else:
                     st.warning(
-                        f"⚠️ {total_prods - no_match}/{total_prods} productos con match. "
-                        f"Faltan {no_match} por asignar (corrige abajo)."
+                        f"⚠️ {total_prods - no_match}/{total_prods} productos completos. "
+                        f"Faltan {no_match} por revisar (corrige abajo)."
                     )
 
     # Mostrar y editar preview
@@ -2140,18 +2145,18 @@ Laura Canales
         st.markdown("### Vista previa - corrige los matches incorrectos")
         st.caption(
             "Si algún producto quedó mal asignado, cámbialo del dropdown. "
-            "Los productos sin match (rojo) se omitirán al generar el ticket."
+            "Producto no encontrado: asígnalo, créalo o elige (omitir). Si falta el peso, captúralo en gramos."
         )
 
         catalogo_keys = sorted(st.session_state.precios_dict.keys())
 
         for i, ped in enumerate(st.session_state["preview_pedidos"]):
-            no_match = sum(1 for p in ped["productos"] if not p["match"])
-            con_match = len(ped["productos"]) - no_match
+            no_match = sum(producto_pendiente_preview(p, st.session_state.precios_dict, st.session_state.costos_dict) for p in ped["productos"])
+            con_match = sum(not p.get("omitido") for p in ped["productos"]) - no_match
 
             label = f"**{ped['cliente']}** — {con_match} productos OK"
             if no_match > 0:
-                label += f", ⚠️ {no_match} sin match"
+                label += f", ⚠️ {no_match} por revisar"
             if ped["lleva_envio"]:
                 label += " 🚚 envío"
 
@@ -2171,14 +2176,10 @@ Laura Canales
                             etiqueta = "📦 " + etiqueta
                         st.text(etiqueta)
                     with col2:
-                        opciones = ["(omitir)", "➕ Crear nuevo producto"] + catalogo_keys
-                        idx_default = (
-                            opciones.index(prod["match"])
-                            if prod["match"] in opciones
-                            else 0
-                        )
+                        opciones = ["Producto no encontrado", "(omitir)", "➕ Crear nuevo producto"] + catalogo_keys
                         nuevo_match = seleccionar_producto_preview(prod, opciones, f"pegar_{rk}_{revision_preview}_prev_match_{i}_{j}")
-                        if nuevo_match == "(omitir)":
+                        prod["omitido"] = nuevo_match == "(omitir)"
+                        if nuevo_match in ("(omitir)", "Producto no encontrado"):
                             prod["match"] = None
                         elif nuevo_match == "➕ Crear nuevo producto":
                             prod["match"] = "__nuevo__"
@@ -2187,6 +2188,11 @@ Laura Canales
                     with col3:
                         nuevos_g = editar_gramos_preview(prod, f"pegar_{rk}_{revision_preview}_prev_gr_{i}_{j}")
                         prod["gramos"] = nuevos_g
+                    if not prod.get("omitido"):
+                        if prod["match"] is None:
+                            st.error("Producto no encontrado. Asígnalo, créalo o selecciona (omitir).")
+                        if prod["gramos"] <= 0:
+                            st.warning("Peso no encontrado o inválido. Captura los gramos o selecciona (omitir).")
 
                     if (prod["match"] in st.session_state.precios_dict
                             and prod["match"] in st.session_state.costos_dict):
@@ -2289,10 +2295,8 @@ Laura Canales
         productos_sin_asignar = []
         for ped in st.session_state["preview_pedidos"]:
             for prod in ped["productos"]:
-                if (not prod["match"]
-                    or prod["match"] == "__nuevo__"
-                    or prod["match"] not in st.session_state.precios_dict
-                    or prod["match"] not in st.session_state.costos_dict):
+                if producto_pendiente_preview(prod, st.session_state.precios_dict,
+                                               st.session_state.costos_dict):
                     productos_sin_asignar.append({
                         "cliente": ped["cliente"],
                         "descripcion": prod["descripcion_original"],
@@ -2301,26 +2305,19 @@ Laura Canales
 
         if productos_sin_asignar:
             st.error(
-                f"⚠️ Hay {len(productos_sin_asignar)} productos sin asignar. "
-                "Si generas los tickets ahora, esos productos NO se cobrarán al cliente. "
-                "Asigna cada uno a un producto del catálogo o créalo como nuevo."
+                f"⚠️ Hay {len(productos_sin_asignar)} productos pendientes de revisar. "
+                "Asigna o crea cada producto y verifica su peso. "
+                "Para excluirlo, selecciona (omitir) en esa línea."
             )
-            with st.expander("Ver productos sin asignar", expanded=True):
+            with st.expander("Ver productos pendientes", expanded=True):
                 for sa in productos_sin_asignar:
                     st.markdown(
                         f"- **{sa['cliente']}**: `{sa['descripcion']}` ({int(sa['gramos'])}g)"
                     )
-            forzar_generar = st.checkbox(
-                "Sé que faltan productos por asignar y aún así quiero generar los tickets "
-                "(los productos sin asignar NO se cobrarán)",
-                key="forzar_generar",
-            )
-        else:
-            forzar_generar = True
 
         col_g1, col_g2 = st.columns(2)
         with col_g1:
-            puede_generar = (not productos_sin_asignar) or forzar_generar
+            puede_generar = not productos_sin_asignar
             if st.button(
                 "✅ Generar todos los tickets",
                 type="primary",
@@ -2357,8 +2354,6 @@ Laura Canales
                 if generados > 0:
                     st.session_state.pegar_reset_count += 1
                 msg = f"✅ Se generaron {generados} tickets."
-                if productos_sin_asignar:
-                    msg += f" ⚠️ {len(productos_sin_asignar)} productos quedaron sin cobrar."
                 st.success(msg)
                 st.rerun()
         with col_g2:
@@ -2489,7 +2484,7 @@ Laura Canales
 
             # Detectar formato: ¿empieza con viñeta? -> es un solo cliente y el nombre está arriba
             primera_linea = texto.split("\n", 1)[0].strip()
-            es_pedido_unico = bool(re.match(r"^(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX\s]?\s*\]\s*)?", primera_linea))
+            es_pedido_unico = bool(nombre_rapido.strip()) or bool(re.match(r"^(?:(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX]?\s*\]\s*)?|\[\s*[xX]?\s*\]\s*)", primera_linea))
 
             if es_pedido_unico:
                 # Modo simple: un solo cliente, nombre del campo de arriba
@@ -2545,21 +2540,26 @@ Laura Canales
                 for widget_key in list(st.session_state):
                     if widget_key.startswith(f"factura_{rk}_prev_") or widget_key.startswith(f"factura_{rk}_new_"):
                         del st.session_state[widget_key]
+                # Cada nueva captura empieza con sus propios valores, sin omisiones anteriores.
+                for clave_preview in list(st.session_state):
+                    if str(clave_preview).startswith(f"factura_{rk}_prev_"):
+                        del st.session_state[clave_preview]
                 st.session_state["factura_preview_pedidos"] = preview
                 # Si TODO matcheó perfecto, mostrar mensaje verde
                 total_prods = sum(len(p["productos"]) for p in preview)
                 no_match = sum(
-                    1 for p in preview for prod in p["productos"] if not prod["match"]
+                    1 for p in preview for prod in p["productos"]
+                    if producto_pendiente_preview(prod, st.session_state.precios_dict, st.session_state.costos_dict)
                 )
                 if no_match == 0:
                     st.success(
-                        f"✅ {total_prods} productos detectados, todos con match. "
+                        f"✅ {total_prods} productos detectados, todos con producto y peso. "
                         "Revisa abajo y dale 'Generar' si todo está bien."
                     )
                 else:
                     st.warning(
-                        f"⚠️ {total_prods - no_match}/{total_prods} productos con match. "
-                        f"Faltan {no_match} por asignar (corrige abajo)."
+                        f"⚠️ {total_prods - no_match}/{total_prods} productos completos. "
+                        f"Faltan {no_match} por revisar (corrige abajo)."
                     )
 
     # Mostrar y editar preview
@@ -2568,18 +2568,18 @@ Laura Canales
         st.markdown("### Vista previa - corrige los matches incorrectos")
         st.caption(
             "Si algún producto quedó mal asignado, cámbialo del dropdown. "
-            "Los productos sin match (rojo) se omitirán al generar el ticket."
+            "Producto no encontrado: asígnalo, créalo o elige (omitir). Si falta el peso, captúralo en gramos."
         )
 
         catalogo_keys = sorted(st.session_state.precios_dict.keys())
 
         for i, ped in enumerate(st.session_state["factura_preview_pedidos"]):
-            no_match = sum(1 for p in ped["productos"] if not p["match"])
-            con_match = len(ped["productos"]) - no_match
+            no_match = sum(producto_pendiente_preview(p, st.session_state.precios_dict, st.session_state.costos_dict) for p in ped["productos"])
+            con_match = sum(not p.get("omitido") for p in ped["productos"]) - no_match
 
             label = f"**{ped['cliente']}** — {con_match} productos OK"
             if no_match > 0:
-                label += f", ⚠️ {no_match} sin match"
+                label += f", ⚠️ {no_match} por revisar"
             if ped["lleva_envio"]:
                 label += " 🚚 envío"
 
@@ -2603,14 +2603,10 @@ Laura Canales
                             etiqueta = "📦 " + etiqueta
                         st.text(etiqueta)
                     with col2:
-                        opciones = ["(omitir)", "➕ Crear nuevo producto"] + catalogo_keys
-                        idx_default = (
-                            opciones.index(prod["match"])
-                            if prod["match"] in opciones
-                            else 0
-                        )
+                        opciones = ["Producto no encontrado", "(omitir)", "➕ Crear nuevo producto"] + catalogo_keys
                         nuevo_match = seleccionar_producto_preview(prod, opciones, f"factura_{rk}_prev_match_{i}_{j}")
-                        if nuevo_match == "(omitir)":
+                        prod["omitido"] = nuevo_match == "(omitir)"
+                        if nuevo_match in ("(omitir)", "Producto no encontrado"):
                             prod["match"] = None
                         elif nuevo_match == "➕ Crear nuevo producto":
                             prod["match"] = "__nuevo__"
@@ -2619,6 +2615,11 @@ Laura Canales
                     with col3:
                         nuevos_g = editar_gramos_preview(prod, f"factura_{rk}_prev_gr_{i}_{j}")
                         prod["gramos"] = nuevos_g
+                    if not prod.get("omitido"):
+                        if prod["match"] is None:
+                            st.error("Producto no encontrado. Asígnalo, créalo o selecciona (omitir).")
+                        if prod["gramos"] <= 0:
+                            st.warning("Peso no encontrado o inválido. Captura los gramos o selecciona (omitir).")
 
                     prod["incremento_pct"] = incremento_default
 
@@ -2698,10 +2699,8 @@ Laura Canales
         productos_sin_asignar = []
         for ped in st.session_state["factura_preview_pedidos"]:
             for prod in ped["productos"]:
-                if (not prod["match"]
-                    or prod["match"] == "__nuevo__"
-                    or prod["match"] not in st.session_state.precios_dict
-                    or prod["match"] not in st.session_state.costos_dict):
+                if producto_pendiente_preview(prod, st.session_state.precios_dict,
+                                               st.session_state.costos_dict):
                     productos_sin_asignar.append({
                         "cliente": ped["cliente"],
                         "descripcion": prod["descripcion_original"],
@@ -2710,26 +2709,19 @@ Laura Canales
 
         if productos_sin_asignar:
             st.error(
-                f"⚠️ Hay {len(productos_sin_asignar)} productos sin asignar. "
-                "Si generas los tickets ahora, esos productos NO se cobrarán al cliente. "
-                "Asigna cada uno a un producto del catálogo o créalo como nuevo."
+                f"⚠️ Hay {len(productos_sin_asignar)} productos pendientes de revisar. "
+                "Asigna o crea cada producto y verifica su peso. "
+                "Para excluirlo, selecciona (omitir) en esa línea."
             )
-            with st.expander("Ver productos sin asignar", expanded=True):
+            with st.expander("Ver productos pendientes", expanded=True):
                 for sa in productos_sin_asignar:
                     st.markdown(
                         f"- **{sa['cliente']}**: `{sa['descripcion']}` ({int(sa['gramos'])}g)"
                     )
-            forzar_generar = st.checkbox(
-                "Sé que faltan productos por asignar y aún así quiero generar los tickets "
-                "(los productos sin asignar NO se cobrarán)",
-                key=f"factura_{rk}_forzar_generar",
-            )
-        else:
-            forzar_generar = True
 
         col_g1, col_g2 = st.columns(2)
         with col_g1:
-            puede_generar = ((not productos_sin_asignar) or forzar_generar) and not any(
+            puede_generar = (not productos_sin_asignar) and not any(
                 p.get("error_calculo") for p in st.session_state["factura_preview_pedidos"])
             puede_generar = puede_generar and any(
                 p.get("productos_calculados") for p in st.session_state["factura_preview_pedidos"])
@@ -2771,8 +2763,6 @@ Laura Canales
                 if generados > 0:
                     st.session_state.factura_reset_count += 1
                 msg = f"✅ Se generaron {generados} tickets."
-                if productos_sin_asignar:
-                    msg += f" ⚠️ {len(productos_sin_asignar)} productos quedaron sin cobrar."
                 st.success(msg)
                 st.rerun()
         with col_g2:
@@ -3741,7 +3731,7 @@ def parsear_linea_compra(linea):
         return None
 
     # Quitar viñetas (*, -, •, [x], 1., 1))
-    s = re.sub(r"^(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX\s]?\s*\]\s*)?", "", s).strip()
+    s = re.sub(r"^(?:(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX]?\s*\]\s*)?|\[\s*[xX]?\s*\]\s*)", "", s).strip()
     if not s:
         return None
 
@@ -4223,11 +4213,56 @@ def unidad_default_producto(nombre):
     return f"1 {etiq.lower()}"
 
 
+CATEGORIAS_CATALOGO = [
+    "FRUTAS", "VERDURAS", "CHILES", "HIERBAS Y AROMÁTICOS",
+    "LÁCTEOS Y HUEVO", "CARNES Y EMBUTIDOS", "PESCADOS Y MARISCOS",
+    "LEGUMBRES Y SEMILLAS", "ABARROTES", "BEBIDAS",
+]
+
+
+def normalizar_categoria_nombre(nombre):
+    import unicodedata
+    return " ".join("".join(c for c in unicodedata.normalize("NFD", str(nombre).lower())
+                            if unicodedata.category(c) != "Mn").split())
+
+
 def categorizar_producto(nombre):
     """Clasifica un producto en una categoría visible.
     Devuelve (categoria, orden_categoria) donde orden_categoria sirve para mostrar primero
     las categorías más importantes."""
-    n = nombre.lower().strip()
+    n = normalizar_categoria_nombre(nombre)
+    # Reutilizar equivalencias ya confirmadas del catálogo, solo coincidencia exacta.
+    alias = {normalizar_categoria_nombre(k): normalizar_categoria_nombre(v)
+             for k, v in ALIASES_PRODUCTOS.items()}
+    n = alias.get(n, n)
+    def contiene(palabras):
+        return any(re.search(r"\b" + re.escape(k) + r"\b", n) for k in palabras)
+    def categoria(valor):
+        return valor, CATEGORIAS_CATALOGO.index(valor) + 1
+    # El tipo de producto prevalece sobre sabores o ingredientes en el nombre.
+    if contiene(["agua", "refresco", "refrescos", "jugo", "jugos", "bebida", "bebidas", "epura", "e pura"]):
+        return categoria("BEBIDAS")
+    if contiene(["papas fritas", "miel", "pan", "azucar", "tortilla", "tortillas", "crema de cacahuate", "crema de almendra", "crema de coco", "granola", "avena", "cereal", "cereales", "maiz palomero",
+                 "palomitas", "mermelada", "conserva", "conservas", "salsa", "salsas", "aceite",
+                 "vinagre", "harina", "galleta", "galletas", "pasta", "arroz", "chocolate", "cafe"]):
+        return categoria("ABARROTES")
+    if contiene(["leche de almendra", "leche de coco", "leche de avena", "bebida vegetal"]):
+        return categoria("BEBIDAS")
+    if contiene(["queso", "quesos", "leche", "yogur", "yogurt", "yoghurt", "crema", "huevo", "huevos"]):
+        return categoria("LÁCTEOS Y HUEVO")
+    if contiene(["pollo", "pavo", "pechuga", "res", "cerdo", "jamon", "salchicha", "salchichas",
+                 "chorizo", "tocino", "longaniza", "salami", "pepperoni", "peperoni", "carne", "carnes"]):
+        return categoria("CARNES Y EMBUTIDOS")
+    if contiene(["pescado", "salmon", "atun", "tilapia", "mojarra", "camaron", "camarones", "marisco", "mariscos"]):
+        return categoria("PESCADOS Y MARISCOS")
+    if contiene(["jitomate", "tomate", "tomatillo", "ejote", "ejotes", "chicharo", "chicharos"]):
+        return categoria("VERDURAS")
+    if contiene(["platano manzano", "cana"]):
+        return categoria("FRUTAS")
+    if contiene(["hierba de olor", "hierbas de olor", "hierbas finas"]):
+        return categoria("HIERBAS Y AROMÁTICOS")
+    if n == "manzano":
+        return None, 99  # Puede referirse a chile o plátano: confirmar.
 
     # 1. Hierbas y aromáticos (específicas)
     if any(re.search(rf"\b{k}\b", n) for k in [
@@ -4318,10 +4353,10 @@ def categorizar_producto(nombre):
     if any(re.search(rf"\b{k}\b", n) for k in verduras):
         return ("VERDURAS", 2)
 
-    return ("OTROS", 8)
+    return (None, 99)  # Pedir categoría; nunca publicar una sección genérica.
 
 
-def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entrega, frase, ancho=900):
+def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entrega, frase, ancho=900, mostrar_precios=True):
     """Genera el catálogo en una o más páginas con diseño elegante por categorías.
     Compacta automáticamente: 1 columna si hay pocos productos, 2 columnas si hay muchos."""
 
@@ -4377,11 +4412,13 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
     f_buscar = font(13, bold=True)         # Mensaje "si tu producto no está"
     f_footer = font(11)                    # Footer chiquito
 
-    # Ordenar productos por categoría y luego alfabéticamente
-    productos_con_cat = [
-        (categorizar_producto(p["nombre"])[1], categorizar_producto(p["nombre"])[0], p["nombre"], p)
-        for p in productos
-    ]
+    # Las categorías confirmadas por el usuario prevalecen sobre las reglas.
+    productos_con_cat = []
+    for prod in productos:
+        cat = prod.get("categoria") or categorizar_producto(prod["nombre"])[0]
+        if cat not in CATEGORIAS_CATALOGO:
+            raise ValueError("Confirma la categoría de: " + prod["nombre"])
+        productos_con_cat.append((CATEGORIAS_CATALOGO.index(cat), cat, prod["nombre"], prod))
     productos_con_cat.sort(key=lambda x: (x[0], x[2].lower()))
 
     # Agrupar por categoría preservando orden
@@ -4526,6 +4563,9 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
                         else:
                             precio_completo = f"{precio_txt} {unidad_raw}"
 
+                        if not mostrar_precios:
+                            precio_completo = unidad_raw
+
                         # Truncar nombre si es muy largo
                         max_nombre_w = ancho_col - draw.textbbox((0, 0), precio_completo, font=f_precio)[2] - 20
                         while draw.textbbox((0, 0), nombre, font=f_producto)[2] > max_nombre_w and len(nombre) > 3:
@@ -4577,6 +4617,9 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
                         precio_completo = f"{precio_txt} {unidad_raw}"
                     else:
                         precio_completo = f"{precio_txt} {unidad_raw}"
+
+                    if not mostrar_precios:
+                        precio_completo = unidad_raw
 
                     draw.text((x_col + 100, y), nombre, fill=NEGRO, font=f_producto)
                     p_w = draw.textbbox((0, 0), precio_completo, font=f_precio)[2]
@@ -4632,8 +4675,8 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
                 fill=NEGRO,
             )
             # Texto blanco centrado en el círculo
-            envio_l1 = "$35"
-            envio_l2 = "de envío"
+            envio_l1 = "$35" if mostrar_precios else "Envío"
+            envio_l2 = "de envío" if mostrar_precios else "Consultar"
             bbox1 = draw.textbbox((0, 0), envio_l1, font=f_envio_circ)
             bbox2 = draw.textbbox((0, 0), envio_l2, font=font(13, bold=True))
             draw.text(
@@ -4683,6 +4726,14 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
             # Texto contacto
             draw.text((ico_x + 30, ico_y - 2), contacto_completo, fill=NEGRO, font=f_contacto)
 
+        # Ajustar el lienzo al contenido real, especialmente con dos columnas.
+        alto_final = max(720, y + 90)
+        if alto_final != alto:
+            ajustada = Image.new("RGB", (ancho, alto_final), BG)
+            ajustada.paste(img, (0, 0))
+            img, alto = ajustada, alto_final
+            draw = ImageDraw.Draw(img)
+
         # ---- Footer ----
         fecha_gen = datetime.now(pytz.timezone(ZONA_HORARIA)).strftime("%d/%m/%Y")
         footer_txt = f"Catálogo generado el {fecha_gen}"
@@ -4695,9 +4746,89 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
     return imagenes
 
 
+def generar_promocion_negocios(contacto_nombre, contacto_tel, marca="MINI SÚPER DOS V"):
+    """Modelo comercial sin tarifas ni promesas de entrega no confirmadas."""
+    ancho, alto = 1000, 1250
+    crema, verde, tinta, gris = "#F6F4EC", "#234B3B", "#203B31", "#607269"
+    imagen = Image.new("RGB", (ancho, alto), crema)
+    draw = ImageDraw.Draw(imagen)
+    def fuente(tam, bold=False):
+        ruta = FUENTE_BOLD if bold else FUENTE_REG
+        return ImageFont.truetype(ruta, tam) if ruta else ImageFont.load_default()
+    def texto_envuelto(texto, x, y, ancho_max, tam, color=tinta, bold=False):
+        f = fuente(tam, bold)
+        lineas, linea = [], ""
+        for palabra in str(texto).split():
+            candidato = (linea + " " + palabra).strip()
+            if draw.textlength(candidato, font=f) <= ancho_max:
+                linea = candidato
+            else:
+                if linea:
+                    lineas.append(linea)
+                linea = ""
+                for caracter in palabra:
+                    if linea and draw.textlength(linea + caracter, font=f) > ancho_max:
+                        lineas.append(linea)
+                        linea = ""
+                    linea += caracter
+        if linea:
+            lineas.append(linea)
+        for linea in lineas:
+            draw.text((x, y), linea, font=f, fill=color)
+            y += tam + 10
+        return y
+    draw.rectangle((0, 0, ancho, 18), fill=verde)
+    y = texto_envuelto(marca.strip().upper(), 70, 65, 860, 29, bold=True)
+    draw.line((70, y + 18, 930, y + 18), fill="#B7C6B8", width=2)
+    y = texto_envuelto("FRUTAS, VERDURAS E INSUMOS", 70, y + 53, 850, 22, gris, True)
+    y = texto_envuelto("Tu próxima compra,\ncon nosotros.", 70, y + 20, 850, 64, verde, True)
+    y = texto_envuelto("Para restaurantes, cafeterías, fondas y comedores.", 70, y + 20, 800, 28)
+    y += 42
+    for num, titulo, detalle in [
+        ("01", "Comparte tu lista", "Indícanos productos, cantidades y la ubicación de tu negocio."),
+        ("02", "Recibe tu cotización", "Consulta disponibilidad, presentaciones y precios para tu pedido."),
+        ("03", "Coordinemos la entrega", "Acordamos contigo la fecha, la zona de entrega y las condiciones."),
+    ]:
+        draw.text((70, y), num, font=fuente(22, True), fill="#829A86")
+        texto_envuelto(titulo, 130, y - 4, 780, 27, verde, True)
+        yy = texto_envuelto(detalle, 130, y + 38, 760, 22, gris)
+        y = yy + 28
+    y = texto_envuelto("FACTURACIÓN DISPONIBLE", 70, y + 3, 850, 20, verde, True)
+    y = texto_envuelto("Cotización según productos, cantidades y zona. Disponibilidad por confirmar.",
+                       70, y + 8, 860, 18, gris)
+    caja_y = y + 30
+    # Altura dinámica para conservar nombres largos sin cortar el contacto.
+    bloque_h = 210
+    if caja_y + bloque_h + 60 > imagen.height:
+        ampliada = Image.new("RGB", (ancho, caja_y + bloque_h + 60), crema)
+        ampliada.paste(imagen, (0, 0)); imagen = ampliada; draw = ImageDraw.Draw(imagen)
+    draw.rounded_rectangle((70, caja_y, 930, caja_y + bloque_h), radius=18, fill=verde)
+    yy = texto_envuelto("Envíanos tu lista de compras", 100, caja_y + 28, 800, 29, "white", True)
+    yy = texto_envuelto(f"WhatsApp: {contacto_tel}", 100, yy + 9, 800, 32, "white", True)
+    texto_envuelto(str(contacto_nombre), 100, yy + 7, 800, 21, "#DFE9DF")
+    return imagen.crop((0, 0, ancho, caja_y + bloque_h + 60))
+
+
 with tab_catalogo:
     st.subheader("🛍️ Generar catálogo para clientes")
     st.caption("Selecciona productos, define unidades, día de entrega y genera un catálogo bonito en PNG o PDF para mandar por WhatsApp.")
+
+    with st.expander("Modelo para promocionarnos a restaurantes y negocios"):
+        marca_negocios = st.text_input("Nombre del negocio en la promoción", value="MINI SÚPER DOS V", max_chars=60)
+        contacto_negocios = st.selectbox("Contacto comercial", list(CONTACTOS), key="contacto_negocios")
+        st.caption("Modelo sin precios, con solicitud de cotización y entrega a coordinar. Puedes compartirlo junto con el catálogo sin precios.")
+        if st.button("Generar promoción para negocios"):
+            st.session_state["promocion_negocios"] = generar_promocion_negocios(
+                contacto_negocios, CONTACTOS[contacto_negocios], marca_negocios or "MINI SÚPER DOS V")
+        if "promocion_negocios" in st.session_state:
+            promo = st.session_state["promocion_negocios"]
+            st.image(promo, caption="Promoción para restaurantes y negocios", width=600)
+            png_promo, pdf_promo = io.BytesIO(), io.BytesIO()
+            promo.save(png_promo, format="PNG")
+            promo.save(pdf_promo, format="PDF", resolution=150)
+            a_promo, b_promo = st.columns(2)
+            a_promo.download_button("Descargar promoción PNG", png_promo.getvalue(), "promocion_negocios.png", "image/png")
+            b_promo.download_button("Descargar promoción PDF", pdf_promo.getvalue(), "promocion_negocios.pdf", "application/pdf")
 
     if not st.session_state.precios_dict:
         st.warning("⚠️ Carga el catálogo primero (desde Google Sheets o CSV) antes de generar.")
@@ -4942,61 +5073,45 @@ with tab_catalogo:
                 "unidad": unidad,
                 "precio": precio_final,
                 "emoji": emoji_para_producto(prod),
+                "categoria": categorizar_producto(prod)[0],
             })
 
+        pendientes_cat = [p["nombre"] for p in productos_incluidos if not p.get("categoria")]
         if not productos_incluidos:
             st.warning("Selecciona al menos un producto.")
+        elif pendientes_cat:
+            st.warning("Confirma la categoría de estos productos antes de generar: " + ", ".join(pendientes_cat))
+            st.caption("Comparte estos nombres en el chat para dejar su rubro incorporado. Ningún producto se publicará como Otros.")
         elif not frase_seleccionada:
             st.warning("Elige o escribe una frase para el catálogo.")
         else:
             st.success(f"Listo para generar con {len(productos_incluidos)} productos.")
 
             if st.button("🎨 Generar catálogo", type="primary", use_container_width=True):
-                with st.spinner("Generando catálogo..."):
-                    imagenes = generar_catalogo_imagen(
-                        productos_incluidos,
-                        cat_contacto,
-                        CONTACTOS[cat_contacto],
-                        dia_entrega_str,
-                        frase_seleccionada,
-                        ancho=900,
-                    )
-                    st.session_state["catalogo_generado"] = imagenes
+                with st.spinner("Generando versiones con precios y sin precios..."):
+                    versiones = {}
+                    for con_precios in (True, False):
+                        versiones[con_precios] = generar_catalogo_imagen(productos_incluidos,
+                            cat_contacto, CONTACTOS[cat_contacto], dia_entrega_str,
+                            frase_seleccionada, ancho=900, mostrar_precios=con_precios)
+                    st.session_state["catalogo_generado"] = {"versiones": versiones,
+                        "dia": dia_entrega_str.lower(),
+                        "fecha": datetime.now(pytz.timezone(ZONA_HORARIA)).strftime("%Y%m%d")}
 
-            if "catalogo_generado" in st.session_state:
-                imagenes = st.session_state["catalogo_generado"]
-
-                st.markdown("#### 👁️ Vista previa")
-                # Como ahora generamos UNA sola imagen larga, siempre hay 1 elemento
-                st.image(imagenes[0], caption="Catálogo", use_container_width=True)
-
-                st.markdown("#### 📥 Descargar")
-                col_d1, col_d2 = st.columns(2)
-
-                with col_d1:
-                    png_buf = io.BytesIO()
-                    imagenes[0].save(png_buf, format="PNG")
-                    png_buf.seek(0)
-                    st.download_button(
-                        "🖼️ Descargar PNG",
-                        data=png_buf.getvalue(),
-                        file_name=f"catalogo_{dia_entrega_str.lower()}_{datetime.now(pytz.timezone(ZONA_HORARIA)).strftime('%Y%m%d')}.png",
-                        mime="image/png",
-                        use_container_width=True,
-                    )
-
-                with col_d2:
-                    pdf_buf = io.BytesIO()
-                    imagenes[0].save(pdf_buf, format="PDF", resolution=100)
-                    pdf_buf.seek(0)
-                    st.download_button(
-                        "📄 Descargar PDF",
-                        data=pdf_buf.getvalue(),
-                        file_name=f"catalogo_{dia_entrega_str.lower()}_{datetime.now(pytz.timezone(ZONA_HORARIA)).strftime('%Y%m%d')}.pdf",
-                        mime="application/pdf",
-                        use_container_width=True,
-                    )
-
-                if st.button("🗑️ Limpiar y generar de nuevo"):
+            resultado_catalogo = st.session_state.get("catalogo_generado")
+            if isinstance(resultado_catalogo, dict) and "versiones" in resultado_catalogo:
+                ver_precios = st.radio("Vista previa", ["Con precios", "Sin precios"], horizontal=True) == "Con precios"
+                st.image(resultado_catalogo["versiones"][ver_precios][0], caption="Catálogo", use_container_width=True)
+                st.caption("Las descargas corresponden al último catálogo generado. Genera de nuevo después de cambiar productos, categorías o contacto.")
+                for con_precios, etiqueta in [(True, "con precios"), (False, "sin precios")]:
+                    imagenes = resultado_catalogo["versiones"][con_precios]
+                    base = f"catalogo_{etiqueta.replace(' ', '_')}_{resultado_catalogo['dia']}_{resultado_catalogo['fecha']}"
+                    col_png, col_pdf = st.columns(2)
+                    buf_png, buf_pdf = io.BytesIO(), io.BytesIO()
+                    imagenes[0].save(buf_png, format="PNG")
+                    imagenes[0].save(buf_pdf, format="PDF", resolution=100, save_all=True, append_images=imagenes[1:])
+                    col_png.download_button(f"Descargar PNG {etiqueta}", buf_png.getvalue(), base + ".png", "image/png")
+                    col_pdf.download_button(f"Descargar PDF {etiqueta}", buf_pdf.getvalue(), base + ".pdf", "application/pdf")
+                if st.button("Limpiar catálogo generado"):
                     del st.session_state["catalogo_generado"]
                     st.rerun()
