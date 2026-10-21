@@ -4216,7 +4216,7 @@ def unidad_default_producto(nombre):
 CATEGORIAS_CATALOGO = [
     "FRUTAS", "VERDURAS", "CHILES", "HIERBAS Y AROMÁTICOS",
     "LÁCTEOS Y HUEVO", "CARNES Y EMBUTIDOS", "PESCADOS Y MARISCOS",
-    "LEGUMBRES Y SEMILLAS", "ABARROTES", "BEBIDAS",
+    "LEGUMBRES Y SEMILLAS", "ABARROTES", "BOTANAS", "BEBIDAS",
 ]
 
 
@@ -4240,6 +4240,9 @@ def categorizar_producto(nombre):
     def categoria(valor):
         return valor, CATEGORIAS_CATALOGO.index(valor) + 1
     # El tipo de producto prevalece sobre sabores o ingredientes en el nombre.
+    # Rubro confirmado: churros y churritos son botana salada.
+    if contiene(["churro", "churros", "churrito", "churritos"]):
+        return categoria("BOTANAS")
     if contiene(["agua", "refresco", "refrescos", "jugo", "jugos", "bebida", "bebidas", "epura", "e pura"]):
         return categoria("BEBIDAS")
     if contiene(["papas fritas", "miel", "pan", "azucar", "tortilla", "tortillas", "crema de cacahuate", "crema de almendra", "crema de coco", "granola", "avena", "cereal", "cereales", "maiz palomero",
