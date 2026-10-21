@@ -4503,7 +4503,7 @@ def categorizar_producto(nombre):
     return (None, 99)  # Pedir categoría; nunca publicar una sección genérica.
 
 
-def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entrega, frase, ancho=900, mostrar_precios=True):
+def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entrega, frase, ancho=900, mostrar_precios=True, dos_columnas=None):
     """Genera el catálogo en una o más páginas con diseño elegante por categorías.
     Compacta automáticamente: 1 columna si hay pocos productos, 2 columnas si hay muchos."""
 
@@ -4590,7 +4590,7 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
 
     # Decidir columnas: 1 si pocos productos, 2 si muchos
     total = len(productos_con_cat)
-    usar_2_columnas = total > 22
+    usar_2_columnas = total > 22 if dos_columnas is None else dos_columnas
 
     # Alturas de elementos
     pad_lateral = 60
@@ -4681,6 +4681,14 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
                     break
             col1_items = items_pagina[:mitad]
             col2_items = items_pagina[mitad:]
+            if dos_columnas is not None:
+                # En impresión, ningún rubro queda solo al pie de la columna.
+                if col1_items and col1_items[-1][0] == "cat":
+                    col2_items.insert(0, col1_items.pop())
+                if col2_items and col2_items[0][0] == "prod":
+                    ultimo_rubro = next((item for item in reversed(col1_items) if item[0] == "cat"), None)
+                    if ultimo_rubro:
+                        col2_items.insert(0, ultimo_rubro)
             col_ancho = (ancho - pad_lateral * 2 - 40) // 2
             x_col1 = pad_lateral
             x_col2 = pad_lateral + col_ancho + 40
@@ -4905,129 +4913,81 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
 
 
 def generar_catalogo_impresion(productos, contacto_nombre, contacto_tel, dia_entrega,
-                                mostrar_precios=True):
-    """PDF carta vertical, 150 dpi, márgenes de 1.27 cm y filas sin cortar."""
-    ancho, alto, margen = 1275, 1650, 75
-    separacion = 45
-    columna = (ancho - 2 * margen - separacion) // 2
-    inicio_y, limite_y = 190, 1450
-    verde, negro, gris = (40, 70, 45), (35, 35, 35), (95, 95, 95)
+                                mostrar_precios=True, frase="Del mercado a tu puerta."):
+    """Usa el diseño original en páginas carta, sin cortar filas ni reducir la letra."""
+    ancho_hoja, alto_hoja, margen, dpi = 1275, 1650, 75, 150
+    ancho_diseno = 900
+    ancho_util = ancho_hoja - 2 * margen
+    alto_util = alto_hoja - 2 * margen - 32  # Reserva para el número de página.
+    escala = ancho_util / ancho_diseno
+    alto_maximo = int(alto_util / escala)
 
-    def fuente(tamano, negrita=False):
-        rutas = (["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                  "/Library/Fonts/Arial Bold.ttf", "C:/Windows/Fonts/arialbd.ttf"] if negrita else
-                 ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                  "/Library/Fonts/Arial.ttf", "C:/Windows/Fonts/arial.ttf"])
-        for ruta in rutas:
-            try:
-                return ImageFont.truetype(ruta, tamano)
-            except OSError:
-                pass
-        return ImageFont.load_default()
-
-    titulo, texto, encabezado, pequeno = fuente(34, True), fuente(20), fuente(20, True), fuente(18)
-    medida = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-
-    def envolver(valor, font, espacio):
-        # También divide nombres largos sin espacios, para no invadir otra columna.
-        lineas, linea = [], ""
-        for palabra in str(valor).split():
-            prueba = (linea + " " + palabra).strip()
-            if medida.textlength(prueba, font=font) <= espacio:
-                linea = prueba
-                continue
-            if linea:
-                lineas.append(linea)
-            linea = ""
-            for caracter in palabra:
-                if linea and medida.textlength(linea + caracter, font=font) > espacio:
-                    lineas.append(linea)
-                    linea = ""
-                linea += caracter
-        if linea:
-            lineas.append(linea)
-        return lineas or [""]
-
-    filas = []
-    lacteos_vistos = set()
+    ordenados, vistos = [], set()
     for original in productos:
         if not producto_visible_catalogo(original["nombre"]):
             continue
         cat = categorizar_producto(original["nombre"])[0]
         if cat not in CATEGORIAS_CATALOGO:
             raise ValueError("Confirma la categoría de: " + original["nombre"])
-        nombre = nombre_visible_catalogo(original["nombre"], mostrar_precios=mostrar_precios).title()
+        nombre = nombre_visible_catalogo(original["nombre"], mostrar_precios=mostrar_precios)
         if not mostrar_precios and cat == "LÁCTEOS Y HUEVO":
             clave = normalizar_categoria_nombre(nombre)
-            if clave in lacteos_vistos:
+            if clave in vistos:
                 continue
-            lacteos_vistos.add(clave)
-        unidad = unidad_corregida_catalogo(original["nombre"], original["unidad"])
-        etiqueta = f"${original['precio']:,.2f} / {unidad}" if mostrar_precios else ""
-        espacio_precio = min(220, max(150, int(medida.textlength(etiqueta, font=pequeno)))) if etiqueta else 0
-        nombre_lineas = envolver(nombre, texto, columna - espacio_precio - (18 if etiqueta else 0))
-        precio_lineas = envolver(etiqueta, pequeno, espacio_precio) if etiqueta else []
-        altura = max(len(nombre_lineas), len(precio_lineas)) * 28 + 8
-        filas.append((CATEGORIAS_CATALOGO.index(cat), cat, nombre, nombre_lineas, precio_lineas, altura))
-    filas.sort(key=lambda fila: (fila[0], fila[2]))
-    if not filas:
+            vistos.add(clave)
+        ordenados.append((CATEGORIAS_CATALOGO.index(cat), nombre.lower(), original))
+    ordenados.sort(key=lambda fila: (fila[0], fila[1]))
+    lista = [fila[2] for fila in ordenados]
+    if not lista:
         raise ValueError("Selecciona al menos un producto para imprimir.")
 
-    # Primero distribuir todo: el total de páginas se conoce antes de dibujar.
-    paginas = [[]]
-    col, y, categoria_actual = 0, inicio_y, None
-    for _, categoria, nombre, lineas, precios, altura in filas:
-        nueva_categoria = categoria != categoria_actual
-        cabecera = envolver(categoria, encabezado, columna)
-        alto_cabecera = len(cabecera) * 27 + 18
-        if altura + alto_cabecera > limite_y - inicio_y:
-            raise ValueError("El nombre de este producto es demasiado largo para imprimir: " + nombre)
-        if y + altura + (alto_cabecera if nueva_categoria else 0) > limite_y:
-            col += 1
-            if col == 2:
-                paginas.append([])
-                col = 0
-            y = inicio_y
-            # Repetir el rubro cuando continúa en otra columna o página.
-            nueva_categoria = True
-        x = margen + col * (columna + separacion)
-        if nueva_categoria:
-            paginas[-1].append(("categoria", x, y, cabecera, []))
-            y += alto_cabecera
-        paginas[-1].append(("producto", x, y, lineas, precios))
-        y += altura
-        categoria_actual = categoria
+    dos_columnas = len(lista) > 22
+    disenos, inicio = [], 0
+    while inicio < len(lista):
+        cache = {}
 
-    imagenes = []
-    for numero, elementos in enumerate(paginas, 1):
-        imagen = Image.new("RGB", (ancho, alto), "white")
-        draw = ImageDraw.Draw(imagen)
-        draw.text((margen, margen), "MINI SÚPER DOS V", font=titulo, fill=verde)
-        descripcion = "Catálogo de productos" + (" · Con precios" if mostrar_precios else "")
-        draw.text((margen, 125), descripcion, font=texto, fill=gris)
-        draw.line((margen, 165, ancho - margen, 165), fill=verde, width=2)
-        for tipo, x, fila_y, lineas, precios in elementos:
-            for i, linea in enumerate(lineas):
-                draw.text((x, fila_y + i * (27 if tipo == "categoria" else 28)), linea,
-                          font=encabezado if tipo == "categoria" else texto,
-                          fill=verde if tipo == "categoria" else negro)
-            for i, linea in enumerate(precios):
-                w = draw.textlength(linea, font=pequeno)
-                draw.text((x + columna - w - 2, fila_y + i * 28), linea, font=pequeno, fill=negro)
-        draw.line((margen, 1470, ancho - margen, 1470), fill=(190, 190, 190), width=1)
-        contacto = f"Pedidos: {contacto_nombre} · {contacto_tel}"
-        for i, linea in enumerate(envolver(contacto, pequeno, ancho - 2 * margen)):
-            if i >= 2:
-                raise ValueError("Acorta el nombre del contacto para que quepa en el pie de impresión.")
-            draw.text((margen, 1488 + i * 24), linea, font=pequeno, fill=gris)
-        entrega = f"Entrega: {dia_entrega}" + (f" · Envío: ${COSTO_ENVIO:g}" if mostrar_precios else "")
-        draw.text((margen, 1545), entrega, font=pequeno, fill=gris)
-        pagina = f"{numero} de {len(paginas)}"
-        draw.text((ancho - margen - 2 - draw.textlength(pagina, font=pequeno), 1545),
-                  pagina, font=pequeno, fill=gris)
-        imagenes.append(imagen)
+        def dibujar(cantidad):
+            if cantidad not in cache:
+                cache[cantidad] = generar_catalogo_imagen(
+                    lista[inicio:inicio + cantidad], contacto_nombre, contacto_tel,
+                    dia_entrega, frase, ancho=ancho_diseno, mostrar_precios=mostrar_precios,
+                    dos_columnas=dos_columnas)[0]
+            return cache[cantidad]
+
+        # Buscar una cantidad que quepa usando la altura real del diseño completo,
+        # incluyendo encabezado, rubros, frase, entrega y contacto.
+        minimo, maximo = 1, min(len(lista) - inicio, 80 if dos_columnas else 40)
+        cantidad_elegida = 0
+        while minimo <= maximo:
+            candidato = (minimo + maximo) // 2
+            if dibujar(candidato).height <= alto_maximo:
+                cantidad_elegida = candidato
+                minimo = candidato + 1
+            else:
+                maximo = candidato - 1
+        if not cantidad_elegida:
+            raise ValueError("El encabezado o la frase son demasiado largos para una hoja carta. Acorta la frase del catálogo.")
+        disenos.append(dibujar(cantidad_elegida))
+        inicio += cantidad_elegida
+
+    try:
+        fuente_pagina = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", 17)
+    except OSError:
+        fuente_pagina = ImageFont.load_default()
+    paginas = []
+    for numero, diseno in enumerate(disenos, 1):
+        hoja = Image.new("RGB", (ancho_hoja, alto_hoja), "white")
+        alto_destino = round(diseno.height * escala)
+        diseno = diseno.resize((ancho_util, alto_destino), Image.Resampling.LANCZOS)
+        hoja.paste(diseno, (margen, margen))
+        draw = ImageDraw.Draw(hoja)
+        numeracion = f"{numero} de {len(disenos)}"
+        w = draw.textlength(numeracion, font=fuente_pagina)
+        draw.text(((ancho_hoja - w) / 2, alto_hoja - margen - 24), numeracion,
+                  font=fuente_pagina, fill=(95, 95, 95))
+        paginas.append(hoja)
     salida = io.BytesIO()
-    imagenes[0].save(salida, format="PDF", resolution=150, save_all=True, append_images=imagenes[1:])
+    paginas[0].save(salida, format="PDF", resolution=dpi, save_all=True, append_images=paginas[1:])
     return salida.getvalue()
 
 
@@ -5189,9 +5149,9 @@ with tab_catalogo:
                 if unidad != seleccionados[producto]:
                     seleccionados[producto] = unidad
                     st.session_state.pop(f"sel_unit_{producto}", None)
-        if st.session_state.get("catalogo_revision_rubros") != 5:
+        if st.session_state.get("catalogo_revision_rubros") != 6:
             st.session_state.pop("catalogo_generado", None)
-            st.session_state["catalogo_revision_rubros"] = 5
+            st.session_state["catalogo_revision_rubros"] = 6
 
         faltantes = [
             producto
@@ -5394,7 +5354,7 @@ with tab_catalogo:
                             frase_seleccionada, ancho=900, mostrar_precios=con_precios)
                         imprimibles[con_precios] = generar_catalogo_impresion(productos_incluidos,
                             cat_contacto, CONTACTOS[cat_contacto], dia_entrega_str,
-                            mostrar_precios=con_precios)
+                            mostrar_precios=con_precios, frase=frase_seleccionada)
                     st.session_state["catalogo_generado"] = {"versiones": versiones, "imprimibles": imprimibles,
                         "dia": dia_entrega_str.lower(),
                         "fecha": datetime.now(pytz.timezone(ZONA_HORARIA)).strftime("%Y%m%d")}
