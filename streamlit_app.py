@@ -4691,7 +4691,7 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
                             precio_completo = f"{precio_txt} {unidad_raw}"
 
                         if not mostrar_precios:
-                            precio_completo = unidad_raw
+                            precio_completo = ""
 
                         # Truncar nombre si es muy largo
                         max_nombre_w = ancho_col - draw.textbbox((0, 0), precio_completo, font=f_precio)[2] - 20
@@ -4746,7 +4746,7 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
                         precio_completo = f"{precio_txt} {unidad_raw}"
 
                     if not mostrar_precios:
-                        precio_completo = unidad_raw
+                        precio_completo = ""
 
                     draw.text((x_col + 100, y), nombre, fill=NEGRO, font=f_producto)
                     p_w = draw.textbbox((0, 0), precio_completo, font=f_precio)[2]
@@ -5031,9 +5031,9 @@ with tab_catalogo:
                 if unidad != seleccionados[producto]:
                     seleccionados[producto] = unidad
                     st.session_state.pop(f"sel_unit_{producto}", None)
-        if st.session_state.get("catalogo_revision_rubros") != 2:
+        if st.session_state.get("catalogo_revision_rubros") != 3:
             st.session_state.pop("catalogo_generado", None)
-            st.session_state["catalogo_revision_rubros"] = 2
+            st.session_state["catalogo_revision_rubros"] = 3
 
         faltantes = [
             producto
