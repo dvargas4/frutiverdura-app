@@ -4153,7 +4153,12 @@ def detectar_unidad_producto(nombre):
     Returns:
         (etiqueta_unidad, admite_fracciones)
     """
-    n = nombre.lower()
+    n = normalizar_categoria_nombre(nombre)
+    if es_garrafon_catalogo(nombre):
+        capacidad = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:litros?|lts?|l)\b", n)
+        return ((f"{capacidad.group(1)} L" if capacidad else "Garrafón"), False)
+    if re.search(r"\barandanos?\b", n):
+        return ("Kg", True)
 
     # 1. Aceites siempre por Lt (aunque no diga "lt" en el nombre)
     if "aceite" in n:
@@ -4163,8 +4168,7 @@ def detectar_unidad_producto(nombre):
     if any(re.search(rf"\b{k}\b", n) for k in [
         "frambuesa", "frambuesas", "zarzamora", "zarzamoras",
         "blueberry", "blueberries", "blue berry", "blue berries",
-        "mora azul", "moras azules", "arándano", "arandano",
-        "arándanos", "arandanos"
+        "mora azul", "moras azules"
     ]):
         return ("170g", False)
 
@@ -4216,16 +4220,15 @@ def unidad_default_producto(nombre):
 CATEGORIAS_CATALOGO = [
     "FRUTAS", "VERDURAS", "CHILES", "HIERBAS Y AROMÁTICOS",
     "LÁCTEOS Y HUEVO", "CARNES Y EMBUTIDOS", "PESCADOS Y MARISCOS",
-    "GRANOS, LEGUMBRES Y SEMILLAS", "ABARROTES Y REPOSTERÍA", "ADEREZOS Y CONSERVAS", "ESPECIAS Y CONDIMENTOS",
-    "PAN Y TORTILLAS", "BOTANAS", "DULCES TRADICIONALES", "BEBIDAS",
-    "MASCOTAS", "SERVICIOS",
+    "GRANOS, LEGUMBRES Y SEMILLAS", "ABARROTES Y REPOSTERÍA", "ESPECIAS Y CONDIMENTOS",
+    "PAN Y TORTILLAS", "BEBIDAS",
 ]
 
 
 # Rubros confirmados por el usuario; prevalecen sobre reglas por ingredientes.
 CATEGORIAS_CONFIRMADAS = {
-    "aderezo cesar": "ADEREZOS Y CONSERVAS",
-    "pepinillos": "ADEREZOS Y CONSERVAS",
+    "aderezo cesar": "ABARROTES Y REPOSTERÍA",
+    "pepinillos": "VERDURAS",
     "alcachofa": "VERDURAS",
     "germen de alfalfa": "VERDURAS",
     "germen de soya": "VERDURAS",
@@ -4248,18 +4251,16 @@ CATEGORIAS_CONFIRMADAS = {
     "piloncillo": "ABARROTES Y REPOSTERÍA",
     "alpiste": "GRANOS, LEGUMBRES Y SEMILLAS",
     "quinoa": "GRANOS, LEGUMBRES Y SEMILLAS",
-    "alegrias": "DULCES TRADICIONALES",
+    "alegrias": "ABARROTES Y REPOSTERÍA",
     "tortillinas": "PAN Y TORTILLAS",
-    "nupec adulto": "MASCOTAS",
-    "envio a domicilio": "SERVICIOS",
-    "japones enchilado": "BOTANAS",
-    "fruta mixta": "BOTANAS",
+    "japones enchilado": "GRANOS, LEGUMBRES Y SEMILLAS",
+    "fruta mixta": "GRANOS, LEGUMBRES Y SEMILLAS",
     "canela natural en polvo": "ESPECIAS Y CONDIMENTOS",
     "canela sintetica en polvo": "ESPECIAS Y CONDIMENTOS",
     "pimienta blanca molida": "ESPECIAS Y CONDIMENTOS",
     "pimienta blanca molida en polvo": "ESPECIAS Y CONDIMENTOS",
-    "cacahuate japones enchilado": "BOTANAS",
-    "fruta deshidratada": "BOTANAS",
+    "cacahuate japones enchilado": "GRANOS, LEGUMBRES Y SEMILLAS",
+    "fruta deshidratada": "GRANOS, LEGUMBRES Y SEMILLAS",
     "plato de verduras": "VERDURAS"
 }
 
@@ -4269,11 +4270,83 @@ def normalizar_categoria_nombre(nombre):
                             if unicodedata.category(c) != "Mn").split())
 
 
+
+def producto_visible_catalogo(nombre):
+    """Exclusiones de venta solicitadas, aplicadas solo al catálogo público."""
+    n = normalizar_categoria_nombre(nombre)
+    if re.search(r"\b(pesaje|bonswiss|pepperoni|peperoni|pepperonni|nupec|mascotas?|servicios?)\b", n):
+        return False
+    if re.search(r"\b(envio|entrega a domicilio|flete)\b", n):
+        return False
+    if re.search(r"\b(camaron|camarones)\b", n) and re.search(r"\b(polvo|pulpa)\b", n):
+        return False
+    if n == "pulpa":
+        return False
+    return True
+
+
+def nombre_visible_catalogo(nombre):
+    n = normalizar_categoria_nombre(nombre)
+    cambios = {
+        "pepinillo": "Pepinillo Persa", "pepinillos": "Pepinillo Persa",
+        "canela importada": "Canela Ceylán Completa",
+        "jalapeno": "Chile Jalapeño", "jalapenos": "Chile Jalapeño",
+        "chile jalapeno": "Chile Jalapeño",
+        "churro": "Churros de Amaranto", "churros": "Churros de Amaranto",
+        "churrito": "Churros de Amaranto", "churritos": "Churros de Amaranto",
+    }
+    return cambios.get(n, nombre)
+
+
+def unidad_corregida_catalogo(nombre, unidad):
+    n = normalizar_categoria_nombre(nombre)
+    etiqueta, fraccionable = detectar_unidad_producto(nombre)
+    if re.search(r"\barandanos?\b", n) and unidad not in ("1/4 kg", "1/2 kg", "1 kg"):
+        return "1 kg"
+    if es_garrafon_catalogo(nombre):
+        return etiqueta if etiqueta[0].isdigit() else "1 " + etiqueta.lower()
+    return unidad
+
+
+def es_garrafon_catalogo(nombre):
+    n = normalizar_categoria_nombre(nombre)
+    return bool(re.search(r"\bgarrafon(?:es)?\b", n) or
+                (re.search(r"\b(agua|epura|e pura)\b", n) and
+                 re.search(r"\b(?:19|20)\s*(?:l|lt|lts|litros?)\b", n)))
+
+
 def categorizar_producto(nombre):
     """Clasifica un producto en una categoría visible.
     Devuelve (categoria, orden_categoria) donde orden_categoria sirve para mostrar primero
     las categorías más importantes."""
     n = normalizar_categoria_nombre(nombre)
+    if not producto_visible_catalogo(nombre):
+        return None, 99
+    def rubro(c):
+        return c, CATEGORIAS_CATALOGO.index(c) + 1
+    # Preparación y presentación prevalecen sobre el ingrediente principal.
+    if re.search(r"\b(consome|caldo)\b", n) or (
+            re.search(r"\b(polvo|molido|molida)\b", n) and
+            re.search(r"\b(ajo|ajos|cebolla|cebollas|curcuma|jengibre|jenjibre|chile|chiles|pimienta|canela)\b", n)):
+        return rubro("ESPECIAS Y CONDIMENTOS")
+    if re.search(r"\bcoco\b", n) and re.search(r"\brallado\b", n):
+        return rubro("ABARROTES Y REPOSTERÍA")
+    if re.search(r"\bcerezas?\b", n) and re.search(r"\b(frasco|almibar|conserva)\b", n):
+        return rubro("ABARROTES Y REPOSTERÍA")
+    if re.search(r"\b(cana|hinojo)\b", n):
+        return rubro("HIERBAS Y AROMÁTICOS")
+    if re.search(r"\b(arandanos?|pasas?|datiles?|datil|frutos secos|frutas? deshidratad[ao]s?)\b", n):
+        return rubro("GRANOS, LEGUMBRES Y SEMILLAS")
+    if re.search(r"\b(nueces|nuez|almendras?|cacahuates?|pistaches?|avellanas?|fruta mixta|japones enchilado)\b", n) and not re.search(r"\b(crema|leche|aceite|harina)\b", n):
+        return rubro("GRANOS, LEGUMBRES Y SEMILLAS")
+    if re.search(r"\b(churros?|churritos?)\b", n):
+        return rubro("ABARROTES Y REPOSTERÍA")
+    if re.search(r"\bpepinillos?(?: persas?)?\b", n):
+        return rubro("VERDURAS")
+    if "canela ceylan" in n:
+        return rubro("ESPECIAS Y CONDIMENTOS")
+    if re.search(r"\baguacates?\b", n) and not re.search(r"\b(aceite|aderezo)\b", n):
+        return rubro("FRUTAS")
     if n in CATEGORIAS_CONFIRMADAS:
         cat = CATEGORIAS_CONFIRMADAS[n]
         return cat, CATEGORIAS_CATALOGO.index(cat) + 1
@@ -4288,7 +4361,7 @@ def categorizar_producto(nombre):
     # El tipo de producto prevalece sobre sabores o ingredientes en el nombre.
     # Rubro confirmado: churros y churritos son botana salada.
     if contiene(["churro", "churros", "churrito", "churritos"]):
-        return categoria("BOTANAS")
+        return categoria("GRANOS, LEGUMBRES Y SEMILLAS")
     if contiene(["agua", "refresco", "refrescos", "jugo", "jugos", "bebida", "bebidas", "epura", "e pura"]):
         return categoria("BEBIDAS")
     if contiene(["papas fritas", "miel", "pan", "azucar", "tortilla", "tortillas", "crema de cacahuate", "crema de almendra", "crema de coco", "granola", "avena", "cereal", "cereales", "maiz palomero",
@@ -4464,7 +4537,12 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
     # Las categorías confirmadas por el usuario prevalecen sobre las reglas.
     productos_con_cat = []
     for prod in productos:
-        cat = prod.get("categoria") or categorizar_producto(prod["nombre"])[0]
+        if not producto_visible_catalogo(prod["nombre"]):
+            continue
+        prod = dict(prod)
+        cat = categorizar_producto(prod["nombre"])[0] or prod.get("categoria")
+        prod["unidad"] = unidad_corregida_catalogo(prod["nombre"], prod["unidad"])
+        prod["nombre"] = nombre_visible_catalogo(prod["nombre"])
         if cat not in CATEGORIAS_CATALOGO:
             raise ValueError("Confirma la categoría de: " + prod["nombre"])
         productos_con_cat.append((CATEGORIAS_CATALOGO.index(cat), cat, prod["nombre"], prod))
@@ -4480,7 +4558,7 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
         productos_por_cat[cat].append(prod)
 
     # Decidir columnas: 1 si pocos productos, 2 si muchos
-    total = len(productos)
+    total = len(productos_con_cat)
     usar_2_columnas = total > 22
 
     # Alturas de elementos
@@ -4945,6 +5023,18 @@ with tab_catalogo:
         seleccionados = st.session_state.catalogo_seleccionados
         precios = st.session_state.precios_dict
 
+        for producto in list(seleccionados):
+            if not producto_visible_catalogo(producto):
+                del seleccionados[producto]
+            else:
+                unidad = unidad_corregida_catalogo(producto, seleccionados[producto])
+                if unidad != seleccionados[producto]:
+                    seleccionados[producto] = unidad
+                    st.session_state.pop(f"sel_unit_{producto}", None)
+        if st.session_state.get("catalogo_revision_rubros") != 2:
+            st.session_state.pop("catalogo_generado", None)
+            st.session_state["catalogo_revision_rubros"] = 2
+
         faltantes = [
             producto
             for producto in seleccionados
@@ -4970,7 +5060,7 @@ with tab_catalogo:
             key="usar_fotos_url",
         )
 
-        productos_ordenados = sorted(st.session_state.precios_dict.keys())
+        productos_ordenados = sorted(p for p in precios if producto_visible_catalogo(p))
 
         # ---- Botones de selección masiva ----
         col_b1, col_b2, col_b3 = st.columns([1.5, 1.5, 1])
@@ -5003,7 +5093,7 @@ with tab_catalogo:
                 "Escribe para buscar...",
                 opciones_busqueda,
                 format_func=lambda x: (
-                    f"{(emoji_para_producto(x) + ' ') if emoji_para_producto(x) else ''}{x.title()} (${st.session_state.precios_dict[x]['precio_venta_kg']:.2f}/{detectar_unidad_producto(x)[0]})"
+                    f"{(emoji_para_producto(x) + ' ') if emoji_para_producto(x) else ''}{nombre_visible_catalogo(x).title()} (${st.session_state.precios_dict[x]['precio_venta_kg']:.2f}/{detectar_unidad_producto(x)[0]})"
                     if x else "Selecciona un producto..."
                 ),
                 key="busqueda_producto",
@@ -5042,7 +5132,7 @@ with tab_catalogo:
                     unidad_nueva = "1 kg"
 
         if producto_a_agregar:
-            if st.button(f"➕ Agregar {producto_a_agregar.title()}", use_container_width=True):
+            if st.button(f"➕ Agregar {nombre_visible_catalogo(producto_a_agregar).title()}", use_container_width=True):
                 st.session_state.catalogo_seleccionados[producto_a_agregar] = unidad_nueva
                 st.rerun()
 
@@ -5068,7 +5158,7 @@ with tab_catalogo:
                 col_n, col_u, col_p, col_x = st.columns([3, 1.5, 1.5, 0.5])
                 with col_n:
                     em = emoji_para_producto(prod)
-                    st.write(f"{em + ' ' if em else ''}{prod.title()}")
+                    st.write(f"{em + ' ' if em else ''}{nombre_visible_catalogo(prod).title()}")
                 with col_u:
                     if admite_frac_prod:
                         # Si la unidad guardada no es válida (de antes), corregir a "1 kg"
@@ -5118,7 +5208,7 @@ with tab_catalogo:
                 else:
                     unidad = f"1 {etiq_unidad.lower()}"
             productos_incluidos.append({
-                "nombre": prod,
+                "nombre": nombre_visible_catalogo(prod),
                 "unidad": unidad,
                 "precio": precio_final,
                 "emoji": emoji_para_producto(prod),
