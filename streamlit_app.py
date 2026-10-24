@@ -11,6 +11,7 @@ import io
 import zipfile
 import os
 from uuid import uuid4
+from copy import deepcopy
 
 # ============================
 # Configuración de página
@@ -38,6 +39,14 @@ DOMICILIO_EMISOR_PREDETERMINADO = {
     "cp": "14370",
 }
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1J3-J_evoyTJcLP94GwixduwD-wFv3zuMjAQX_oBrcPQ/edit"
+
+# Índices de columna desde cero. Cada modalidad consulta una sola pestaña.
+CATALOGOS = {
+    "MENUDEO": {"hoja": "PRECIOS", "producto": 1, "costo": 7, "precio": 8},
+    "DOS V": {"hoja": "DOS V", "producto": 0, "costo": 5, "precio": 7},
+    "MAYOREO": {"hoja": "NEGOCIOS", "producto": 0, "costo": 5, "precio": 7},
+}
+DATOS_POR_CATALOGO = ("pedidos", "gastos_sesion", "historico_guardado_sesion")
 
 CONTACTOS = {
     "IVAN": "55 3497 6860",
@@ -96,65 +105,105 @@ if "pegar_reset_count" not in st.session_state:
     st.session_state.pegar_reset_count = 0
 
 # ============================
-# Carga del catálogo (Google Sheets o CSV local)
+# Carga exclusiva de la hoja seleccionada
 # ============================
 def limpiar_valor(valor):
-    """Conserva la lógica original: coma decimal -> punto decimal."""
+    """Conserva la convención decimal original, pero nunca inventa un cero."""
+    import math
     try:
-        import math
         numero = float(str(valor).replace("$", "").replace(",", ".").strip())
-        return numero if math.isfinite(numero) else 0.0
-    except (ValueError, AttributeError):
-        return 0.0
+    except (ValueError, TypeError):
+        raise ValueError(f"Importe no válido: {valor!r}") from None
+    if not math.isfinite(numero) or numero < 0:
+        raise ValueError(f"Importe no válido: {valor!r}")
+    return numero
 
 
-def catalogo_desde_filas(filas):
+def catalogo_desde_filas(filas, modalidad):
+    config = CATALOGOS[modalidad]
     precios, costos = {}, {}
     for numero_fila, fila in enumerate(filas, start=2):
-        nombre = str(fila[1]).strip().lower() if len(fila) > 1 else ""
+        col_nombre = config["producto"]
+        nombre = str(fila[col_nombre]).strip().lower() if len(fila) > col_nombre else ""
         if not nombre:
             continue
-        if len(fila) < 9 or not str(fila[7]).strip() or not str(fila[8]).strip():
-            raise ValueError(f"Falta costo o precio de {nombre} en la fila {numero_fila} del catálogo.")
-        precios[nombre] = {"precio_venta_kg": limpiar_valor(fila[8])}
-        costos[nombre] = {"costo_kg": limpiar_valor(fila[7])}
+        contexto = f"Hoja {config['hoja']}, fila {numero_fila}, producto {nombre}"
+        if nombre in precios:
+            raise ValueError(f"{contexto}: nombre duplicado. Deja una sola fila por producto.")
+        if len(fila) <= max(config["costo"], config["precio"]):
+            raise ValueError(f"{contexto}: falta costo o precio.")
+        try:
+            costo = limpiar_valor(fila[config["costo"]])
+            precio = limpiar_valor(fila[config["precio"]])
+        except ValueError as error:
+            raise ValueError(f"{contexto}: {error}") from error
+        precios[nombre] = {"precio_venta_kg": precio}
+        costos[nombre] = {"costo_kg": costo}
+    if not precios:
+        raise ValueError(f"La hoja {config['hoja']} no contiene productos válidos desde la fila 2.")
     return precios, costos
 
 
-@st.cache_data(ttl=300, show_spinner="Cargando catálogo desde Google Sheets...")
-def cargar_catalogo_gsheets():
-    """Carga el catálogo desde Google Sheets usando service account en st.secrets."""
+def cargar_catalogo_gsheets(modalidad):
+    """Lee solamente la pestaña elegida, sin caché ni fuentes alternativas."""
+    config = CATALOGOS[modalidad]
     import gspread
     from google.oauth2.service_account import Credentials
-
     creds = Credentials.from_service_account_info(
         dict(st.secrets["gcp_service_account"]),
         scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
     )
     client = gspread.authorize(creds)
-    sheet = client.open_by_url(SPREADSHEET_URL).worksheet("PRECIOS")
-
-    # Leer filas completas: los huecos nunca deben desplazar costos/precios.
-    precios, costos = catalogo_desde_filas(sheet.get_all_values()[1:])
-    return precios, costos
+    sheet = client.open_by_url(SPREADSHEET_URL).worksheet(config["hoja"])
+    return catalogo_desde_filas(sheet.get_all_values(value_render_option="UNFORMATTED_VALUE")[1:], modalidad)
 
 
-def cargar_catalogo_csv(archivo):
-    """Alternativa: cargar desde CSV subido con columnas Producto, Costo, Precio."""
-    df = pd.read_csv(archivo)
-    df.columns = [c.strip().lower() for c in df.columns]
+def limpiar_estado_catalogo():
+    """Descarta precios, borradores, widgets y descargas de la carga anterior."""
+    conservar = set(DATOS_POR_CATALOGO) | {
+        "selector_catalogo", "catalogo_activo", "sesiones_catalogo", "emisor_remision",
+    }
+    for clave in list(st.session_state):
+        if clave not in conservar and not str(clave).startswith("remision_emisor_"):
+            del st.session_state[clave]
+    st.session_state["precios_dict"] = {}
+    st.session_state["costos_dict"] = {}
+    st.session_state["productos_actuales"] = []
+    st.session_state["catalogo_cargado"] = None
+    st.session_state["pegar_reset_count"] = 0
+    st.session_state["factura_reset_count"] = 0
 
-    precios = {}
-    costos = {}
-    for _, row in df.iterrows():
-        if pd.isna(row.get("producto")):
-            continue
-        nombre = str(row.get("producto", "")).strip().lower()
-        if not nombre:
-            continue
-        precios[nombre] = {"precio_venta_kg": limpiar_valor(row.get("precio", 0))}
-        costos[nombre] = {"costo_kg": limpiar_valor(row.get("costo", 0))}
-    return precios, costos
+
+def cambiar_catalogo_activo():
+    """Conserva tickets por modalidad, sin transportar tarifas ni borradores."""
+    anterior = st.session_state.get("catalogo_activo")
+    nuevo = st.session_state["selector_catalogo"]
+    sesiones = st.session_state.setdefault("sesiones_catalogo", {})
+    if anterior in CATALOGOS:
+        sesiones[anterior] = {
+            clave: deepcopy(st.session_state[clave])
+            for clave in DATOS_POR_CATALOGO if clave in st.session_state
+        }
+    limpiar_estado_catalogo()
+    for clave in DATOS_POR_CATALOGO:
+        st.session_state.pop(clave, None)
+    st.session_state.update(deepcopy(sesiones.get(nuevo, {})))
+    st.session_state["catalogo_activo"] = nuevo
+
+
+def recargar_catalogo_activo():
+    # Callback: limpia los widgets antes de que Streamlit vuelva a dibujarlos.
+    limpiar_estado_catalogo()
+    modalidad = st.session_state["catalogo_activo"]
+    try:
+        precios, costos = cargar_catalogo_gsheets(modalidad)
+    except Exception as error:
+        st.session_state["error_catalogo"] = str(error)
+        return
+    # Publicar ambos diccionarios sólo después de validar la hoja completa.
+    st.session_state["precios_dict"] = precios
+    st.session_state["costos_dict"] = costos
+    st.session_state["catalogo_cargado"] = modalidad
 
 
 # ============================
@@ -186,6 +235,109 @@ def _abrir_spreadsheet():
     )
     client = gspread.authorize(creds)
     return client.open_by_url(SPREADSHEET_URL)
+
+
+
+def guardar_producto_en_hoja(modalidad, nombre, costo, precio):
+    """Guarda en la pestaña elegida y sólo publica precios releídos de Sheets."""
+    if (modalidad != st.session_state.get("catalogo_activo")
+            or modalidad != st.session_state.get("selector_catalogo")):
+        raise ValueError("Cambió la lista seleccionada. Vuelve a abrir el formulario.")
+    config = CATALOGOS[modalidad]
+    nombre = str(nombre).strip()
+    clave = nombre.lower()
+    if not nombre:
+        raise ValueError("Escribe el nombre del producto.")
+    costo, precio = limpiar_valor(costo), limpiar_valor(precio)
+    ss = _abrir_spreadsheet()
+    ws = ss.worksheet(config["hoja"])
+    filas = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
+    if not filas or not any(str(v).strip() for v in filas[0]):
+        raise ValueError("La hoja necesita sus encabezados en la fila 1 antes de agregar productos.")
+    col = config["producto"]
+    for numero, fila in enumerate(filas[1:], start=2):
+        if len(fila) > col and str(fila[col]).strip().lower() == clave:
+            raise ValueError(f"{nombre} ya existe en {config['hoja']}, fila {numero}. "
+                "No se duplicó ni se cambiaron sus precios. Recarga la lista para usarlo.")
+
+    # appendCells determina la última fila ocupada en el servidor, incluso con
+    # huecos o fórmulas. No calcula una fila local que pueda sobrescribir datos.
+    celdas = [{} for _ in range(max(config["producto"], config["costo"], config["precio"]) + 1)]
+    celdas[col] = {"userEnteredValue": {"stringValue": nombre}}
+    celdas[config["costo"]] = {"userEnteredValue": {"numberValue": costo}}
+    celdas[config["precio"]] = {"userEnteredValue": {"numberValue": precio}}
+    try:
+        ss.batch_update({"requests": [{"appendCells": {
+            "sheetId": ws.id, "rows": [{"values": celdas}], "fields": "userEnteredValue",
+        }}]})
+    except Exception as error:
+        raise RuntimeError("No se pudo confirmar el guardado en Google Sheets. "
+            "Revisa los permisos de edición y recarga la hoja antes de reintentar; "
+            "no se agregó un precio local.") from error
+
+    # La escritura ya fue confirmada. Una falla de lectura posterior no debe
+    # presentarse como un guardado fallido ni invitar a duplicar el producto.
+    resultado = {"clave": clave, "hoja": config["hoja"], "sincronizado": False}
+    try:
+        filas = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
+        precios, costos = catalogo_desde_filas(filas[1:], modalidad)
+        if clave not in precios:
+            raise ValueError("El producto guardado todavía no aparece en la lectura.")
+        numero = next(i for i, fila in enumerate(filas[1:], start=2)
+            if len(fila) > col and str(fila[col]).strip().lower() == clave)
+    except Exception as error:
+        st.session_state["precios_dict"] = {}
+        st.session_state["costos_dict"] = {}
+        st.session_state["catalogo_cargado"] = None
+        st.session_state.pop("catalogo_generado", None)
+        resultado["aviso"] = (f"Producto guardado en {config['hoja']}, pero no se pudo actualizar "
+            f"el catálogo: {error}. Corrige el problema y pulsa Cargar / Recargar catálogo. "
+            "No vuelvas a registrar este producto.")
+        return resultado
+    st.session_state["precios_dict"] = precios
+    st.session_state["costos_dict"] = costos
+    st.session_state["catalogo_cargado"] = modalidad
+    st.session_state.pop("error_catalogo", None)
+    st.session_state.pop("catalogo_generado", None)
+    resultado.update(sincronizado=True, fila=numero)
+    return resultado
+
+
+def formulario_nuevo_producto(clave_formulario, sugerencia=""):
+    modalidad = st.session_state["catalogo_activo"]
+    config = CATALOGOS[modalidad]
+    st.caption(f"Se guardará en {modalidad} · hoja {config['hoja']}, "
+        "en una fila nueva al final de los datos.")
+    with st.form(f"alta_{modalidad}_{clave_formulario}", clear_on_submit=False):
+        nombre = st.text_input("Nombre del producto", value=sugerencia)
+        costo = st.number_input("Costo por kg ($)", min_value=0.0, step=1.0, format="%.2f")
+        precio = st.number_input("Precio de venta por kg ($)", min_value=0.0, step=1.0, format="%.2f")
+        enviar = st.form_submit_button(f"Guardar producto en {config['hoja']}")
+    if not enviar:
+        return None
+    try:
+        resultado = guardar_producto_en_hoja(modalidad, nombre, costo, precio)
+    except Exception as error:
+        st.error(str(error))
+        return None
+    if not resultado["sincronizado"]:
+        st.warning(resultado["aviso"])
+        st.stop()
+    st.session_state["aviso_producto_guardado"] = (
+        f"{nombre.strip()} guardado en {resultado['hoja']}, fila {resultado['fila']}. "
+        "Catálogo actualizado desde esa hoja.")
+    return resultado["clave"]
+
+
+def formulario_producto_preview(prod, clave_formulario, clave_selector):
+    sugerencia = re.sub(r"^[\d\.\,/]+\s*\w*\s*", "", prod["descripcion_original"]).strip()
+    nuevo = formulario_nuevo_producto(clave_formulario, sugerencia)
+    if nuevo:
+        prod["match"] = nuevo
+        prod["omitido"] = False
+        # El widget ya se dibujó en esta pasada; recrearlo evita un valor anterior.
+        st.session_state.pop(clave_selector, None)
+        st.rerun()
 
 
 def _obtener_o_crear_pestaña(spreadsheet, nombre, headers):
@@ -1255,35 +1407,42 @@ with st.sidebar:
         st.caption("La nota de remisión no sustituye la factura fiscal (CFDI).")
 
     st.subheader("Catálogo")
-    fuente = st.radio(
-        "Fuente del catálogo",
-        ["Google Sheets", "CSV subido"],
-        help="Elige Google Sheets si tienes configurado el service account en secrets, o sube un CSV manualmente.",
+    if "catalogo_activo" not in st.session_state:
+        st.session_state["catalogo_activo"] = "MENUDEO"
+        st.session_state["selector_catalogo"] = "MENUDEO"
+        # Una sesión anterior a esta versión no tiene procedencia verificada.
+        st.session_state["precios_dict"] = {}
+        st.session_state["costos_dict"] = {}
+        st.session_state["catalogo_cargado"] = None
+    modalidad = st.selectbox(
+        "Lista de precios",
+        list(CATALOGOS),
+        key="selector_catalogo",
+        on_change=cambiar_catalogo_activo,
+        help="Cada lista usa exclusivamente su propia hoja del mismo archivo.",
     )
-
-    if fuente == "Google Sheets":
-        if st.button("🔄 Cargar / Recargar catálogo"):
-            try:
-                cargar_catalogo_gsheets.clear()
-                p, c = cargar_catalogo_gsheets()
-                st.session_state.precios_dict = p
-                st.session_state.costos_dict = c
-                st.success(f"✅ {len(p)} productos cargados")
-            except Exception as e:
-                st.error(f"Error: {e}")
-                st.info("Revisa la configuración de secrets o sube un CSV como alternativa.")
+    config_catalogo = CATALOGOS[modalidad]
+    st.caption(f"Hoja: {config_catalogo['hoja']} · "
+        f"Producto: {chr(65 + config_catalogo['producto'])} · "
+        f"Costo/kg: {chr(65 + config_catalogo['costo'])} · "
+        f"Venta/kg: {chr(65 + config_catalogo['precio'])}")
+    st.button("🔄 Cargar / Recargar catálogo", on_click=recargar_catalogo_activo)
+    if st.session_state.get("error_catalogo"):
+        st.error(st.session_state["error_catalogo"])
+        st.info("No se cargaron precios. Corrige la hoja seleccionada o sus permisos y vuelve a cargar.")
+    if st.session_state.get("catalogo_cargado") == modalidad:
+        st.success(f"{modalidad}: {len(st.session_state.precios_dict)} productos cargados")
     else:
-        archivo_csv = st.file_uploader("Sube CSV con columnas: Producto, Costo, Precio", type=["csv"])
-        if archivo_csv is not None:
-            try:
-                p, c = cargar_catalogo_csv(archivo_csv)
-                st.session_state.precios_dict = p
-                st.session_state.costos_dict = c
-                st.success(f"✅ {len(p)} productos cargados")
-            except Exception as e:
-                st.error(f"Error: {e}")
-
-    st.caption(f"Productos en catálogo: **{len(st.session_state.precios_dict)}**")
+        st.info(f"Carga {modalidad} para comenzar. No se usarán precios de otra hoja.")
+    with st.expander("➕ Agregar producto nuevo"):
+        nuevo_guardado = formulario_nuevo_producto("panel_lateral")
+        if nuevo_guardado:
+            st.rerun()
+    if st.session_state.get("aviso_producto_guardado"):
+        st.success(st.session_state.pop("aviso_producto_guardado"))
+    st.caption("Al cambiar de lista se descartan borradores y catálogos generados. "
+        "Los tickets terminados y gastos quedan separados por lista durante esta sesión. "
+        "Los productos nuevos se guardan únicamente en la hoja seleccionada.")
 
     st.divider()
     st.subheader("Sesión")
@@ -1305,8 +1464,11 @@ with st.sidebar:
 # Main: tabs
 # ============================
 st.title("Frutiverdura a Domicilio")
+st.caption(f"Lista activa: {st.session_state['catalogo_activo']} · "
+    f"Hoja: {CATALOGOS[st.session_state['catalogo_activo']]['hoja']}")
 
-if not st.session_state.precios_dict:
+if (st.session_state.get("catalogo_cargado") != st.session_state["catalogo_activo"]
+        or not st.session_state.precios_dict):
     st.warning("⚠️ Primero carga el catálogo desde el panel lateral.")
     st.stop()
 
@@ -1399,6 +1561,13 @@ def parsear_bloque_pedido(texto):
 # Se aplican ANTES del matcher general. Las claves se buscan como palabra completa
 # o como substring si tienen 4+ caracteres.
 ALIASES_PRODUCTOS = {
+    # Variantes de escritura del mismo queso, con y sin prefijo.
+    **{
+        f"{prefijo}{variante}": "queso mozzarella"
+        for prefijo in ("", "queso ", "queso tipo ", "quesos ")
+        for variante in ("mozzarella", "mozarella", "mozarela", "mozzarela",
+                         "muzzarella", "muzzarela", "mosarela", "mozarrella")
+    },
     # Sandía sin semilla
     "sandia sin semilla": "sandia",
     "sandía sin semilla": "sandia",
@@ -1474,8 +1643,8 @@ ALIASES_PRODUCTOS = {
     # Cebolla morada (separada de cebolla blanca)
     "cebolla morada": "cebolla morada",
     "cebollas moradas": "cebolla morada",
-    "cebolla blanca": "cebolla blanca",
-    "cebollas blancas": "cebolla blanca",
+    "cebolla blanca": "cebolla",
+    "cebollas blancas": "cebolla",
     # Productos empacados en bolsa (distintos del fresco a granel)
     "bolsa espinaca": "bolsa espinaca",
     "bolsa de espinaca": "bolsa espinaca",
@@ -1750,15 +1919,15 @@ ALIASES_PRODUCTOS = {
     "mantequilla s/s la gloria": "Mantequilla Sin Sal La Gloria",
     "mantequilla la gloria s/s": "Mantequilla Sin Sal La Gloria",
 
-    # Queso tipo Mozzarella Bonswiss
-    "queso tipo mozzarella bonswiss": "Queso Tipo Mozzarella Bonswiss",
-    "queso mozzarella bonswiss": "Queso Tipo Mozzarella Bonswiss",
-    "mozzarella bonswiss": "Queso Tipo Mozzarella Bonswiss",
-    "queso tipo mozarella bonswiss": "Queso Tipo Mozzarella Bonswiss",
-    "queso mozarella bonswiss": "Queso Tipo Mozzarella Bonswiss",
-    "mozarella bonswiss": "Queso Tipo Mozzarella Bonswiss",
-    "queso mozzarella bon swiss": "Queso Tipo Mozzarella Bonswiss",
-    "mozzarella bon swiss": "Queso Tipo Mozzarella Bonswiss",
+    # La marca explícita conserva su destino específico y tiene prioridad.
+    **{
+        descripcion: "Queso Tipo Mozzarella Bonswiss"
+        for prefijo in ("", "queso ", "queso tipo ", "quesos ")
+        for variante in ("mozzarella", "mozarella", "mozarela", "mozzarela",
+                         "muzzarella", "muzzarela", "mosarela", "mozarrella")
+        for marca in ("bonswiss", "bon swiss")
+        for descripcion in (f"{prefijo}{variante} {marca}", f"{prefijo}{marca} {variante}")
+    },
 
     # Pepperoni Peñaranda
     "pepperoni peñaranda": "Pepperoni Peñaranda",
@@ -2190,7 +2359,7 @@ Laura Canales
                         prod["gramos"] = nuevos_g
                     if not prod.get("omitido"):
                         if prod["match"] is None:
-                            st.error("Producto no encontrado. Asígnalo, créalo o selecciona (omitir).")
+                            st.error("Producto no encontrado en esta lista. Asígnalo, selecciona (omitir) o usa Crear nuevo producto para guardarlo en esta hoja.")
                         if prod["gramos"] <= 0:
                             st.warning("Peso no encontrado o inválido. Captura los gramos o selecciona (omitir).")
 
@@ -2201,43 +2370,9 @@ Laura Canales
                         tarifa = st.session_state.precios_dict[prod["match"]]["precio_venta_kg"]
                         st.caption(f"{prod['gramos']:g} g ÷ 1,000 × ${tarifa:,.2f}/kg = ${linea_base[3]:,.2f} de venta base")
 
-                    # Si el usuario eligió "Crear nuevo producto", mostrar formulario
                     if prod["match"] == "__nuevo__":
-                        sub1, sub2, sub3 = st.columns([2, 1, 1])
-                        with sub1:
-                            sugerencia = re.sub(
-                                r"^[\d\.\,/]+\s*\w*\s*", "", prod["descripcion_original"].lower()
-                            ).strip()
-                            nuevo_nombre = st.text_input(
-                                "Nombre del producto",
-                                value=sugerencia,
-                                key=f"pegar_{rk}_{revision_preview}_new_name_{i}_{j}",
-                            )
-                        with sub2:
-                            nuevo_costo = st.number_input(
-                                "Costo/kg",
-                                min_value=0.0,
-                                step=1.0,
-                                key=f"pegar_{rk}_{revision_preview}_new_costo_{i}_{j}",
-                            )
-                        with sub3:
-                            nuevo_precio = st.number_input(
-                                "Precio/kg",
-                                min_value=0.0,
-                                step=1.0,
-                                key=f"pegar_{rk}_{revision_preview}_new_precio_{i}_{j}",
-                            )
-                        if st.button("Guardar nuevo", key=f"pegar_{rk}_{revision_preview}_save_new_{i}_{j}"):
-                            if nuevo_nombre.strip() and nuevo_costo > 0 and nuevo_precio > 0:
-                                key = nuevo_nombre.strip().lower()
-                                st.session_state.precios_dict[key] = {"precio_venta_kg": nuevo_precio}
-                                st.session_state.costos_dict[key] = {"costo_kg": nuevo_costo}
-                                prod["match"] = key
-                                del st.session_state[f"pegar_{rk}_{revision_preview}_prev_match_{i}_{j}"]
-                                st.success(f"✅ {key.title()} agregado al catálogo")
-                                st.rerun()
-                            else:
-                                st.error("Completa nombre, costo y precio")
+                        formulario_producto_preview(prod, f"pegar_{rk}_{revision_preview}_nuevo_{i}_{j}",
+                            f"pegar_{rk}_{revision_preview}_prev_match_{i}_{j}")
 
                 ped["productos_calculados"] = lineas_desde_preview(ped["productos"],
                     st.session_state.precios_dict, st.session_state.costos_dict)
@@ -2246,7 +2381,6 @@ Laura Canales
                 productos_validos = [
                     p for p in ped["productos"]
                     if p["match"]
-                    and p["match"] != "__nuevo__"
                     and p["match"] in st.session_state.precios_dict
                     and p["match"] in st.session_state.costos_dict
                     and p["gramos"] > 0
@@ -2345,6 +2479,7 @@ Laura Canales
                         **totales,
                     }
                     preparar_remision(pedido)
+                    pedido["catalogo_origen"] = st.session_state["catalogo_activo"]
                     st.session_state.pedidos.append(pedido)
                     generados += 1
 
@@ -2617,7 +2752,7 @@ Laura Canales
                         prod["gramos"] = nuevos_g
                     if not prod.get("omitido"):
                         if prod["match"] is None:
-                            st.error("Producto no encontrado. Asígnalo, créalo o selecciona (omitir).")
+                            st.error("Producto no encontrado en esta lista. Asígnalo, selecciona (omitir) o usa Crear nuevo producto para guardarlo en esta hoja.")
                         if prod["gramos"] <= 0:
                             st.warning("Peso no encontrado o inválido. Captura los gramos o selecciona (omitir).")
 
@@ -2630,43 +2765,9 @@ Laura Canales
                         tarifa = st.session_state.precios_dict[prod["match"]]["precio_venta_kg"]
                         st.caption(f"{prod['gramos']:g} g ÷ 1,000 × ${tarifa:,.2f}/kg = ${linea_base[3]:,.2f} de venta base")
 
-                    # Si el usuario eligió "Crear nuevo producto", mostrar formulario
                     if prod["match"] == "__nuevo__":
-                        sub1, sub2, sub3 = st.columns([2, 1, 1])
-                        with sub1:
-                            sugerencia = re.sub(
-                                r"^[\d\.\,/]+\s*\w*\s*", "", prod["descripcion_original"].lower()
-                            ).strip()
-                            nuevo_nombre = st.text_input(
-                                "Nombre del producto",
-                                value=sugerencia,
-                                key=f"factura_{rk}_new_name_{i}_{j}",
-                            )
-                        with sub2:
-                            nuevo_costo = st.number_input(
-                                "Costo/kg",
-                                min_value=0.0,
-                                step=1.0,
-                                key=f"factura_{rk}_new_costo_{i}_{j}",
-                            )
-                        with sub3:
-                            nuevo_precio = st.number_input(
-                                "Precio/kg",
-                                min_value=0.0,
-                                step=1.0,
-                                key=f"factura_{rk}_new_precio_{i}_{j}",
-                            )
-                        if st.button("Guardar nuevo", key=f"factura_{rk}_save_new_{i}_{j}"):
-                            if nuevo_nombre.strip() and nuevo_costo > 0 and nuevo_precio > 0:
-                                key = nuevo_nombre.strip().lower()
-                                st.session_state.precios_dict[key] = {"precio_venta_kg": nuevo_precio}
-                                st.session_state.costos_dict[key] = {"costo_kg": nuevo_costo}
-                                prod["match"] = key
-                                del st.session_state[f"factura_{rk}_prev_match_{i}_{j}"]
-                                st.success(f"✅ {key.title()} agregado al catálogo")
-                                st.rerun()
-                            else:
-                                st.error("Completa nombre, costo y precio")
+                        formulario_producto_preview(prod, f"factura_{rk}_nuevo_{i}_{j}",
+                            f"factura_{rk}_prev_match_{i}_{j}")
 
                 lineas_factura = []
                 for prod in ped["productos"]:
@@ -2754,6 +2855,7 @@ Laura Canales
                         **totales,
                     }
                     preparar_remision(pedido)
+                    pedido["catalogo_origen"] = st.session_state["catalogo_activo"]
                     st.session_state.pedidos.append(pedido)
                     generados += 1
 
@@ -2798,6 +2900,9 @@ with tab_modificar:
 
         idx_sel = indices_tickets[ticket_seleccionado]
         pedido = st.session_state.pedidos[idx_sel]
+        if pedido.get("catalogo_origen", "MENUDEO") != st.session_state["catalogo_activo"]:
+            st.error("Este ticket pertenece a otra lista. Selecciona su modalidad para modificarlo.")
+            st.stop()
         edit_key = f"{pedido['_ui_id']}_{pedido.get('_ui_revision', 0)}"
 
         col_vista, col_edit = st.columns([1, 1])
@@ -2863,6 +2968,7 @@ with tab_modificar:
                         value=min(99.99, float(pedido["lineas_factura"][0]["incremento_pct"])),
                         key=f"fe_pct_{edit_key}_{rev_factura}")
                     lineas_edit = []
+                    faltan_precios_edit = False
                     for j, linea in enumerate(pedido["lineas_factura"]):
                         opciones_edit = sorted(st.session_state.precios_dict)
                         clave_actual = resolver_clave_catalogo(linea["nombre"], opciones_edit)
@@ -2875,13 +2981,18 @@ with tab_modificar:
                         gramos_edit = st.number_input("Gramos (0 para quitar)", min_value=0.0,
                             value=float(linea["gramos"]), key=f"fe_gr_{edit_key}_{rev_factura}_{j}")
 
-                        if gramos_edit > 0:
+                        if gramos_edit > 0 and nombre_edit not in st.session_state.precios_dict:
+                            faltan_precios_edit = True
+                            st.error("Producto ausente de la hoja actual. Elige uno disponible o usa 0 gramos para quitarlo.")
+                        elif gramos_edit > 0:
                             lineas_edit.append({**linea, "nombre": nombre_edit.title(),
                                 "gramos": gramos_edit, "incremento_pct": pct_edit,
-                                "precio_kg": st.session_state.precios_dict.get(nombre_edit, {}).get("precio_venta_kg", linea["precio_kg"]),
-                                "costo_kg": st.session_state.costos_dict.get(nombre_edit, {}).get("costo_kg", linea["costo_kg"])})
+                                "precio_kg": st.session_state.precios_dict[nombre_edit]["precio_venta_kg"],
+                                "costo_kg": st.session_state.costos_dict[nombre_edit]["costo_kg"]})
                     if st.form_submit_button("Guardar cambios de factura"):
-                        if not lineas_edit:
+                        if faltan_precios_edit:
+                            st.error("No se guardaron cambios: faltan precios en la hoja seleccionada.")
+                        elif not lineas_edit:
                             st.error("Conserva al menos un producto o elimina el ticket completo.")
                         else:
                             try:
@@ -2943,9 +3054,11 @@ with tab_modificar:
 
                         if (nuevos_gr != int(gr) or nombre_edit != clave_actual) and nuevos_gr > 0:
                             key = nombre_edit
-                            if gr > 0:
-                                precio_kg = st.session_state.precios_dict.get(key, {}).get("precio_venta_kg", vta * 1000 / gr)
-                                costo_kg = st.session_state.costos_dict.get(key, {}).get("costo_kg", cto * 1000 / gr)
+                            if key not in st.session_state.precios_dict:
+                                st.error("Producto ausente de la hoja actual. Selecciona uno disponible o elimina la línea.")
+                            elif gr > 0:
+                                precio_kg = st.session_state.precios_dict[key]["precio_venta_kg"]
+                                costo_kg = st.session_state.costos_dict[key]["costo_kg"]
                                 pedido["productos"][i] = (
                                     nombre_edit.title(),
                                     float(nuevos_gr),
@@ -2962,7 +3075,7 @@ with tab_modificar:
                 st.markdown("**Agregar producto**")
                 col_np, col_ng, col_nb = st.columns([3, 1, 1])
                 with col_np:
-                    opciones_prod = [""] + ["➕ Crear nuevo producto"] + sorted(st.session_state.precios_dict.keys())
+                    opciones_prod = ["", "➕ Crear nuevo producto"] + sorted(st.session_state.precios_dict.keys())
                     nuevo_prod = st.selectbox(
                         "Producto",
                         opciones_prod,
@@ -2998,63 +3111,19 @@ with tab_modificar:
                             pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
                             st.rerun()
 
-                # Si eligió "Crear nuevo producto", mostrar formulario inline
                 if nuevo_prod == "➕ Crear nuevo producto":
-                    st.markdown("**Crear producto nuevo y agregarlo al ticket:**")
-                    sub_n, sub_c, sub_v, sub_g, sub_btn = st.columns([2, 1, 1, 1, 1])
-                    with sub_n:
-                        nuevo_nombre = st.text_input(
-                            "Nombre",
-                            key=f"new_name_mod_{edit_key}",
-                            placeholder="ej: papas fritas",
-                        )
-                    with sub_c:
-                        nuevo_costo_kg = st.number_input(
-                            "Costo/kg",
-                            min_value=0.0,
-                            step=1.0,
-                            key=f"new_costo_mod_{edit_key}",
-                        )
-                    with sub_v:
-                        nuevo_precio_kg = st.number_input(
-                            "Precio/kg",
-                            min_value=0.0,
-                            step=1.0,
-                            key=f"new_precio_mod_{edit_key}",
-                        )
-                    with sub_g:
-                        nuevo_g_mod = st.number_input(
-                            "Gramos",
-                            min_value=0,
-                            value=500,
-                            step=50,
-                            key=f"new_g_mod_{edit_key}",
-                        )
-                    with sub_btn:
-                        st.write("")
-                        st.write("")
-                        if st.button("Guardar", key=f"save_new_mod_{edit_key}", use_container_width=True):
-                            if (nuevo_nombre.strip() and nuevo_costo_kg > 0
-                                    and nuevo_precio_kg > 0 and nuevo_g_mod > 0):
-                                key = nuevo_nombre.strip().lower()
-                                # Agregar al catálogo en sesión
-                                st.session_state.precios_dict[key] = {"precio_venta_kg": nuevo_precio_kg}
-                                st.session_state.costos_dict[key] = {"costo_kg": nuevo_costo_kg}
-                                # Agregar al ticket
-                                pedido["productos"].append((
-                                    key.title(),
-                                    float(nuevo_g_mod),
-                                    round(nuevo_g_mod * nuevo_costo_kg / 1000, 2),
-                                    round(nuevo_g_mod * nuevo_precio_kg / 1000, 2),
-                                ))
-                                totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
-                                pedido.update(totales)
-                                pedido["descuento"] = 0.0
-                                st.success(f"✅ {key.title()} creado y agregado al ticket")
-                                pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
-                                st.rerun()
-                            else:
-                                st.error("Completa todos los campos (nombre, costo, precio, gramos)")
+                    if nuevos_g <= 0:
+                        st.warning("Captura los gramos antes de crear y agregar el producto.")
+                    else:
+                        clave_nueva = formulario_nuevo_producto(f"modificar_{edit_key}")
+                        if clave_nueva:
+                            pedido["productos"].append(calcular_linea_catalogo(
+                                clave_nueva, nuevos_g, st.session_state.precios_dict,
+                                st.session_state.costos_dict))
+                            pedido.update(calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0))
+                            pedido["descuento"] = 0.0
+                            pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
+                            st.rerun()
 
             st.divider()
             if st.button("🗑️ Eliminar ticket completo", key=f"del_ticket_{edit_key}"):
@@ -5076,7 +5145,7 @@ with tab_catalogo:
             b_promo.download_button("Descargar promoción PDF", pdf_promo.getvalue(), "promocion_negocios.pdf", "application/pdf")
 
     if not st.session_state.precios_dict:
-        st.warning("⚠️ Carga el catálogo primero (desde Google Sheets o CSV) antes de generar.")
+        st.warning("⚠️ Carga primero la hoja seleccionada desde el panel lateral.")
     else:
         # ---- CONFIGURACIÓN GENERAL ----
         st.markdown("### ⚙️ Configuración del catálogo")
