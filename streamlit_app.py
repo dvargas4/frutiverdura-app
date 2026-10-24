@@ -3381,7 +3381,7 @@ with tab_resumen:
 # ============================
 # Tab 5: Análisis de clientes
 # ============================
-with tab_analisis:
+def mostrar_analisis_clientes():
     st.subheader("📈 Análisis de clientes")
     st.caption(
         "Datos acumulados de todos los pedidos guardados al histórico. "
@@ -3397,7 +3397,7 @@ with tab_analisis:
     resultado = cargar_historico()
     if resultado is None or (isinstance(resultado[0], type(None))):
         st.error(f"No se pudo cargar el histórico: {resultado[1]}")
-        st.stop()
+        return
 
     df_tickets, df_productos = resultado
 
@@ -3406,7 +3406,7 @@ with tab_analisis:
             "Aún no hay datos en el histórico. Genera tickets en Tickets sin factura o "
             "Factura, y dale 'Guardar al histórico' en la pestaña Resumen."
         )
-        st.stop()
+        return
 
     # ---- Filtros temporales ----
     st.markdown("### Filtros")
@@ -3456,7 +3456,7 @@ with tab_analisis:
 
     if df_t.empty:
         st.warning("No hay datos para los filtros seleccionados.")
-        st.stop()
+        return
 
     # ---- KPIs globales ----
     st.divider()
@@ -3779,351 +3779,398 @@ with tab_analisis:
         )
 
 
+with tab_analisis:
+    mostrar_analisis_clientes()
+
+
 # ============================
-# Tab 6: Lista de compra (mayoreo)
+# Tab 6: Lista de compra
 # ============================
-def parsear_linea_compra(linea):
-    """Parsea una línea tipo:
-        '* 5 calabazas'         → ('calabaza', 5, 'pz')
-        '* 1 kg jitomate'       → ('jitomate', 1.0, 'kg')
-        '* 1/2 kg cebolla'      → ('cebolla', 0.5, 'kg')
-        '* 100g arándano'       → ('arandano', 0.1, 'kg')
-        '* 1 manojo cilantro'   → ('cilantro', 1, 'pz')
-        '* 1 cabeza ajos'       → ('ajo', 1, 'pz')
-        '* 1.5k plátano'        → ('platano', 1.5, 'kg')
+UNIDADES_COMPRA = {
+    "kg": "kg", "kgs": "kg", "k": "kg", "kilo": "kg", "kilos": "kg",
+    "g": "g", "gr": "g", "grs": "g", "gramo": "g", "gramos": "g",
+    "l": "L", "lt": "L", "lts": "L", "litro": "L", "litros": "L",
+    "ml": "ml", "mililitro": "ml", "mililitros": "ml",
+    "pz": "pieza", "pza": "pieza", "pzas": "pieza", "pieza": "pieza", "piezas": "pieza",
+    **{variante: unidad for unidad, variantes in {
+        "bolsa": ("bolsa", "bolsas"), "bolsita": ("bolsita", "bolsitas"),
+        "domo": ("domo", "domos"), "domito": ("domito", "domitos"),
+        "caja": ("caja", "cajas"), "cajita": ("cajita", "cajitas"),
+        "cartón": ("carton", "cartones"), "cono": ("cono", "conos"),
+        "manojo": ("manojo", "manojos"), "ramo": ("ramo", "ramos"),
+        "cabeza": ("cabeza", "cabezas"), "penca": ("penca", "pencas"),
+        "lata": ("lata", "latas"), "frasco": ("frasco", "frascos"),
+        "paquete": ("paquete", "paquetes"), "atado": ("atado", "atados"),
+        "racimo": ("racimo", "racimos"), "charola": ("charola", "charolas"),
+    }.items() for variante in variantes},
+}
+PATRON_VINETA_COMPRA = r"^(?:(?:[*•\-]|\d+[.)](?=\s))\s*(?:\[\s*[xX]?\s*\]\s*)?|\[\s*[xX]?\s*\]\s*)"
 
-    Devuelve (producto_normalizado, cantidad, unidad) o None si no parseable.
-    Unidad es 'kg' o 'pz'.
-    """
-    s = linea.strip()
-    if not s:
-        return None
 
-    # Quitar viñetas (*, -, •, [x], 1., 1))
-    s = re.sub(r"^(?:(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX]?\s*\]\s*)?|\[\s*[xX]?\s*\]\s*)", "", s).strip()
-    if not s:
-        return None
+def nombre_producto_compra(descripcion, catalogo_keys):
+    """Equivalencias confirmadas y plurales inequívocos, sin adivinar otra variedad."""
+    limpio = normalizar_producto(descripcion).strip(" .,:;")
+    destino = detectar_alias(limpio)
+    if destino:
+        return resolver_clave_catalogo(destino, catalogo_keys) or normalizar_producto(destino)
+    exacto = resolver_clave_catalogo(limpio, catalogo_keys)
+    if exacto:
+        return exacto
+    def singular(palabra):
+        if palabra.endswith("ces"):
+            return palabra[:-3] + "z"
+        if palabra.endswith(("ones", "anes", "ales", "ores")):
+            return palabra[:-2]
+        if palabra.endswith("s") and len(palabra) > 3:
+            return palabra[:-1]
+        return palabra
+    singularizado = " ".join(singular(p) for p in limpio.split())
+    coincidencias = [k for k in catalogo_keys
+        if " ".join(singular(p) for p in normalizar_producto(k).split()) == singularizado]
+    # Sólo usamos un plural si identifica un único producto de la lista activa.
+    return coincidencias[0] if len(coincidencias) == 1 else limpio
 
-    # Quitar paréntesis al final (gramos comprados, no es lo que pidieron)
-    s = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
-    # Quitar precios
+
+def parsear_linea_compra(linea, catalogo_keys=None):
+    """Cantidad solicitada al inicio; presentación independiente del peso final entre ()."""
+    from fractions import Fraction
+    s = re.sub(PATRON_VINETA_COMPRA, "", linea.strip()).strip()
+    s = s.translate(str.maketrans({"½": " 1/2", "¼": " 1/4", "¾": " 3/4"})).strip()
+    # Sólo quitar el peso numérico final, no observaciones/presentaciones textuales.
+    s = re.sub(r"\s*\(\s*[\d.,]+\s*(?:g|gr|gramos)?\s*\)\s*$", "", s, flags=re.I)
     s = re.sub(r"\$\s*[\d.,]+", "", s)
-    # Quitar emojis
-    s = "".join(c for c in s if c.isascii() or c.isalpha() or c.isspace() or c in "/.")
-    s = re.sub(r"\s+", " ", s).strip()
-    if not s:
-        return None
-
-    # Convertir fracciones tipo "1/2" en su valor decimal AL INICIO
-    # Patrón: número entero opcional + fracción
-    def num_a_float(token):
-        token = token.strip()
-        if "/" in token:
-            try:
-                a, b = token.split("/")
-                return float(a) / float(b)
-            except (ValueError, ZeroDivisionError):
-                return None
-        # Intentar como número simple
-        token_norm = token.replace(",", ".")
-        try:
-            return float(token_norm)
-        except ValueError:
-            return None
-
-    # Buscar la cantidad al inicio. Acepta: "5", "1.5", "1/2", "1 1/2"
-    m = re.match(r"^(\d+\s+\d+/\d+|\d+/\d+|[\d.,]+)\s*(.*)$", s)
+    s = "".join(c for c in s if c.isalnum() or c.isspace() or c in "/.,()-")
+    s = " ".join(s.split())
+    m = re.match(r"^(\d+\s+\d+/\d+|\d+/\d+|\d+(?:[.,]\d+)?)\s*(.*)$", s)
     if not m:
         return None
-    cant_str, resto = m.group(1).strip(), m.group(2).strip()
-
-    # Manejar "1 1/2" (entero + fracción)
-    if " " in cant_str:
-        partes = cant_str.split()
-        cantidad = sum(filter(None, (num_a_float(p) for p in partes)))
-        if cantidad == 0:
-            cantidad = num_a_float(cant_str.split()[0])
-    else:
-        cantidad = num_a_float(cant_str)
-
-    if cantidad is None or cantidad <= 0:
+    numero, resto = m.groups()
+    try:
+        cantidad = float(sum(Fraction(p.replace(",", ".")) for p in numero.split()))
+    except (ValueError, ZeroDivisionError, OverflowError):
         return None
-
-    # Detectar unidad: kg, g, k, o palabras de pieza
-    unidades_kg = ["kg", "kgs", "kilo", "kilos", "k"]
-    unidades_g = ["g", "gr", "grs", "gramos"]
-    palabras_pieza = [
-        "pz", "pza", "pzas", "pieza", "piezas",
-        "manojo", "manojos", "ramo", "ramos",
-        "cabeza", "cabezas",
-        "domo", "domos", "domito", "domitos",
-        "penca", "pencas",
-        "cartón", "carton", "cartones",
-        "cajita", "cajitas", "caja", "cajas",
-        "bolsa", "bolsas", "bolsita", "bolsitas",
-        "lata", "latas", "frasco", "frascos",
-        "atado", "atados", "racimo", "racimos",
-    ]
-
-    # Tomar primera palabra del resto, ver si es unidad
-    primera = resto.split()[0].lower() if resto else ""
-    primera_norm = primera.rstrip(".,;:")
-
-    unidad = None
-    if primera_norm in unidades_kg:
-        unidad = "kg"
-        resto = resto.split(maxsplit=1)[1] if " " in resto else ""
-    elif primera_norm in unidades_g:
-        # gramos -> kg dividiendo entre 1000
-        cantidad = cantidad / 1000
-        unidad = "kg"
-        resto = resto.split(maxsplit=1)[1] if " " in resto else ""
-    elif primera_norm in palabras_pieza:
-        unidad = "pz"
-        resto = resto.split(maxsplit=1)[1] if " " in resto else ""
-    else:
-        # Caso especial: número pegado con "g" o "kg" (ej "100g", "1kg")
-        m2 = re.match(r"^([\d.,/]+)\s*(kg|kgs|k|g|gr)\b\s*(.*)", s, re.IGNORECASE)
-        if m2:
-            num = num_a_float(m2.group(1))
-            uni = m2.group(2).lower()
-            if num and num > 0:
-                if uni in ("g", "gr"):
-                    cantidad = num / 1000
-                    unidad = "kg"
-                else:
-                    cantidad = num
-                    unidad = "kg"
-                resto = m2.group(3).strip()
-        if unidad is None:
-            # Si no se detectó unidad, asumir piezas (ej "5 calabazas")
-            # EXCEPTO si es fracción sola sin unidad: ahí asumir kg (ej "1/2 jamaica")
-            if "/" in cant_str and not cant_str.replace("/", "").replace(" ", "").isdigit() == False:
-                # Es fracción pura como "1/4 jamaica" -> asumir kg
-                unidad = "kg"
-            elif cantidad < 1 and "/" in cant_str:
-                unidad = "kg"
-            else:
-                unidad = "pz"
-
-    # Quitar "de" inicial: "de plátano" -> "plátano"
-    resto = re.sub(r"^de\s+", "", resto, flags=re.IGNORECASE).strip()
-
-    if not resto:
+    if cantidad <= 0 or not resto:
         return None
+    palabras = resto.split(maxsplit=1)
+    primera = normalizar_producto(palabras[0]).rstrip(".")
+    unidad = UNIDADES_COMPRA.get(primera)
+    explicita = unidad is not None
+    if explicita:
+        resto = palabras[1] if len(palabras) > 1 else ""
+    else:
+        unidad = "kg" if "/" in numero else "pieza"
+    if unidad == "g":
+        cantidad, unidad = cantidad / 1000, "kg"
+    elif unidad == "ml":
+        cantidad, unidad = cantidad / 1000, "L"
+    resto = re.sub(r"^de\s+", "", resto, flags=re.I).strip()
 
-    # Aplicar matcher para normalizar a nombre de catálogo
-    catalogo_keys = list(st.session_state.precios_dict.keys()) if st.session_state.precios_dict else []
-    nombre_norm = buscar_match_catalogo(resto, catalogo_keys) if catalogo_keys else None
-    if not nombre_norm:
-        # Si no hay match, usar la descripción limpia (singularizada en español)
-        palabras = resto.lower().split()
-        palabras_limpias = []
-        for p in palabras:
-            # En español:
-            # - palabras terminadas en vocal forman plural con -s (manzana->manzanas, jitomate->jitomates)
-            # - palabras terminadas en consonante forman plural con -es (limón->limones, color->colores)
-            # Para singularizar miramos la letra que queda antes de 's' al quitar la 's' final.
-            if len(p) > 3 and p.endswith("s"):
-                # Quitar 's' tentativamente
-                sin_s = p[:-1]
-                # Si lo que queda termina en 'e' Y la letra antes de la 'e' es consonante,
-                # probablemente venía de un plural -es de palabra terminada en consonante
-                # Ej: 'limones' -> sin_s='limone' -> 'n' antes de 'e' -> quitar 'e' -> 'limon'
-                # Ej: 'jitomates' -> sin_s='jitomate' -> 't' antes de 'e' -> mantener (es 'jitomate')
-                # La diferencia: limón termina en consonante (n) y forma -es. jitomate termina en vocal y forma -s.
-                # Heurística: si la palabra original termina en 'ones', 'anes', 'ales' (consonante+es), quitar 'es'
-                if len(sin_s) > 2 and sin_s.endswith("e"):
-                    # Posibles terminaciones de plural -es: nes, res, les, ces, ses, des, jes
-                    if len(sin_s) >= 3 and sin_s[-2] in "nrlcsdjzpvfbgkmhqtxy":
-                        # Verificar que no sea palabra que naturalmente termina en 'e' + esas letras
-                        # Lista de excepciones (palabras que terminan en consonante+e en singular):
-                        # 'jitomate', 'tomate', 'aguacate', 'chayote', 'elote', 'paquete', 'machete'
-                        # Si la palabra original es 'jitomates', sin_s sería 'jitomate' que es válida.
-                        # Para distinguir: si sin_s sin la 'e' final también es palabra válida, usamos esa.
-                        # Heurística más simple: si la consonante antes de 'e' es l, n, r, s, z, d -> probable plural -es
-                        # Si es t, c -> probable singular ya (jitomate, chayote)
-                        consonante = sin_s[-2]
-                        if consonante in "lnrszd":
-                            palabras_limpias.append(sin_s[:-1])  # quitar 'e' también
-                        else:
-                            palabras_limpias.append(sin_s)
-                    else:
-                        palabras_limpias.append(sin_s)
-                else:
-                    palabras_limpias.append(sin_s)
-            else:
-                palabras_limpias.append(p)
-        nombre_norm = " ".join(palabras_limpias)
+    # Una capacidad explícita distingue, por ejemplo, bolsas de 500 g y de 1 kg.
+    if unidad not in ("kg", "L", "pieza"):
+        capacidad = re.match(r"^(\d+(?:[.,]\d+)?)\s*(kg|g|gr|ml|l|lt|piezas?|pzas?)\b\s*(?:de\s+)?(.+)$", resto, re.I)
+        if capacidad:
+            valor, medida, resto = capacidad.groups()
+            medida = UNIDADES_COMPRA.get(medida.lower(), medida.lower())
+            unidad += f" de {valor.replace(',', '.')} {medida}"
+    # También conservar '2 espinacas en bolsa', sin convertir su presentación.
+    sufijo = re.search(r"\s+en\s+(bolsas?|bolsitas?|domos?|domitos?|cajas?|cartones?|manojos?|paquetes?|charolas?)\s*$", resto, re.I)
+    if sufijo and not explicita:
+        unidad = UNIDADES_COMPRA[normalizar_producto(sufijo.group(1))]
+        resto = resto[:sufijo.start()].strip()
+    if not resto or not any(c.isalpha() for c in resto):
+        return None
+    if catalogo_keys is None:
+        catalogo_keys = list(st.session_state.get("precios_dict", {}))
+    nombre = nombre_producto_compra(resto, catalogo_keys)
+    # Si el catálogo llama 'bolsa espinaca' a la presentación, agrupar bajo
+    # espinaca sólo cuando la unidad ya dice bolsa; nunca perder la presentación.
+    if unidad.split(" de ")[0] in ("bolsa", "domo", "caja", "cartón", "manojo", "paquete"):
+        prefijo = normalizar_producto(unidad.split(" de ")[0]) + " "
+        if normalizar_producto(nombre).startswith(prefijo):
+            nombre = nombre_producto_compra(nombre[len(prefijo):], catalogo_keys)
+    return nombre, cantidad, unidad
 
-    return (nombre_norm, cantidad, unidad)
+
+def construir_lista_compra(texto, catalogo_keys, modalidad):
+    from decimal import Decimal
+    grupos, pendientes = {}, []
+    cliente = "Sin cliente indicado"
+    for numero, linea in enumerate(texto.splitlines(), 1):
+        linea = linea.strip()
+        if not linea:
+            continue
+        tiene_vineta = bool(re.match(PATRON_VINETA_COMPRA, linea))
+        empieza_cantidad = bool(re.match(r"^[\d½¼¾]", linea))
+        if not tiene_vineta and not empieza_cantidad:
+            cliente = re.sub(r"^(?:cliente|pedido)\s*:\s*", "", linea, flags=re.I).strip(" :") or "Sin cliente indicado"
+            continue
+        resultado = parsear_linea_compra(linea, catalogo_keys)
+        if resultado is None:
+            pendientes.append({"linea": numero, "cliente": cliente, "texto": linea})
+            continue
+        nombre, cantidad, unidad = resultado
+        clave = (nombre, unidad)
+        item = grupos.setdefault(clave, {"producto": nombre, "unidad": unidad, "cantidad": Decimal(0),
+            "clientes": {}, "lineas": [], "comprado": False, "cantidad_comprada": 0.0, "observaciones": ""})
+        item["cantidad"] += Decimal(str(cantidad))
+        clave_cliente = normalizar_producto(cliente)
+        detalle = item["clientes"].setdefault(clave_cliente, {"cliente": cliente, "cantidad": Decimal(0)})
+        detalle["cantidad"] += Decimal(str(cantidad))
+        item["lineas"].append({"cliente": cliente, "texto": linea, "linea": numero})
+    items = []
+    for item in grupos.values():
+        item["cantidad"] = float(item["cantidad"])
+        item["clientes"] = [{"cliente": c["cliente"], "cantidad": float(c["cantidad"])} for c in item["clientes"].values()]
+        items.append(item)
+    orden_productos = {nombre: i for i, nombre in enumerate(dict.fromkeys(item["producto"] for item in items))}
+    items.sort(key=lambda item: orden_productos[item["producto"]])
+    return {"version": 2, "modalidad": modalidad, "texto": texto, "items": items, "no_parseables": pendientes}
+
+
+def cantidad_compra_texto(cantidad, unidad):
+    if unidad == "kg" and 0 < cantidad < 1:
+        return f"{cantidad * 1000:g} g"
+    plurales = {"pieza": "piezas", "bolsa": "bolsas", "bolsita": "bolsitas", "domo": "domos",
+        "domito": "domitos", "caja": "cajas", "cajita": "cajitas", "cartón": "cartones", "cono": "conos",
+        "manojo": "manojos", "cabeza": "cabezas", "penca": "pencas", "lata": "latas", "frasco": "frascos",
+        "paquete": "paquetes", "ramo": "ramos", "atado": "atados", "racimo": "racimos", "charola": "charolas"}
+    base, sep, detalle = unidad.partition(" de ")
+    etiqueta = plurales.get(base, base) if cantidad != 1 else base
+    return f"{cantidad:g} {etiqueta}{sep}{detalle}"
+
+
+def filas_exportar_compra(lista):
+    filas = [{"Comprado": "Sí" if i["comprado"] else "No", "Producto": i["producto"].title(),
+        "Presentación": i["unidad"], "Cantidad solicitada": i["cantidad"],
+        "Cantidad comprada": i["cantidad_comprada"],
+        "Faltante": max(0.0, round(i["cantidad"] - i["cantidad_comprada"], 6)),
+        "Clientes": " | ".join(c["cliente"] + ": " + cantidad_compra_texto(c["cantidad"], i["unidad"]) for c in i["clientes"]),
+        "Observaciones": i["observaciones"]} for i in lista["items"]]
+
+
+    for pendiente in lista["no_parseables"]:
+        filas.append({"Comprado": "Revisar", "Producto": pendiente["texto"],
+            "Presentación": "Sin interpretar", "Cantidad solicitada": "", "Cantidad comprada": "", "Faltante": "",
+            "Clientes": pendiente["cliente"], "Observaciones": f"Línea {pendiente['linea']}: no incluida en los totales"})
+    return filas
+
+
+def texto_checklist_compra(lista):
+    lineas = ["LISTA DE COMPRA - " + lista["modalidad"], ""]
+    for item in lista["items"]:
+        marca = "[x]" if item["comprado"] else "[ ]"
+        lineas.append(f"{marca} {item['producto'].title()}: " + cantidad_compra_texto(item["cantidad"], item["unidad"]))
+        for cliente in item["clientes"]:
+            lineas.append("  " + cliente["cliente"] + ": " + cantidad_compra_texto(cliente["cantidad"], item["unidad"]))
+        if item["cantidad_comprada"]:
+            lineas.append("  Comprado: " + cantidad_compra_texto(item["cantidad_comprada"], item["unidad"]))
+        if item["observaciones"]:
+            lineas.append("  Observaciones: " + item["observaciones"])
+        lineas.append("")
+    if lista["no_parseables"]:
+        lineas.append("PENDIENTES DE INTERPRETAR (no incluidos en los totales)")
+        for pendiente in lista["no_parseables"]:
+            lineas.append(f"Línea {pendiente['linea']} - {pendiente['cliente']}: {pendiente['texto']}")
+    return "\n".join(lineas).rstrip()
+
+
+def generar_paginas_compra(lista):
+    """Páginas Carta para imprimir y compartir, con texto envuelto sin recortes."""
+    ancho, alto, margen = 1275, 1650, 80
+    tinta, verde, gris = (35, 45, 40), (36, 88, 60), (95, 105, 100)
+    def fuente(tam, bold=False):
+        ruta = FUENTE_BOLD if bold else FUENTE_REG
+        return ImageFont.truetype(ruta, tam) if ruta else ImageFont.load_default()
+    normal, negrita, pequena = fuente(23), fuente(25, True), fuente(20)
+    paginas, y = [], 0
+    def nueva():
+        nonlocal draw, y
+        imagen = Image.new("RGB", (ancho, alto), "white")
+        paginas.append(imagen); draw = ImageDraw.Draw(imagen)
+        draw.text((margen, 55), "LISTA DE COMPRA", font=fuente(36, True), fill=verde)
+        draw.text((margen, 108), f"Lista: {lista['modalidad']}  |  {len(lista['items'])} productos/presentaciones", font=pequena, fill=gris)
+        draw.line((margen, 150, ancho - margen, 150), fill=verde, width=2)
+        y = 175
+    draw = None
+    nueva()
+    def envolver_compra(valor, font, sangria=45):
+        limite = ancho - 2 * margen - sangria
+        lineas, linea = [], ""
+        # Ajustar por caracteres también soporta nombres largos sin espacios.
+        for palabra in str(valor).split():
+            candidato = (linea + " " + palabra).strip()
+            if draw.textlength(candidato, font=font) <= limite:
+                linea = candidato
+                continue
+            if linea: lineas.append(linea)
+            linea = ""
+            for caracter in palabra:
+                if linea and draw.textlength(linea + caracter, font=font) > limite:
+                    lineas.append(linea); linea = ""
+                linea += caracter
+        if linea: lineas.append(linea)
+        return lineas
+    def texto(valor, font=normal, color=tinta, sangria=45, casilla=None):
+        nonlocal y
+        lineas = envolver_compra(valor, font, sangria)
+        for indice, linea in enumerate(lineas):
+            if y + 38 > alto - 95: nueva()
+            if casilla is not None and indice == 0:
+                draw.rectangle((margen, y + 3, margen + 24, y + 27), outline=verde, width=2)
+                if casilla:
+                    draw.line((margen + 4, y + 15, margen + 10, y + 22, margen + 21, y + 7), fill=verde, width=3)
+            draw.text((margen + sangria, y), linea, font=font, fill=color)
+            y += 34
+    for item in lista["items"]:
+        bloques = [(item["producto"].title() + " | " + cantidad_compra_texto(item["cantidad"], item["unidad"]), negrita, verde)]
+        bloques.append(("Comprado: " + cantidad_compra_texto(item["cantidad_comprada"], item["unidad"]) +
+            "   |   Faltante: " + cantidad_compra_texto(max(0, round(item["cantidad"] - item["cantidad_comprada"], 6)), item["unidad"]), pequena, gris))
+        for cliente in item["clientes"]:
+            bloques.append((cliente["cliente"] + ": " + cantidad_compra_texto(cliente["cantidad"], item["unidad"]), normal, tinta))
+        bloques.append(("Observaciones: " + (item["observaciones"] or "________________________________________"), pequena, gris))
+        altura_item = sum(len(envolver_compra(valor, font)) * 34 for valor, font, _ in bloques) + 12
+        if y + min(altura_item, alto - 95 - 175) > alto - 95:
+            nueva()
+        for indice, (valor, font, color) in enumerate(bloques):
+            texto(valor, font, color, casilla=item["comprado"] if indice == 0 else None)
+        y += 12
+    if lista["no_parseables"]:
+        texto("PENDIENTES DE INTERPRETAR (no incluidos en los totales)", negrita, (150, 65, 25), sangria=0)
+        for pendiente in lista["no_parseables"]:
+            texto(f"Línea {pendiente['linea']} - {pendiente['cliente']}: {pendiente['texto']}")
+    for numero, imagen in enumerate(paginas, 1):
+        d = ImageDraw.Draw(imagen)
+        d.text((margen, alto - 60), f"Página {numero} de {len(paginas)}", font=pequena, fill=gris)
+    return paginas
 
 
 with tab_mayoreo:
-    st.subheader("🛒 Lista de compra al mayoreo")
-    st.caption(
-        "Pega todos los pedidos del día. La app suma piezas y kilos por producto, "
-        "manteniéndolos separados, para que sepas cuánto comprar de cada cosa."
-    )
+    st.subheader("🛒 Lista de compra")
+    st.caption("Pega los pedidos con el nombre de cada cliente arriba. Se suman sólo el mismo producto y presentación. "
+        "Los gramos entre paréntesis al final no sustituyen la cantidad solicitada.")
+    ejemplo = """Laura
+* 1 kg cebolla blanca
+* 2 bolsas de espinaca
+* 1 caja de huevo
 
-    ejemplo = """Lulú Velasco
-* 5 calabazas
-* 5 zanahorias
-* 6 jitomates
-* 6 plátanos
-* 2 papas
+Lulú
+* 2 kg cebolla
+* 1 kg espinaca
+* 1 cartón de huevo
 
-Macry Funez
-* 1 kilo mandarina
-* 1 kilo jitomate
-* 1 kilo zanahoria
-* 1/2 kg cebolla
-
-Abue Lucero
-* 1 kg dominico
-* 6 manzanas golden
-* 1/4 jamaica
-* 100g arándano"""
-
+Macry
+* 500 g cebolla
+* 4 piezas de cebolla
+* 1 bolsa de espinaca"""
     with st.expander("Ver ejemplo de formato"):
         st.code(ejemplo, language="text")
-
-    texto_compra = st.text_area(
-        "Pega los pedidos completos aquí",
-        height=400,
-        placeholder=ejemplo,
-        key="texto_compra",
-    )
-
+        st.caption("Presentaciones: kg, g, piezas, bolsas, domos, cajas, cartones, conos, manojos y otras. "
+            "Ejemplo para distinguir tamaños: 2 bolsas de 500 g espinaca. También admite productos sin viñeta.")
+    texto_compra = st.text_area("Pega los pedidos completos aquí", height=330, placeholder=ejemplo, key="texto_compra")
+    st.caption("Calcular nuevamente reinicia las marcas, cantidades compradas y observaciones de esta lista.")
     if st.button("🧮 Calcular lista de compra", type="primary"):
         if not texto_compra.strip():
             st.warning("Pega al menos un pedido.")
         else:
-            # Acumuladores
-            kg_por_producto = {}
-            pz_por_producto = {}
-            no_parseables = []
-
-            # Procesar línea por línea
-            for linea in texto_compra.split("\n"):
-                linea = linea.strip()
-                if not linea:
-                    continue
-                # Detectar si es viñeta (producto) o nombre (cliente)
-                es_viñeta = bool(re.match(r"^(?:[\*\-\u2022]|\d+[\.\)])", linea))
-                if not es_viñeta:
-                    continue  # nombres de clientes se ignoran
-
-                resultado = parsear_linea_compra(linea)
-                if resultado is None:
-                    no_parseables.append(linea)
-                    continue
-                nombre, cantidad, unidad = resultado
-                if unidad == "kg":
-                    kg_por_producto[nombre] = kg_por_producto.get(nombre, 0) + cantidad
-                else:
-                    pz_por_producto[nombre] = pz_por_producto.get(nombre, 0) + cantidad
-
-            st.session_state["lista_compra"] = {
-                "kg": kg_por_producto,
-                "pz": pz_por_producto,
-                "no_parseables": no_parseables,
-            }
-
-    # Mostrar resultado
-    if "lista_compra" in st.session_state:
-        lc = st.session_state["lista_compra"]
-        kg_dict = lc["kg"]
-        pz_dict = lc["pz"]
-
-        # Combinar todos los productos, ordenados de mayor a menor
-        # Criterio: max(kg, pz) descendente; si están en pz se compara con pz, si en kg con kg.
-        # Como kg suele ser número pequeño (1, 2, 3) y pz puede ser 5-30, ordenamos
-        # por la suma de ambos para tener un ranking justo (kilos cuentan como su valor numérico).
-        productos_con_total = [
-            (p, kg_dict.get(p, 0) + pz_dict.get(p, 0))
-            for p in set(list(kg_dict.keys()) + list(pz_dict.keys()))
-        ]
-        productos_con_total.sort(key=lambda x: x[1], reverse=True)
-        todos_productos = [p for p, _ in productos_con_total]
-
-        if not todos_productos:
-            st.warning("No se detectó nada parseable.")
+            st.session_state["lista_compra"] = construir_lista_compra(texto_compra,
+                list(st.session_state.precios_dict), st.session_state["catalogo_activo"])
+            st.session_state["compra_revision"] = st.session_state.get("compra_revision", 0) + 1
+            # Las nuevas claves evitan heredar casillas de una lista anterior.
+            st.session_state.pop("compra_exportacion", None)
+    lc = st.session_state.get("lista_compra")
+    if lc and lc.get("version") != 2:
+        st.info("Vuelve a calcular tu lista para activar las presentaciones y el desglose por cliente.")
+    elif lc:
+        if texto_compra != lc["texto"]:
+            st.info("Cambiaste el texto. Pulsa Calcular lista de compra para aplicar los cambios.")
+        items = lc["items"]
+        if lc["no_parseables"]:
+            with st.expander(f"⚠️ {len(lc['no_parseables'])} líneas pendientes, sin incluir en los totales", expanded=True):
+                for pendiente in lc["no_parseables"]:
+                    st.write(f"Línea {pendiente['linea']} · {pendiente['cliente']}: {pendiente['texto']}")
+                st.caption("Corrige esas líneas en el texto y vuelve a calcular antes de comprar.")
+        if not items:
+            st.warning("No se detectaron productos con cantidades válidas.")
         else:
-            st.divider()
-            st.markdown("### 📋 Lista de compra consolidada")
-
-            # Tabla con kg y pz separados, ya ordenada
-            filas = []
-            for prod in todos_productos:
-                kg = kg_dict.get(prod, 0)
-                pz = pz_dict.get(prod, 0)
-                filas.append({
-                    "Producto": prod.title(),
-                    "Kilos": f"{kg:.3f} kg" if kg > 0 else "—",
-                    "Piezas": f"{int(pz)} pz" if pz > 0 and pz == int(pz) else (f"{pz:.1f} pz" if pz > 0 else "—"),
-                })
-
-            df_compra = pd.DataFrame(filas)
-            st.dataframe(df_compra, use_container_width=True, hide_index=True)
-
-            # Resumen
-            col_res1, col_res2 = st.columns(2)
-            with col_res1:
-                st.metric("Productos distintos", len(todos_productos))
-            with col_res2:
-                kg_total = sum(kg_dict.values())
-                pz_total = sum(pz_dict.values())
-                st.metric("Total", f"{kg_total:.2f} kg + {int(pz_total)} pz")
-
-            # Vista en dos columnas: solo kg / solo pz
-            col_kg, col_pz = st.columns(2)
-            with col_kg:
-                st.markdown("**🟢 Comprar por kilos**")
-                if kg_dict:
-                    df_kg = pd.DataFrame(
-                        sorted(kg_dict.items(), key=lambda x: -x[1]),
-                        columns=["Producto", "Kilos"],
-                    )
-                    df_kg["Producto"] = df_kg["Producto"].str.title()
-                    df_kg["Kilos"] = df_kg["Kilos"].apply(lambda x: f"{x:.3f}")
-                    st.dataframe(df_kg, use_container_width=True, hide_index=True)
-                else:
-                    st.caption("Nada por kilos")
-
-            with col_pz:
-                st.markdown("**🔵 Comprar por piezas**")
-                if pz_dict:
-                    df_pz = pd.DataFrame(
-                        sorted(pz_dict.items(), key=lambda x: -x[1]),
-                        columns=["Producto", "Piezas"],
-                    )
-                    df_pz["Producto"] = df_pz["Producto"].str.title()
-                    df_pz["Piezas"] = df_pz["Piezas"].apply(
-                        lambda x: f"{int(x)}" if x == int(x) else f"{x:.1f}"
-                    )
-                    st.dataframe(df_pz, use_container_width=True, hide_index=True)
-                else:
-                    st.caption("Nada por piezas")
-
-            # Líneas que no se pudieron parsear
-            if lc["no_parseables"]:
-                with st.expander(f"⚠️ {len(lc['no_parseables'])} líneas no parseables"):
-                    for ln in lc["no_parseables"]:
-                        st.code(ln, language="text")
-
-            # Descargar como CSV
-            csv_compra = df_compra.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "📄 Descargar lista de compra (CSV)",
-                data=csv_compra,
-                file_name="lista_compra.csv",
-                mime="text/csv",
-            )
-
-            if st.button("🗑️ Limpiar"):
-                del st.session_state["lista_compra"]
+            revision = st.session_state.get("compra_revision", 0)
+            # Leer los widgets antes del resumen permite ver el progreso en el mismo rerun.
+            for i, item in enumerate(items):
+                for campo in ("comprado", "cantidad_comprada", "observaciones"):
+                    clave = f"compra_{revision}_{i}_{campo}"
+                    if clave in st.session_state:
+                        item[campo] = st.session_state[clave]
+            completados = sum(i["comprado"] for i in items)
+            st.progress(completados / len(items))
+            a, b, c = st.columns(3)
+            a.metric("Productos", len({i["producto"] for i in items}))
+            b.metric("Presentaciones compradas", f"{completados} / {len(items)}")
+            c.metric("Pendientes", len(items) - completados)
+            st.caption("La casilla marca que terminaste esa compra. Registra por separado la cantidad realmente comprada; "
+                "no se convierten cajas, bolsas ni piezas a kilos.")
+            solo_pendientes = st.checkbox("Mostrar sólo pendientes", key="compra_solo_pendientes")
+            por_producto = {}
+            for i, item in enumerate(items):
+                por_producto.setdefault(item["producto"], []).append((i, item))
+            for producto, registros in por_producto.items():
+                visibles = [(i, item) for i, item in registros if not solo_pendientes or not item["comprado"]]
+                if not visibles: continue
+                resumen = " + ".join(cantidad_compra_texto(item["cantidad"], item["unidad"]) for _, item in registros)
+                estado = "✅" if all(item["comprado"] for _, item in registros) else "🛒"
+                with st.expander(f"{estado} {producto.title()}: {resumen}", expanded=True):
+                    for i, item in visibles:
+                        clave = f"compra_{revision}_{i}_"
+                        col_check, col_cantidad = st.columns([1, 2])
+                        with col_check:
+                            item["comprado"] = st.checkbox("Comprado · " + item["unidad"], value=item["comprado"], key=clave + "comprado")
+                        with col_cantidad:
+                            item["cantidad_comprada"] = st.number_input("Cantidad comprada (" + item["unidad"] + ")",
+                                min_value=0.0, value=float(item["cantidad_comprada"]), step=0.1, format="%.3f", key=clave + "cantidad_comprada")
+                        st.write("**Solicitado:** " + cantidad_compra_texto(item["cantidad"], item["unidad"]) +
+                            " · **Faltante calculado:** " + cantidad_compra_texto(max(0, round(item["cantidad"] - item["cantidad_comprada"], 6)), item["unidad"]))
+                        st.dataframe(pd.DataFrame([{"Cliente": d["cliente"], "Cantidad": cantidad_compra_texto(d["cantidad"], item["unidad"])}
+                            for d in item["clientes"]]), use_container_width=True, hide_index=True)
+                        item["observaciones"] = st.text_input("Observaciones · " + item["unidad"], value=item["observaciones"],
+                            key=clave + "observaciones", placeholder="Faltante, sustitución acordada, proveedor...")
+            if solo_pendientes and completados == len(items):
+                st.success("Toda la lista está marcada como comprada.")
+            if st.button("🗑️ Limpiar lista de compra", key="compra_limpiar"):
+                st.session_state.pop("lista_compra", None)
+                st.session_state.pop("compra_exportacion", None)
                 st.rerun()
+            st.divider()
+            st.markdown("**Copiar y descargar checklist completa**")
+            with st.expander("📋 Copiar lista para WhatsApp, Notas u otra app"):
+                st.caption("Usa el botón de copiar de la esquina superior derecha del texto y pégalo en tu app. "
+                    "También puedes seleccionar el texto desde tu dispositivo.")
+                st.code(texto_checklist_compra(lc), language="text", wrap_lines=True)
+
+            filas = filas_exportar_compra(lc)
+            st.download_button("Descargar CSV", pd.DataFrame(filas).to_csv(index=False).encode("utf-8-sig"),
+                "lista_compra.csv", "text/csv", key="compra_csv")
+            # Una edición invalida las descargas visuales para que reflejen la checklist actual.
+            firma = repr((filas, lc["no_parseables"], lc["modalidad"]))
+            exportacion = st.session_state.get("compra_exportacion")
+            if exportacion and exportacion["firma"] != firma:
+                st.session_state.pop("compra_exportacion", None); exportacion = None
+            if st.button("Preparar PDF e imágenes", key="compra_preparar"):
+                paginas = generar_paginas_compra(lc)
+                pdf, imagenes_zip = io.BytesIO(), io.BytesIO()
+                paginas[0].save(pdf, format="PDF", resolution=150, save_all=True, append_images=paginas[1:])
+                pngs = []
+                with zipfile.ZipFile(imagenes_zip, "w", zipfile.ZIP_DEFLATED) as archivo:
+                    for i, pagina in enumerate(paginas, 1):
+                        buf = io.BytesIO(); pagina.save(buf, format="PNG"); pngs.append(buf.getvalue())
+                        archivo.writestr(f"lista_compra_{i}.png", buf.getvalue())
+                exportacion = {"firma": firma, "pdf": pdf.getvalue(), "pngs": pngs, "zip": imagenes_zip.getvalue()}
+                st.session_state["compra_exportacion"] = exportacion
+            if exportacion:
+                d1, d2 = st.columns(2)
+                d1.download_button("PDF para imprimir", exportacion["pdf"], "lista_compra.pdf", "application/pdf", key="compra_pdf")
+                if len(exportacion["pngs"]) == 1:
+                    d2.download_button("Imagen para WhatsApp", exportacion["pngs"][0], "lista_compra.png", "image/png", key="compra_png")
+                else:
+                    d2.download_button("Imágenes para WhatsApp (ZIP)", exportacion["zip"], "lista_compra_imagenes.zip", "application/zip", key="compra_zip")
+                st.caption("PDF en tamaño Carta. Las descargas incluyen todos los productos y el desglose por cliente.")
 
 
 # ============================
