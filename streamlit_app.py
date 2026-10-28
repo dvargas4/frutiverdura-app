@@ -4372,7 +4372,7 @@ def detectar_unidad_producto(nombre):
         return ("Domo", False)
 
     # 7. Productos que claramente son por pieza
-    if any(re.search(rf"\b{k}\b", n) for k in ["pieza", "piezas", "pza", "pzas",
+    if any(re.search(rf"\b{k}\b", n) for k in ["pieza", "piezas", "pz", "pza", "pzas",
                                                  "unidad", "unidades"]):
         return ("Pieza", False)
 
@@ -4392,6 +4392,8 @@ def unidad_default_producto(nombre):
     etiq, admite_frac = detectar_unidad_producto(nombre)
     if admite_frac:
         return "1 kg"
+    if etiq == "Pieza":
+        return "1 pz"
     # Si la etiqueta ya contiene cantidad (ej "170g"), usarla tal cual sin "1 "
     if etiq[0].isdigit():
         return etiq
@@ -4504,7 +4506,28 @@ def nombre_visible_catalogo(nombre, mostrar_precios=True):
     return visible
 
 
+def opciones_unidad_catalogo(nombre):
+    """Permite elegir pieza expresamente, conservando las presentaciones originales."""
+    etiqueta, fraccionable = detectar_unidad_producto(nombre)
+    if fraccionable:
+        return ["1/4 kg", "1/2 kg", "1 kg", "1 pz"]
+    unidad_fija = etiqueta if etiqueta[0].isdigit() else "1 " + etiqueta.lower()
+    if etiqueta == "Pieza":
+        return ["1 pz"]
+    return [unidad_fija, "1 pz"]
+
+
+def precio_unidad_catalogo(precio_kg, unidad):
+    """Una pieza usa el precio completo de la hoja; sólo se fraccionan los kg."""
+    from decimal import Decimal, ROUND_HALF_UP
+    factor = {"1/4 kg": "0.25", "1/2 kg": "0.5"}.get(unidad, "1")
+    return float((Decimal(str(precio_kg)) * Decimal(factor)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def unidad_corregida_catalogo(nombre, unidad):
+    if unidad in ("1 pz", "pz", "1 pieza", "1 Pieza"):
+        return "1 pz"
     n = normalizar_categoria_nombre(nombre)
     etiqueta, fraccionable = detectar_unidad_producto(nombre)
     if re.search(r"\barandanos?\b", n) and unidad not in ("1/4 kg", "1/2 kg", "1 kg"):
@@ -4902,7 +4925,7 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
                             precio_completo = f"{precio_txt} ½ Kg"
                         elif unidad_raw.startswith("1 "):
                             # ej "1 bolsa", "1 lt" -> "Bolsa", "Lt"
-                            etiq = unidad_raw[2:].capitalize()
+                            etiq = "pz" if unidad_raw == "1 pz" else unidad_raw[2:].capitalize()
                             precio_completo = f"{precio_txt} {etiq}"
                         elif unidad_raw and unidad_raw[0].isdigit():
                             # ej "170g" -> tal cual
@@ -4958,7 +4981,7 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
                     elif unidad_raw == "1/2 kg":
                         precio_completo = f"{precio_txt} ½ Kg"
                     elif unidad_raw.startswith("1 "):
-                        etiq = unidad_raw[2:].capitalize()
+                        etiq = "pz" if unidad_raw == "1 pz" else unidad_raw[2:].capitalize()
                         precio_completo = f"{precio_txt} {etiq}"
                     elif unidad_raw and unidad_raw[0].isdigit():
                         precio_completo = f"{precio_txt} {unidad_raw}"
@@ -5428,43 +5451,27 @@ with tab_catalogo:
                 "Escribe para buscar...",
                 opciones_busqueda,
                 format_func=lambda x: (
-                    f"{(emoji_para_producto(x) + ' ') if emoji_para_producto(x) else ''}{nombre_visible_catalogo(x).title()} (${st.session_state.precios_dict[x]['precio_venta_kg']:.2f}/{detectar_unidad_producto(x)[0]})"
+                    f"{(emoji_para_producto(x) + ' ') if emoji_para_producto(x) else ''}{nombre_visible_catalogo(x).title()} (${st.session_state.precios_dict[x]['precio_venta_kg']:.2f} precio base)"
                     if x else "Selecciona un producto..."
                 ),
                 key="busqueda_producto",
                 label_visibility="collapsed",
             )
         with col_unidad:
-            # Solo mostrar selector de fracciones si el producto admite kg fraccionable
-            admite_frac = False
+            unidad_nueva = "1 kg"
             if producto_a_agregar:
-                _, admite_frac = detectar_unidad_producto(producto_a_agregar)
+                opciones_unidad = opciones_unidad_catalogo(producto_a_agregar)
+                predeterminada = unidad_corregida_catalogo(
+                    producto_a_agregar, unidad_default_producto(producto_a_agregar))
+                indice = opciones_unidad.index(predeterminada) if predeterminada in opciones_unidad else 0
+                unidad_nueva = st.selectbox("Unidad de venta", opciones_unidad, index=indice,
+                    format_func=lambda u: "pz" if u == "1 pz" else u,
+                    key=f"unidad_nueva_{producto_a_agregar}")
 
-            if admite_frac:
-                # Para productos que admiten fracciones, usar el default del producto (ej fresa = 1/2 kg)
-                default_unidad = unidad_default_producto(producto_a_agregar) if producto_a_agregar else "1 kg"
-                opciones_frac = ["1/4 kg", "1/2 kg", "1 kg"]
-                idx_default = opciones_frac.index(default_unidad) if default_unidad in opciones_frac else 2
-                unidad_nueva = st.selectbox(
-                    "Unidad",
-                    opciones_frac,
-                    index=idx_default,
-                    key="unidad_nueva",
-                    label_visibility="collapsed",
-                )
-            else:
-                if producto_a_agregar:
-                    etiq, _ = detectar_unidad_producto(producto_a_agregar)
-                    # Si etiq empieza con dígito (ej "170g"), no prefijar "1"
-                    if etiq[0].isdigit():
-                        unidad_nueva = etiq
-                        display = etiq
-                    else:
-                        unidad_nueva = f"1 {etiq.lower()}"
-                        display = f"1 {etiq}"
-                    st.markdown(f"<div style='padding-top: 8px; color: #888;'>{display}</div>", unsafe_allow_html=True)
-                else:
-                    unidad_nueva = "1 kg"
+        if producto_a_agregar and unidad_nueva == "1 pz":
+            precio_pieza = precio_unidad_catalogo(
+                st.session_state.precios_dict[producto_a_agregar]["precio_venta_kg"], unidad_nueva)
+            st.caption(f"${precio_pieza:,.2f} por pz. Se utiliza el precio completo de la hoja, sin fraccionarlo.")
 
         if producto_a_agregar:
             if st.button(f"➕ Agregar {nombre_visible_catalogo(producto_a_agregar).title()}", use_container_width=True):
@@ -5480,44 +5487,24 @@ with tab_catalogo:
             for prod in seleccionados_ordenados:
                 precio_kg = st.session_state.precios_dict[prod]["precio_venta_kg"]
                 unidad_actual = st.session_state.catalogo_seleccionados[prod]
-                etiq_unidad, admite_frac_prod = detectar_unidad_producto(prod)
-
-                # Calcular precio según unidad
-                if admite_frac_prod and unidad_actual in ["1/4 kg", "1/2 kg", "1 kg"]:
-                    factor = {"1/4 kg": 0.25, "1/2 kg": 0.5, "1 kg": 1.0}[unidad_actual]
-                    precio_final = precio_kg * factor
-                else:
-                    # Unidad fija: el precio es el del producto tal cual (no se multiplica)
-                    precio_final = precio_kg
+                precio_final = precio_unidad_catalogo(precio_kg, unidad_actual)
 
                 col_n, col_u, col_p, col_x = st.columns([3, 1.5, 1.5, 0.5])
                 with col_n:
                     em = emoji_para_producto(prod)
                     st.write(f"{em + ' ' if em else ''}{nombre_visible_catalogo(prod).title()}")
                 with col_u:
-                    if admite_frac_prod:
-                        # Si la unidad guardada no es válida (de antes), corregir a "1 kg"
-                        opciones_unidad = ["1/4 kg", "1/2 kg", "1 kg"]
-                        idx = opciones_unidad.index(unidad_actual) if unidad_actual in opciones_unidad else 2
-                        nueva_u = st.selectbox(
-                            "u",
-                            opciones_unidad,
-                            index=idx,
-                            key=f"sel_unit_{prod}",
-                            label_visibility="collapsed",
-                        )
-                        if nueva_u != unidad_actual:
-                            st.session_state.catalogo_seleccionados[prod] = nueva_u
-                            st.rerun()
-                    else:
-                        # Producto con unidad fija: solo mostrar la etiqueta
-                        if etiq_unidad[0].isdigit():
-                            display = etiq_unidad
-                        else:
-                            display = f"1 {etiq_unidad}"
-                        st.markdown(f"<div style='padding-top: 8px;'>{display}</div>", unsafe_allow_html=True)
+                    opciones_unidad = opciones_unidad_catalogo(prod)
+                    idx = opciones_unidad.index(unidad_actual) if unidad_actual in opciones_unidad else 0
+                    nueva_u = st.selectbox("Unidad de venta", opciones_unidad, index=idx,
+                        format_func=lambda u: "pz" if u == "1 pz" else u,
+                        key=f"sel_unit_{prod}", label_visibility="collapsed")
+                    if nueva_u != unidad_actual:
+                        st.session_state.catalogo_seleccionados[prod] = nueva_u
+                        st.rerun()
                 with col_p:
-                    st.write(f"**${precio_final:,.2f}**")
+                    sufijo = " / pz" if unidad_actual == "1 pz" else ""
+                    st.write(f"**${precio_final:,.2f}{sufijo}**")
                 with col_x:
                     if st.button("🗑️", key=f"del_{prod}", help="Quitar del catálogo"):
                         del st.session_state.catalogo_seleccionados[prod]
@@ -5530,18 +5517,9 @@ with tab_catalogo:
         productos_incluidos = []
         for prod in sorted(st.session_state.catalogo_seleccionados.keys()):
             unidad = st.session_state.catalogo_seleccionados[prod]
-            etiq_unidad, admite_frac_prod = detectar_unidad_producto(prod)
+            unidad = unidad_corregida_catalogo(prod, unidad)
             precio_kg = st.session_state.precios_dict[prod]["precio_venta_kg"]
-            if admite_frac_prod and unidad in ["1/4 kg", "1/2 kg", "1 kg"]:
-                factor = {"1/4 kg": 0.25, "1/2 kg": 0.5, "1 kg": 1.0}[unidad]
-                precio_final = precio_kg * factor
-            else:
-                precio_final = precio_kg
-                # Si la etiqueta ya incluye cantidad (ej "170g"), usar tal cual
-                if etiq_unidad[0].isdigit():
-                    unidad = etiq_unidad
-                else:
-                    unidad = f"1 {etiq_unidad.lower()}"
+            precio_final = precio_unidad_catalogo(precio_kg, unidad)
             productos_incluidos.append({
                 "nombre": nombre_visible_catalogo(prod),
                 "unidad": unidad,
