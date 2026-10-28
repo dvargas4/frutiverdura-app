@@ -27,6 +27,8 @@ st.set_page_config(
 # Constantes
 # ============================
 COSTO_ENVIO = 35
+UMBRAL_ENVIO_GRATIS_KG = 35
+DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 UTILIDAD_MINIMA_PCT = 0.25
 MIN_PRODUCTOS_DESCUENTO = 5
 ZONA_HORARIA = "America/Mexico_City"
@@ -162,6 +164,7 @@ def limpiar_estado_catalogo():
     """Descarta precios, borradores, widgets y descargas de la carga anterior."""
     conservar = set(DATOS_POR_CATALOGO) | {
         "selector_catalogo", "catalogo_activo", "sesiones_catalogo", "emisor_remision",
+        "config_envio_negocios",
     }
     for clave in list(st.session_state):
         if clave not in conservar and not str(clave).startswith("remision_emisor_"):
@@ -549,13 +552,44 @@ def editar_gramos_preview(prod, clave):
         key=clave, label_visibility="collapsed")
 
 
-def calcular_totales(productos, lleva_envio, descuento=0.0):
+def tarifa_envio_actual():
+    if st.session_state.get("catalogo_activo") == "MAYOREO":
+        return float(st.session_state.get("config_envio_negocios", COSTO_ENVIO))
+    return float(COSTO_ENVIO)
+
+
+def resolver_envio(gramos, lleva_envio, modalidad, tarifa):
+    """El límite es estricto: 35 kg pagan; más de 35 kg no pagan en negocios."""
+    from decimal import Decimal, ROUND_HALF_UP
+    peso = sum((Decimal(str(g)) for g in gramos), Decimal(0)) / 1000
+    importe = Decimal(str(tarifa))
+    if not peso.is_finite() or peso < 0 or not importe.is_finite() or importe < 0:
+        raise ValueError("Peso y tarifa de envío deben ser finitos y no negativos.")
+    gratis = bool(lleva_envio and modalidad == "MAYOREO" and peso > UMBRAL_ENVIO_GRATIS_KG)
+    cobro = importe if lleva_envio and not gratis else Decimal(0)
+    return float(cobro.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)), gratis, float(peso)
+
+
+def totales_pedido(pedido, descuento=None):
+    """Usa la tarifa guardada del pedido, aunque se cambie la configuración."""
+    return calcular_totales(pedido["productos"],
+        pedido["lleva_envio"] and pedido.get("tipo") != "factura",
+        pedido.get("descuento", 0.0) if descuento is None else descuento,
+        modalidad=pedido.get("catalogo_origen", "MENUDEO"),
+        tarifa_envio=pedido.get("tarifa_envio", COSTO_ENVIO))
+
+
+def calcular_totales(productos, lleva_envio, descuento=0.0, modalidad=None, tarifa_envio=None):
     from decimal import Decimal, ROUND_HALF_UP
     def dinero(valor):
         return Decimal(str(valor)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     subtotal_costo = sum((dinero(p[2]) for p in productos), Decimal(0))
     subtotal_venta = sum((dinero(p[3]) for p in productos), Decimal(0))
-    costo_envio = dinero(COSTO_ENVIO if lleva_envio else 0)
+    modalidad = modalidad or st.session_state.get("catalogo_activo", "MENUDEO")
+    tarifa_envio = tarifa_envio_actual() if tarifa_envio is None else tarifa_envio
+    importe_envio, envio_gratis, peso_kg = resolver_envio(
+        (p[1] for p in productos), lleva_envio, modalidad, tarifa_envio)
+    costo_envio = dinero(importe_envio)
     total_venta = subtotal_venta + costo_envio
     nuevo_total = total_venta - dinero(descuento)
     utilidad = nuevo_total - subtotal_costo
@@ -566,6 +600,10 @@ def calcular_totales(productos, lleva_envio, descuento=0.0):
         "subtotal_costo": subtotal_costo,
         "subtotal_venta": subtotal_venta,
         "costo_envio": costo_envio,
+        "tarifa_envio": float(tarifa_envio),
+        "catalogo_origen": modalidad,
+        "envio_gratis": envio_gratis,
+        "peso_kg": peso_kg,
         "total_venta": total_venta,
         "nuevo_total": nuevo_total,
         "utilidad": utilidad,
@@ -578,7 +616,7 @@ def calcular_totales(productos, lleva_envio, descuento=0.0):
 # ============================
 
 # Factura: importes internos, integrados en las líneas de producto.
-def calcular_productos_factura(lineas, envio=0.0, comision=0.0):
+def calcular_productos_factura(lineas, envio=0.0, comision=0.0, modalidad=None):
     """Ajusta costos y prorratea cargos en centavos sin alterar el catálogo.
 
     Cada línea contiene nombre, gramos, costo_kg, precio_kg e incremento_pct.
@@ -610,7 +648,9 @@ def calcular_productos_factura(lineas, envio=0.0, comision=0.0):
         aumento_costo = costo_ajustado - centavos(costo_base)
         costos.append(costo_ajustado)
         bases.append(centavos(gramos * numero(linea["precio_kg"]) / 1000) + aumento_costo)
-    extras = centavos(numero(envio)) + centavos(numero(comision))
+    modalidad = modalidad or st.session_state.get("catalogo_activo", "MENUDEO")
+    envio_aplicado, _, _ = resolver_envio(cantidades, True, modalidad, numero(envio))
+    extras = centavos(numero(envio_aplicado)) + centavos(numero(comision))
     if not lineas:
         if extras:
             raise ValueError("Agrega productos antes de distribuir el adicional a la venta o la comisión.")
@@ -665,7 +705,7 @@ def generar_ticket_normal_png(pedido, _para_pdf=False):
     totales abajo a la derecha.
     """
     productos = pedido["productos"]
-    totales = calcular_totales(productos, pedido["lleva_envio"], pedido["descuento"])
+    totales = totales_pedido(pedido)
 
     # ---- Configuración de fuentes ----
     try:
@@ -914,7 +954,7 @@ def generar_remision_png(pedido, _para_pdf=False):
     """
     preparar_remision(pedido)
     productos = pedido["productos"]
-    totales = calcular_totales(productos, pedido["lleva_envio"], pedido["descuento"])
+    totales = totales_pedido(pedido)
 
     # ---- Configuración de fuentes ----
     try:
@@ -1421,6 +1461,14 @@ with st.sidebar:
         on_change=cambiar_catalogo_activo,
         help="Cada lista usa exclusivamente su propia hoja del mismo archivo.",
     )
+    if modalidad == "MAYOREO":
+        st.subheader("Envío para negocios")
+        st.session_state["config_envio_negocios"] = st.number_input(
+            "Tarifa de envío ($)", min_value=0.0,
+            value=float(st.session_state.get("config_envio_negocios", COSTO_ENVIO)),
+            step=1.0, format="%.2f", key="tarifa_envio_negocios_widget")
+        st.caption("Envío gratis en pedidos de más de 35 kg. Con 35 kg o menos se cobra esta tarifa. "
+                   "Aplica al catálogo y a los pedidos nuevos. Se conserva durante esta sesión.")
     config_catalogo = CATALOGOS[modalidad]
     st.caption(f"Hoja: {config_catalogo['hoja']} · "
         f"Producto: {chr(65 + config_catalogo['producto'])} · "
@@ -2396,7 +2444,8 @@ Laura Canales
                         (p["gramos"] * st.session_state.precios_dict[p["match"]]["precio_venta_kg"]) / 1000
                         for p in productos_validos
                     )
-                    costo_envio_prev = COSTO_ENVIO if ped["lleva_envio"] else 0
+                    costo_envio_prev = calcular_totales(
+                        ped["productos_calculados"], ped["lleva_envio"])["costo_envio"]
                     utilidad_prev = subtotal_venta_prev + costo_envio_prev - subtotal_costo_prev
                     util_min = subtotal_costo_prev * UTILIDAD_MINIMA_PCT
                     max_descuento = utilidad_prev - util_min
@@ -2422,6 +2471,10 @@ Laura Canales
                 resumen = calcular_totales(ped["productos_calculados"],
                     ped["lleva_envio"], ped.get("descuento", 0.0))
                 st.metric("Total del pedido", f"${resumen['nuevo_total']:,.2f}")
+                if ped["lleva_envio"]:
+                    st.caption(f"Peso del pedido: {resumen['peso_kg']:g} kg · " +
+                        ("Envío gratis por superar 35 kg" if resumen["envio_gratis"] else
+                         f"Envío: ${resumen['costo_envio']:,.2f}"))
 
         st.divider()
 
@@ -2522,7 +2575,8 @@ with tab_factura:
         step=1.0, key=f"factura_{rk}_incremento_default",
         help="Ejemplo: $8,400 ÷ (1 − 16%) = $10,000. Se aplica a todos los productos del pedido.")
     envio_default = st.number_input(
-        "2. Envío a integrar en los precios ($)", min_value=0.0, value=0.0, step=1.0,
+        "2. Envío a integrar en los precios ($)", min_value=0.0,
+        value=tarifa_envio_actual() if st.session_state["catalogo_activo"] == "MAYOREO" else 0.0, step=1.0,
         key=f"factura_{rk}_envio_default", on_change=actualizar_cargo_factura,
         args=(rk, "envio_integrado", "prev_envio", f"factura_{rk}_envio_default"))
     comision_default = st.number_input(
@@ -2790,6 +2844,12 @@ Laura Canales
                         lineas_factura, ped["envio_integrado"], ped["comision_integrada"])
                     if ped["productos_calculados"]:
                         mostrar_resumen_factura(ped["productos_calculados"])
+                        envio_cobrado, envio_gratis, peso_kg = resolver_envio(
+                            (p["gramos"] for p in lineas_factura), True,
+                            st.session_state["catalogo_activo"], ped["envio_integrado"])
+                        st.caption(f"Peso: {peso_kg:g} kg · " +
+                            ("Envío gratis por superar 35 kg" if envio_gratis else
+                             f"Envío integrado: ${envio_cobrado:,.2f}"))
                 except ValueError as error:
                     ped["error_calculo"] = True
                     st.error(str(error))
@@ -2996,7 +3056,8 @@ with tab_modificar:
                             st.error("Conserva al menos un producto o elimina el ticket completo.")
                         else:
                             try:
-                                productos_edit = calcular_productos_factura(lineas_edit, envio_edit, comision_edit)
+                                productos_edit = calcular_productos_factura(lineas_edit, envio_edit, comision_edit,
+                                    modalidad=pedido.get("catalogo_origen", "MENUDEO"))
                             except ValueError as error:
                                 st.error(str(error))
                             else:
@@ -3004,23 +3065,27 @@ with tab_modificar:
                                     envio_integrado=envio_edit, comision_integrada=comision_edit,
                                     lleva_envio=False, descuento=0.0)
                                 pedido["revision_factura"] = rev_factura + 1
-                                pedido.update(calcular_totales(productos_edit, False))
+                                pedido.update(totales_pedido(pedido, descuento=0.0))
                                 pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
                                 st.rerun()
                 mostrar_resumen_factura(pedido["productos"])
             else:
                 # Cambiar envío
                 nuevo_envio = st.checkbox(
-                    "Lleva envío (+$35)", value=pedido["lleva_envio"], key=f"envio_{edit_key}"
+                    "Lleva envío", value=pedido["lleva_envio"], key=f"envio_{edit_key}"
                 )
                 if nuevo_envio != pedido["lleva_envio"]:
                     pedido["lleva_envio"] = nuevo_envio
-                    totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
+                    totales = totales_pedido(pedido, descuento=0.0)
                     pedido.update(totales)
                     pedido["descuento"] = 0.0
                     pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
                     st.rerun()
 
+                resumen_envio = totales_pedido(pedido)
+                st.caption(f"Peso: {resumen_envio['peso_kg']:g} kg · " +
+                    ("Envío gratis por superar 35 kg" if resumen_envio["envio_gratis"] else
+                     f"Envío: ${resumen_envio['costo_envio']:,.2f}"))
                 st.markdown("**Productos del ticket**")
                 if pedido["productos"]:
                     for i, (nombre, gr, cto, vta) in enumerate(pedido["productos"]):
@@ -3044,7 +3109,7 @@ with tab_modificar:
                         with col_b:
                             if st.button("🗑️", key=f"del_{edit_key}_{i}"):
                                 pedido["productos"].pop(i)
-                                totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
+                                totales = totales_pedido(pedido, descuento=0.0)
                                 pedido.update(totales)
                                 pedido["descuento"] = 0.0
                                 if not pedido["productos"]:
@@ -3065,7 +3130,7 @@ with tab_modificar:
                                     round(nuevos_gr * costo_kg / 1000, 2),
                                     round(nuevos_gr * precio_kg / 1000, 2),
                                 )
-                                totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
+                                totales = totales_pedido(pedido, descuento=0.0)
                                 pedido.update(totales)
                                 pedido["descuento"] = 0.0
                                 pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
@@ -3105,7 +3170,7 @@ with tab_modificar:
                                     round(nuevos_g * precio_kg / 1000, 2),
                                 )
                             )
-                            totales = calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0)
+                            totales = totales_pedido(pedido, descuento=0.0)
                             pedido.update(totales)
                             pedido["descuento"] = 0.0
                             pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
@@ -3120,7 +3185,7 @@ with tab_modificar:
                             pedido["productos"].append(calcular_linea_catalogo(
                                 clave_nueva, nuevos_g, st.session_state.precios_dict,
                                 st.session_state.costos_dict))
-                            pedido.update(calcular_totales(pedido["productos"], pedido["lleva_envio"], 0.0))
+                            pedido.update(totales_pedido(pedido, descuento=0.0))
                             pedido["descuento"] = 0.0
                             pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
                             st.rerun()
@@ -4619,7 +4684,7 @@ def categorizar_producto(nombre):
     return (None, 99)  # Pedir categoría; nunca publicar una sección genérica.
 
 
-def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entrega, frase, ancho=900, mostrar_precios=True, dos_columnas=None):
+def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entrega, frase, ancho=900, mostrar_precios=True, dos_columnas=None, tarifa_envio=COSTO_ENVIO, es_negocios=False):
     """Genera el catálogo en una o más páginas con diseño elegante por categorías.
     Compacta automáticamente: 1 columna si hay pocos productos, 2 columnas si hay muchos."""
 
@@ -4714,7 +4779,7 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
     espacio_top_lista = 30
     alto_fila = 28 if usar_2_columnas else 32
     alto_separador_cat = 50
-    bloque_envio_h = 240
+    bloque_envio_h = 600 if es_negocios else 240
     footer_h = 60
 
     # Calcular cuántos productos caben por página
@@ -4936,41 +5001,66 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
                 y += 22
             y += 30
 
-            # Bloque "ENTREGA DÍAS + $35 envío"
-            bloque_y = y
-            # Lado izquierdo: ENTREGA DÍAS
-            entrega_x = ancho // 2 - 180
-            draw.text((entrega_x, bloque_y), "ENTREGA", fill=NEGRO, font=f_envio_big)
-            draw.text((entrega_x, bloque_y + 30), "DÍAS", fill=NEGRO, font=f_envio_big)
-            draw.text((entrega_x, bloque_y + 60), DIAS_MAYUS, fill=NEGRO, font=f_envio_big)
-
-            # Signo "+" en medio
-            draw.text((ancho // 2 - 15, bloque_y + 30), "+", fill=NEGRO, font=f_titulo)
-
-            # Lado derecho: círculo con "$35 de envío"
-            circulo_cx = ancho // 2 + 130
-            circulo_cy = bloque_y + 55
-            circulo_r = 55
-            draw.ellipse(
-                [circulo_cx - circulo_r, circulo_cy - circulo_r,
-                 circulo_cx + circulo_r, circulo_cy + circulo_r],
-                fill=NEGRO,
-            )
-            # Texto blanco centrado en el círculo
-            envio_l1 = "$35" if mostrar_precios else "Envío"
-            envio_l2 = "de envío" if mostrar_precios else "Consultar"
-            bbox1 = draw.textbbox((0, 0), envio_l1, font=f_envio_circ)
-            bbox2 = draw.textbbox((0, 0), envio_l2, font=font(13, bold=True))
-            draw.text(
-                (circulo_cx - (bbox1[2] - bbox1[0]) // 2, circulo_cy - 22),
-                envio_l1, fill=BLANCO, font=f_envio_circ
-            )
-            draw.text(
-                (circulo_cx - (bbox2[2] - bbox2[0]) // 2, circulo_cy + 8),
-                envio_l2, fill=BLANCO, font=font(13, bold=True)
-            )
-
-            y = bloque_y + 130
+            if es_negocios:
+                textos_entrega = [
+                    ("ENTREGAS: " + DIAS_MAYUS, f_envio_big, NEGRO),
+                    (f"ENVÍO: ${tarifa_envio:,.2f}", f_envio_big, NEGRO),
+                    ("ENVÍO GRATIS EN PEDIDOS DE MÁS DE 35 KG", f_envio_big, VERDE_PROFUNDO),
+                ]
+                for texto, fuente, color in textos_entrega:
+                    lineas = []
+                    linea = ""
+                    for palabra in texto.split():
+                        propuesta = (linea + " " + palabra).strip()
+                        if draw.textbbox((0, 0), propuesta, font=fuente)[2] > ancho - 120 and linea:
+                            lineas.append(linea)
+                            linea = palabra
+                        else:
+                            linea = propuesta
+                    if linea:
+                        lineas.append(linea)
+                    for linea in lineas:
+                        bbox = draw.textbbox((0, 0), linea, font=fuente)
+                        draw.text(((ancho - bbox[2] + bbox[0]) // 2, y), linea, fill=color, font=fuente)
+                        y += 28
+                    y += 12
+                y += 8
+            else:
+                # Bloque "ENTREGA DÍAS + $35 envío"
+                bloque_y = y
+                # Lado izquierdo: ENTREGA DÍAS
+                entrega_x = ancho // 2 - 180
+                draw.text((entrega_x, bloque_y), "ENTREGA", fill=NEGRO, font=f_envio_big)
+                draw.text((entrega_x, bloque_y + 30), "DÍAS", fill=NEGRO, font=f_envio_big)
+                draw.text((entrega_x, bloque_y + 60), DIAS_MAYUS, fill=NEGRO, font=f_envio_big)
+    
+                # Signo "+" en medio
+                draw.text((ancho // 2 - 15, bloque_y + 30), "+", fill=NEGRO, font=f_titulo)
+    
+                # Lado derecho: círculo con "$35 de envío"
+                circulo_cx = ancho // 2 + 130
+                circulo_cy = bloque_y + 55
+                circulo_r = 55
+                draw.ellipse(
+                    [circulo_cx - circulo_r, circulo_cy - circulo_r,
+                     circulo_cx + circulo_r, circulo_cy + circulo_r],
+                    fill=NEGRO,
+                )
+                # Texto blanco centrado en el círculo
+                envio_l1 = f"${tarifa_envio:g}" if mostrar_precios else "Envío"
+                envio_l2 = "de envío" if mostrar_precios else "Consultar"
+                bbox1 = draw.textbbox((0, 0), envio_l1, font=f_envio_circ)
+                bbox2 = draw.textbbox((0, 0), envio_l2, font=font(13, bold=True))
+                draw.text(
+                    (circulo_cx - (bbox1[2] - bbox1[0]) // 2, circulo_cy - 22),
+                    envio_l1, fill=BLANCO, font=f_envio_circ
+                )
+                draw.text(
+                    (circulo_cx - (bbox2[2] - bbox2[0]) // 2, circulo_cy + 8),
+                    envio_l2, fill=BLANCO, font=font(13, bold=True)
+                )
+    
+                y = bloque_y + 130
 
             # Pago
             pago_txt = "Efectivo · Transferencia · Tarjeta débito o crédito"
@@ -5029,7 +5119,8 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
 
 
 def generar_catalogo_impresion(productos, contacto_nombre, contacto_tel, dia_entrega,
-                                mostrar_precios=True, frase="Del mercado a tu puerta."):
+                                mostrar_precios=True, frase="Del mercado a tu puerta.",
+                                tarifa_envio=COSTO_ENVIO, es_negocios=False):
     """Usa el diseño original en páginas carta, sin cortar filas ni reducir la letra."""
     ancho_hoja, alto_hoja, margen, dpi = 1275, 1650, 75, 150
     ancho_diseno = 900
@@ -5067,7 +5158,7 @@ def generar_catalogo_impresion(productos, contacto_nombre, contacto_tel, dia_ent
                 cache[cantidad] = generar_catalogo_imagen(
                     lista[inicio:inicio + cantidad], contacto_nombre, contacto_tel,
                     dia_entrega, frase, ancho=ancho_diseno, mostrar_precios=mostrar_precios,
-                    dos_columnas=dos_columnas)[0]
+                    dos_columnas=dos_columnas, tarifa_envio=tarifa_envio, es_negocios=es_negocios)[0]
             return cache[cantidad]
 
         # Buscar una cantidad que quepa usando la altura real del diseño completo,
@@ -5204,13 +5295,23 @@ with tab_catalogo:
                 key="cat_contacto",
             )
         with col_c2:
-            DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-            dia_entrega_str = st.selectbox(
-                "Día de entrega",
-                DIAS_SEMANA,
-                index=5,  # Sábado por default
-                key="cat_dia_entrega",
-            )
+            es_negocios = st.session_state["catalogo_activo"] == "MAYOREO"
+            opciones_entrega = DIAS_SEMANA + (["Toda la semana", "Elegir varios días"] if es_negocios else [])
+            opcion_entrega = st.selectbox(
+                "Días de entrega" if es_negocios else "Día de entrega",
+                opciones_entrega, index=7 if es_negocios else 5, key="cat_dia_entrega")
+            if opcion_entrega == "Elegir varios días":
+                dias_elegidos = st.multiselect("Selecciona los días de entrega", DIAS_SEMANA,
+                    default=["Lunes", "Miércoles", "Viernes"], key="cat_dias_negocios")
+                dias_ordenados = [dia for dia in DIAS_SEMANA if dia in dias_elegidos]
+                dia_entrega_str = "Toda la semana" if len(dias_ordenados) == 7 else ", ".join(dias_ordenados)
+                if not dia_entrega_str:
+                    st.warning("Selecciona al menos un día de entrega.")
+            else:
+                dia_entrega_str = opcion_entrega
+        if es_negocios:
+            st.info(f"Envío: ${tarifa_envio_actual():,.2f}. Gratis en pedidos de más de 35 kg. "
+                    "Puedes cambiar la tarifa en el panel lateral.")
 
         st.markdown("### 💬 Frase del catálogo")
         st.caption("Elige una categoría para ver opciones de frase, o escribe la tuya.")
@@ -5462,24 +5563,29 @@ with tab_catalogo:
 
             if st.button("🎨 Generar catálogo", type="primary", use_container_width=True):
                 with st.spinner("Generando versiones con precios y sin precios..."):
+                    if not dia_entrega_str:
+                        st.error("Selecciona al menos un día de entrega antes de generar el catálogo.")
+                        st.stop()
                     versiones = {}
                     imprimibles = {}
                     for con_precios in (True, False):
                         versiones[con_precios] = generar_catalogo_imagen(productos_incluidos,
                             cat_contacto, CONTACTOS[cat_contacto], dia_entrega_str,
-                            frase_seleccionada, ancho=900, mostrar_precios=con_precios)
+                            frase_seleccionada, ancho=900, mostrar_precios=con_precios,
+                            tarifa_envio=tarifa_envio_actual(), es_negocios=es_negocios)
                         imprimibles[con_precios] = generar_catalogo_impresion(productos_incluidos,
                             cat_contacto, CONTACTOS[cat_contacto], dia_entrega_str,
-                            mostrar_precios=con_precios, frase=frase_seleccionada)
+                            mostrar_precios=con_precios, frase=frase_seleccionada,
+                            tarifa_envio=tarifa_envio_actual(), es_negocios=es_negocios)
                     st.session_state["catalogo_generado"] = {"versiones": versiones, "imprimibles": imprimibles,
-                        "dia": dia_entrega_str.lower(),
+                        "dia": dia_entrega_str.lower().replace(", ", "_").replace(" ", "_"),
                         "fecha": datetime.now(pytz.timezone(ZONA_HORARIA)).strftime("%Y%m%d")}
 
             resultado_catalogo = st.session_state.get("catalogo_generado")
             if isinstance(resultado_catalogo, dict) and "versiones" in resultado_catalogo:
                 ver_precios = st.radio("Vista previa", ["Con precios", "Sin precios"], horizontal=True) == "Con precios"
                 st.image(resultado_catalogo["versiones"][ver_precios][0], caption="Catálogo", use_container_width=True)
-                st.caption("Las descargas corresponden al último catálogo generado. Genera de nuevo después de cambiar productos, categorías o contacto.")
+                st.caption("Las descargas corresponden al último catálogo generado. Genera de nuevo después de cambiar productos, categorías, contacto, días de entrega o tarifa de envío.")
                 for con_precios, etiqueta in [(True, "con precios"), (False, "sin precios")]:
                     imagenes = resultado_catalogo["versiones"][con_precios]
                     base = f"catalogo_{etiqueta.replace(' ', '_')}_{resultado_catalogo['dia']}_{resultado_catalogo['fecha']}"
