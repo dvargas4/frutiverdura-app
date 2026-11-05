@@ -734,6 +734,51 @@ def generar_zip_tickets_termicos(pedidos):
 
 
 
+def seleccionar_tickets_impresos(pedidos):
+    """Checklist por tipo; la selección pertenece al ticket, no a su posición."""
+    seleccionados = set()
+    for con_factura, titulo in ((False, "Sin factura"), (True, "Con factura")):
+        st.markdown(f"**{titulo}**")
+        grupo = [(i, pedido) for i, pedido in enumerate(pedidos)
+                 if (pedido.get("tipo") == "factura") == con_factura]
+        if not grupo:
+            st.caption("No hay tickets en este grupo.")
+        for indice, pedido in grupo:
+            pedido.setdefault("_ui_id", uuid4().hex)
+            if st.checkbox(pedido["cliente"], key=f"imprimir_ticket_{pedido['_ui_id']}"):
+                seleccionados.add(indice)
+    return [i for i in range(len(pedidos)) if i in seleccionados]
+
+
+def descargar_tickets_impresos(pedidos, indices):
+    """Un PNG por ticket marcado y un ZIP que contiene solo esa selección."""
+    if not indices:
+        st.caption("Marca los clientes cuyos tickets quieres imprimir.")
+        return
+    archivos = []
+    for indice in indices:
+        pedido = pedidos[indice]
+        archivos.append((pedido, nombre_archivo_ticket_termico(pedido, indice),
+                         generar_ticket_termico_png(pedido)))
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as archivo:
+        for _, nombre, png in archivos:
+            archivo.writestr(nombre, png)
+    st.markdown("**Descargar tickets seleccionados**")
+    st.download_button(
+        f"📦 Descargar seleccionados ({len(archivos)}) · ZIP",
+        data=zip_buf.getvalue(), file_name="tickets_impresos_seleccionados.zip",
+        mime="application/zip", key="descargar_zip_impresos_seleccionados",
+        use_container_width=True,
+    )
+    for pedido, nombre, png in archivos:
+        st.download_button(
+            f"📄 {pedido['cliente']} · PNG", data=png, file_name=nombre,
+            mime="image/png", key=f"descargar_impreso_{pedido['_ui_id']}",
+            use_container_width=True,
+        )
+
+
 def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False):
     """Genera la imagen del ticket y devuelve los bytes PNG.
     Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
@@ -3310,6 +3355,32 @@ with tab_resumen:
             st.dataframe(df_gramos.reset_index(drop=True), use_container_width=True, hide_index=True)
 
         st.divider()
+        st.subheader("💾 Guardar al histórico")
+        st.caption(
+            "Guarda permanentemente estos pedidos en Google Sheets para análisis futuros. "
+            "Los datos quedan en las pestañas HISTORICO_TICKETS y HISTORICO_PRODUCTOS."
+        )
+
+        if st.session_state.get("historico_guardado_sesion", False):
+            st.success("✅ Esta sesión ya fue guardada al histórico.")
+            if st.button("Guardar de nuevo (duplicará registros)"):
+                st.session_state["historico_guardado_sesion"] = False
+                st.rerun()
+        else:
+            if st.button("💾 Guardar todos los tickets al histórico", type="primary"):
+                with st.spinner("Guardando en Google Sheets..."):
+                    tickets_g, productos_g = guardar_pedidos_en_historico(pedidos)
+                if tickets_g is None:
+                    st.error(f"Error al guardar: {productos_g}")
+                else:
+                    st.success(
+                        f"✅ Guardados {tickets_g} tickets y {productos_g} productos al histórico. "
+                        "Velos en la pestaña 'Análisis de clientes'."
+                    )
+                    st.session_state["historico_guardado_sesion"] = True
+                    cargar_historico.clear()
+
+        st.divider()
         st.subheader("📥 Descargar")
 
         # ZIP con todos los PNGs
@@ -3418,6 +3489,13 @@ with tab_resumen:
         csv_bytes = df_csv.to_csv(index=False).encode("utf-8")
 
         st.divider()
+        st.subheader("TICKET IMPRESO")
+        st.caption("Marca los clientes que quieres imprimir. Se genera una imagen por ticket seleccionado.")
+        indices_impresos = seleccionar_tickets_impresos(pedidos)
+
+        st.divider()
+        descargar_tickets_impresos(pedidos, indices_impresos)
+        st.markdown("**Descargas habituales**")
 
         col_zip, col_pdf, col_csv = st.columns(3)
         with col_zip:
@@ -3449,74 +3527,20 @@ with tab_resumen:
             )
 
         st.divider()
-        st.subheader("💾 Guardar al histórico")
-        st.caption(
-            "Guarda permanentemente estos pedidos en Google Sheets para análisis futuros. "
-            "Los datos quedan en las pestañas HISTORICO_TICKETS y HISTORICO_PRODUCTOS."
-        )
-
-        if st.session_state.get("historico_guardado_sesion", False):
-            st.success("✅ Esta sesión ya fue guardada al histórico.")
-            if st.button("Guardar de nuevo (duplicará registros)"):
-                st.session_state["historico_guardado_sesion"] = False
-                st.rerun()
-        else:
-            if st.button("💾 Guardar todos los tickets al histórico", type="primary"):
-                with st.spinner("Guardando en Google Sheets..."):
-                    tickets_g, productos_g = guardar_pedidos_en_historico(pedidos)
-                if tickets_g is None:
-                    st.error(f"Error al guardar: {productos_g}")
-                else:
-                    st.success(
-                        f"✅ Guardados {tickets_g} tickets y {productos_g} productos al histórico. "
-                        "Velos en la pestaña 'Análisis de clientes'."
+        with st.expander("Ver imágenes de los tickets", expanded=False):
+            cols_gal = st.columns(3)
+            for i, p in enumerate(pedidos):
+                with cols_gal[i % 3]:
+                    png = generar_ticket_png(p)
+                    st.image(png, caption=f"{p['cliente']} - ${p['nuevo_total']:,.2f}", use_container_width=True)
+                    st.download_button(
+                        "📄 Descargar este ticket en PDF",
+                        data=generar_tickets_pdf([p]),
+                        file_name=f"ticket_{i+1}.pdf",
+                        mime="application/pdf",
+                        key=f"pdf_ticket_galeria_{i}",
+                        use_container_width=True,
                     )
-                    st.session_state["historico_guardado_sesion"] = True
-                    cargar_historico.clear()
-
-        st.divider()
-        st.subheader("Galería de tickets")
-        cols_gal = st.columns(3)
-        for i, p in enumerate(pedidos):
-            with cols_gal[i % 3]:
-                png = generar_ticket_png(p)
-                st.image(png, caption=f"{p['cliente']} - ${p['nuevo_total']:,.2f}", use_container_width=True)
-                st.download_button(
-                    "📄 Descargar este ticket en PDF",
-                    data=generar_tickets_pdf([p]),
-                    file_name=f"ticket_{i+1}.pdf",
-                    mime="application/pdf",
-                    key=f"pdf_ticket_galeria_{i}",
-                    use_container_width=True,
-                )
-
-
-        st.divider()
-        st.subheader("TICKET IMPRESO")
-        st.caption("Cantidades en kg con 3 decimales, precios de venta y totales. "
-                   "Sin costos internos ni utilidad, en blanco y negro y sin el espacio vacío izquierdo. Estos cambios solo se aplican a TICKET IMPRESO.")
-        indice_termico = st.selectbox(
-            "Pedido para imprimir", options=list(range(len(pedidos))),
-            format_func=lambda i: f"{i + 1}. {pedidos[i]['cliente']}",
-            key="seleccion_ticket_termico",
-        )
-        pedido_termico = pedidos[indice_termico]
-        png_termico = generar_ticket_termico_png(pedido_termico)
-        with st.expander("Ver TICKET IMPRESO", expanded=True):
-            st.image(png_termico, width=330)
-        st.download_button(
-            "📱 Descargar TICKET IMPRESO (PNG)", data=png_termico,
-            file_name=nombre_archivo_ticket_termico(pedido_termico, indice_termico),
-            mime="image/png", key="descargar_ticket_termico", use_container_width=True,
-        )
-        st.caption("En el teléfono: descarga la imagen, ábrela en la aplicación de impresión "
-                   "y selecciona el rollo de 58 mm. La conexión con la impresora se configura en esa aplicación.")
-        if st.button("Preparar todos los TICKETS IMPRESOS (ZIP)", key="preparar_zip_termico"):
-            st.download_button(
-                "📦 Descargar todos los TICKETS IMPRESOS", data=generar_zip_tickets_termicos(pedidos),
-                file_name="tickets_termicos_58mm.zip", mime="application/zip",
-                key="descargar_zip_termico", use_container_width=True,
-            )
 
 
 # ============================
