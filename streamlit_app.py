@@ -699,9 +699,44 @@ def generar_ticket_png(pedido):
     return generar_ticket_normal_png(pedido)
 
 
+def cantidad_ticket_kg(gramos):
+    """Solo cambia la presentación; el pedido conserva su cantidad original."""
+    from decimal import Decimal, ROUND_HALF_UP
+    cantidad = Decimal(str(gramos)) / Decimal("1000")
+    return f"{cantidad.quantize(Decimal('0.001'), rounding=ROUND_HALF_UP):.3f} kg"
+
+
+def generar_ticket_termico_png(pedido):
+    """Copia para impresión sin margen sobrante y en blanco y negro puro."""
+    original = Image.open(io.BytesIO(generar_ticket_png(pedido)))
+    # PRODUCTO empieza en x=130; conservar 20 px de margen para imprimir.
+    imagen = original.crop((110, 0, original.width, original.height))
+    # Convertir los colores de texto a negro, sin tramado ni tonos grises.
+    imagen = imagen.convert("L").point(lambda pixel: 0 if pixel < 200 else 255, mode="1")
+    buf = io.BytesIO()
+    imagen.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def nombre_archivo_ticket_termico(pedido, indice):
+    import re
+    cliente = re.sub(r"[^\w-]+", "_", pedido["cliente"], flags=re.UNICODE).strip("_")[:60]
+    return f"ticket_termico_{indice + 1:03d}_{cliente or 'cliente'}.png"
+
+
+def generar_zip_tickets_termicos(pedidos):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archivo:
+        for indice, pedido in enumerate(pedidos):
+            archivo.writestr(nombre_archivo_ticket_termico(pedido, indice), generar_ticket_termico_png(pedido))
+    return buf.getvalue()
+
+
+
+
 def generar_ticket_normal_png(pedido, _para_pdf=False):
     """Genera la imagen del ticket y devuelve los bytes PNG.
-    Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
+    Diseño original: encabezado centrado, PRODUCTO y VENTA en sus posiciones,
     totales abajo a la derecha.
     """
     productos = pedido["productos"]
@@ -744,7 +779,7 @@ def generar_ticket_normal_png(pedido, _para_pdf=False):
     paso_texto = max(18, f_reg.getbbox("Ágj")[3] - f_reg.getbbox("Ágj")[1] + 4)
     for nombre, gramos, costo, venta in productos_ord:
         lineas, linea = [], ""
-        for palabra in f"{nombre} {int(gramos)}g".split():
+        for palabra in f"{nombre} {cantidad_ticket_kg(gramos)}".split():
             candidato = f"{linea} {palabra}".strip()
             if medir(candidato) <= ancho_producto:
                 linea = candidato
@@ -839,7 +874,6 @@ def generar_ticket_normal_png(pedido, _para_pdf=False):
     y += 12
 
     # Headers de columna
-    draw.text((col_costo_x, y), "COSTO", font=f_header, fill=c_sec)
     draw.text((col_producto_x, y), "PRODUCTO", font=f_header, fill=c_titulo)
     venta_h = "VENTA"
     tw = text_width(venta_h, f_header)
@@ -851,7 +885,6 @@ def generar_ticket_normal_png(pedido, _para_pdf=False):
 
     # ---- Productos (ordenados por venta descendente) ----
     for costo, venta, lineas, alto_fila in filas_producto:
-        draw.text((col_costo_x, y), f"${costo:,.2f}", font=f_reg, fill=c_costo)
         for indice_linea, linea in enumerate(lineas):
             draw.text((col_producto_x, y + indice_linea * paso_texto), linea,
                       font=f_reg, fill=c_titulo)
@@ -866,35 +899,6 @@ def generar_ticket_normal_png(pedido, _para_pdf=False):
     y += 10
 
     # ---- Totales ----
-    # Zona del PROVEEDOR (izquierda de la línea de corte en col_producto_x):
-    # COSTO y DIF compactos, sobre dos líneas cada uno para no rebasar la línea
-    # de corte. La imagen se recorta por col_producto_x al entregar al cliente.
-    y_izq_inicio = y
-    ancho_zona_izq = col_producto_x - col_costo_x - 8  # 8px de margen interno
-
-    def dibujar_compacto_izq(y_local, label, valor, color):
-        """Dibuja label y valor en la zona estrecha izquierda. Si no caben en una
-        sola línea las pone en dos líneas."""
-        linea_completa = f"{label} {valor}"
-        if text_width(linea_completa, f_compacta) <= ancho_zona_izq:
-            draw.text((col_costo_x, y_local), linea_completa, font=f_compacta, fill=color)
-            return y_local + 14
-        # No cabe: poner label arriba y valor abajo
-        draw.text((col_costo_x, y_local), label, font=f_compacta, fill=color)
-        draw.text((col_costo_x, y_local + 12), valor, font=f_compacta, fill=color)
-        return y_local + 26
-
-    y_izq = y_izq_inicio
-    y_izq = dibujar_compacto_izq(
-        y_izq, "COSTO:", f"${totales['subtotal_costo']:,.2f}", c_sec
-    )
-    y_izq = dibujar_compacto_izq(
-        y_izq,
-        "DIF:",
-        f"${totales['utilidad']:,.2f} ({totales['utilidad_pct']:.1f}%)",
-        c_sec,
-    )
-
     # Zona del CLIENTE (derecha de la línea de corte): Productos / Subtotal / Envío / Descuento / TOTAL
     # Se cuentan renglones del pedido completo, incluidos productos repetidos.
     productos_txt = f"Productos: {len(productos)}"
@@ -928,9 +932,6 @@ def generar_ticket_normal_png(pedido, _para_pdf=False):
     draw.text((col_venta_x - tw, y), total_txt, font=f_total_bold, fill=c_venta)
     y += interlinea + 8
 
-    # Asegurar que el ticket no termine antes de que acabe la zona izquierda
-    y = max(y, y_izq + 4)
-
     gracias = "GRACIAS POR TU COMPRA"
     tw = text_width(gracias, f_total_bold)
     # Centrado en zona cliente (entre col_producto_x y borde derecho), no en ancho total
@@ -949,7 +950,7 @@ def generar_ticket_normal_png(pedido, _para_pdf=False):
 
 def generar_remision_png(pedido, _para_pdf=False):
     """Genera la imagen del ticket y devuelve los bytes PNG.
-    Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
+    Diseño original: encabezado centrado, PRODUCTO y VENTA en sus posiciones,
     totales abajo a la derecha.
     """
     preparar_remision(pedido)
@@ -1006,7 +1007,7 @@ def generar_remision_png(pedido, _para_pdf=False):
         return lineas
 
     emisor = pedido.get("emisor_remision", {})
-    faltantes = [k for k in ("nombre", "rfc", "regimen", "domicilio", "lugar", "cp") if not emisor.get(k)]
+    faltantes = [k for k in ("domicilio", "lugar", "cp") if not emisor.get(k)]
     # Bloques visuales medidos en el ancho que conserva el cliente al recortar.
     lineas_encabezado = []
     lineas_pie = []
@@ -1016,12 +1017,10 @@ def generar_remision_png(pedido, _para_pdf=False):
     def separar(destino):
         destino.append((None, None, False))
 
-    agregar_texto(lineas_encabezado, emisor.get("nombre") or "NOMBRE DEL NEGOCIO", f_titulo, True)
+    agregar_texto(lineas_encabezado, "FRUTIVERDURA A DOMICILIO", f_titulo, True)
     agregar_texto(lineas_encabezado, emisor.get("domicilio") or "Domicilio: pendiente", centrado=True)
     agregar_texto(lineas_encabezado,
                   (emisor.get("lugar") or "Lugar: pendiente") + " · C.P. " + (emisor.get("cp") or "pendiente"), centrado=True)
-    agregar_texto(lineas_encabezado, "RFC: " + (emisor.get("rfc") or "pendiente"), centrado=True)
-    agregar_texto(lineas_encabezado, "Régimen fiscal: " + (emisor.get("regimen") or "pendiente"), centrado=True)
     if faltantes:
         agregar_texto(lineas_encabezado, "BORRADOR: completar datos del emisor", centrado=True)
     separar(lineas_encabezado)
@@ -1065,7 +1064,7 @@ def generar_remision_png(pedido, _para_pdf=False):
     paso_texto = max(18, f_reg.getbbox("Ágj")[3] - f_reg.getbbox("Ágj")[1] + 4)
     for nombre, gramos, costo, venta in productos_ord:
         lineas, linea = [], ""
-        for palabra in f"{nombre} {int(gramos)}g".split():
+        for palabra in f"{nombre} {cantidad_ticket_kg(gramos)}".split():
             candidato = f"{linea} {palabra}".strip()
             if medir(candidato) <= ancho_producto:
                 linea = candidato
@@ -1154,7 +1153,6 @@ def generar_remision_png(pedido, _para_pdf=False):
     y += 12
 
     # Headers de columna
-    draw.text((col_costo_x, y), "COSTO", font=f_header, fill=c_sec)
     draw.text((col_producto_x, y), "PRODUCTO", font=f_header, fill=c_titulo)
     venta_h = "VENTA"
     tw = text_width(venta_h, f_header)
@@ -1166,7 +1164,6 @@ def generar_remision_png(pedido, _para_pdf=False):
 
     # ---- Productos (ordenados por venta descendente) ----
     for costo, venta, lineas, alto_fila in filas_producto:
-        draw.text((col_costo_x, y), f"${costo:,.2f}", font=f_reg, fill=c_costo)
         for indice_linea, linea in enumerate(lineas):
             draw.text((col_producto_x, y + indice_linea * paso_texto), linea,
                       font=f_reg, fill=c_titulo)
@@ -1181,35 +1178,6 @@ def generar_remision_png(pedido, _para_pdf=False):
     y += 10
 
     # ---- Totales ----
-    # Zona del PROVEEDOR (izquierda de la línea de corte en col_producto_x):
-    # COSTO y DIF compactos, sobre dos líneas cada uno para no rebasar la línea
-    # de corte. La imagen se recorta por col_producto_x al entregar al cliente.
-    y_izq_inicio = y
-    ancho_zona_izq = col_producto_x - col_costo_x - 8  # 8px de margen interno
-
-    def dibujar_compacto_izq(y_local, label, valor, color):
-        """Dibuja label y valor en la zona estrecha izquierda. Si no caben en una
-        sola línea las pone en dos líneas."""
-        linea_completa = f"{label} {valor}"
-        if text_width(linea_completa, f_compacta) <= ancho_zona_izq:
-            draw.text((col_costo_x, y_local), linea_completa, font=f_compacta, fill=color)
-            return y_local + 14
-        # No cabe: poner label arriba y valor abajo
-        draw.text((col_costo_x, y_local), label, font=f_compacta, fill=color)
-        draw.text((col_costo_x, y_local + 12), valor, font=f_compacta, fill=color)
-        return y_local + 26
-
-    y_izq = y_izq_inicio
-    y_izq = dibujar_compacto_izq(
-        y_izq, "COSTO:", f"${totales['subtotal_costo']:,.2f}", c_sec
-    )
-    y_izq = dibujar_compacto_izq(
-        y_izq,
-        "DIF:",
-        f"${totales['utilidad']:,.2f} ({totales['utilidad_pct']:.1f}%)",
-        c_sec,
-    )
-
     # Zona del CLIENTE (derecha de la línea de corte): Productos / Subtotal / Envío / Descuento / TOTAL
     # Se cuentan renglones del pedido completo, incluidos productos repetidos.
     productos_txt = f"Productos: {len(productos)}"
@@ -1242,9 +1210,6 @@ def generar_remision_png(pedido, _para_pdf=False):
     tw = text_width(total_txt, f_total_bold)
     draw.text((col_venta_x - tw, y), total_txt, font=f_total_bold, fill=c_venta)
     y += interlinea + 8
-
-    # Asegurar que el ticket no termine antes de que acabe la zona izquierda
-    y = max(y, y_izq + 4)
 
     y = dibujar_bloques(lineas_pie, y + 8)
     img = img.crop((0, 0, ancho, min(alto, y + 20)))
@@ -3441,6 +3406,34 @@ with tab_resumen:
                     key=f"pdf_ticket_galeria_{i}",
                     use_container_width=True,
                 )
+
+
+        st.divider()
+        st.subheader("🧾 Ticket térmico para cliente · 58 mm")
+        st.caption("Cantidades en kg con 3 decimales, precios de venta y totales. "
+                   "Sin costos internos ni utilidad. Conserva el mismo diseño de la imagen original.")
+        indice_termico = st.selectbox(
+            "Pedido para imprimir", options=list(range(len(pedidos))),
+            format_func=lambda i: f"{i + 1}. {pedidos[i]['cliente']}",
+            key="seleccion_ticket_termico",
+        )
+        pedido_termico = pedidos[indice_termico]
+        png_termico = generar_ticket_termico_png(pedido_termico)
+        with st.expander("Ver ticket térmico", expanded=True):
+            st.image(png_termico, width=330)
+        st.download_button(
+            "📱 Descargar ticket térmico (PNG)", data=png_termico,
+            file_name=nombre_archivo_ticket_termico(pedido_termico, indice_termico),
+            mime="image/png", key="descargar_ticket_termico", use_container_width=True,
+        )
+        st.caption("En el teléfono: descarga la imagen, ábrela en la aplicación de impresión "
+                   "y selecciona el rollo de 58 mm. La conexión con la impresora se configura en esa aplicación.")
+        if st.button("Preparar todos los tickets térmicos (ZIP)", key="preparar_zip_termico"):
+            st.download_button(
+                "📦 Descargar todos los tickets térmicos", data=generar_zip_tickets_termicos(pedidos),
+                file_name="tickets_termicos_58mm.zip", mime="application/zip",
+                key="descargar_zip_termico", use_container_width=True,
+            )
 
 
 # ============================
