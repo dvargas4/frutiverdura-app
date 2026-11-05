@@ -707,13 +707,12 @@ def cantidad_ticket_kg(gramos):
 
 
 def generar_ticket_termico_png(pedido):
-    """Copia para impresión sin margen sobrante y en blanco y negro puro."""
+    """PNG sin pérdida: texto negro con suavizado, a resolución original."""
     generador = generar_remision_png if pedido.get("tipo") == "factura" else generar_ticket_normal_png
     original = Image.open(io.BytesIO(generador(pedido, _para_impresion=True)))
     # PRODUCTO empieza en x=130; conservar 20 px de margen para imprimir.
     imagen = original.crop((110, 0, original.width, original.height))
-    # Convertir los colores de texto a negro, sin tramado ni tonos grises.
-    imagen = imagen.convert("L").point(lambda pixel: 0 if pixel < 200 else 255, mode="1")
+    # Conservar los píxeles y el suavizado originales: sin umbral ni reescalado.
     buf = io.BytesIO()
     imagen.save(buf, format="PNG")
     return buf.getvalue()
@@ -823,9 +822,9 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False):
     # ---- Colores ----
     c_fondo = (255, 255, 255)
     c_titulo = (0, 0, 0)
-    c_venta = (0, 102, 204)
+    c_venta = (0, 0, 0) if _para_impresion else (0, 102, 204)
     c_costo = (204, 0, 0)
-    c_sec = (120, 120, 120)
+    c_sec = (0, 0, 0) if _para_impresion else (120, 120, 120)
 
     img = Image.new("RGB", (ancho, alto), c_fondo)
     draw = ImageDraw.Draw(img)
@@ -1154,9 +1153,9 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False):
     # ---- Colores ----
     c_fondo = (255, 255, 255)
     c_titulo = (0, 0, 0)
-    c_venta = (0, 102, 204)
+    c_venta = (0, 0, 0) if _para_impresion else (0, 102, 204)
     c_costo = (204, 0, 0)
-    c_sec = (120, 120, 120)
+    c_sec = (0, 0, 0) if _para_impresion else (120, 120, 120)
 
     img = Image.new("RGB", (ancho, alto), c_fondo)
     draw = ImageDraw.Draw(img)
