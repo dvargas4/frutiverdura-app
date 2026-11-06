@@ -915,7 +915,26 @@ def _componer_ticket_mp210(pedido, mostrar_guia=False):
     fecha_ref = pedido.get('fecha_custom') or pedido.get('fecha_emision') or datetime.now(pytz.timezone(ZONA_HORARIA)).strftime('%d/%m/%Y')
     fecha_txt = str(fecha_ref).split()[0]
     centro(fecha_txt, f_meta)
-    avanzar(f_meta, 13)
+    avanzar(f_meta, 11)
+
+    # La ubicación del establecimiento aparece SIEMPRE: en tickets con y sin factura.
+    # Si el documento ya tenía datos del emisor, esos datos tienen prioridad.
+    emisor_configurado = dict(DOMICILIO_EMISOR_PREDETERMINADO)
+    emisor_configurado.update({k: v for k, v in st.session_state.get('emisor_remision', {}).items() if v})
+    emisor_configurado.update({k: v for k, v in (pedido.get('emisor_remision') or {}).items() if v})
+    domicilio_emisor = str(emisor_configurado.get('domicilio', '')).strip()
+    lugar_cp = ' '.join(v for v in [str(emisor_configurado.get('lugar', '')).strip(),
+                                ('C.P. ' + str(emisor_configurado.get('cp', '')).strip()
+                                 if emisor_configurado.get('cp') else '')] if v)
+    if domicilio_emisor or lugar_cp:
+        centro('DOMICILIO', f_label)
+        avanzar(f_label, 6)
+        for dato in (domicilio_emisor, lugar_cp):
+            for segmento in envolver(dato, f_meta, ANCHO_PX - 4):
+                centro(segmento, f_meta)
+                avanzar(f_meta, 3)
+        y += 7
+
     separador(6, antes=6, despues=19)
 
     es_remision = pedido.get('tipo') == 'factura'
@@ -929,7 +948,7 @@ def _componer_ticket_mp210(pedido, mostrar_guia=False):
             avanzar(f_body, 2)
         if pedido.get('domicilio_entrega'):
             y += 6
-            izquierda('ENTREGA', f_label)
+            izquierda('DOMICILIO DE ENTREGA', f_label)
             avanzar(f_label, 6)
             for linea in envolver(str(pedido['domicilio_entrega']), f_body, ANCHO_PX - 2):
                 izquierda(linea, f_body)
@@ -943,21 +962,6 @@ def _componer_ticket_mp210(pedido, mostrar_guia=False):
             bloque_etiqueta_valor('Contacto', str(pedido.get('contacto', '')), f_meta, f_meta)
         if pedido.get('telefono'):
             bloque_etiqueta_valor('Teléfono', str(pedido['telefono']), f_meta, f_meta)
-        emisor = pedido.get('emisor_remision') or {}
-        emisor_lineas = []
-        if emisor.get('domicilio'):
-            emisor_lineas.append(str(emisor['domicilio']))
-        lugar_cp = ' '.join(v for v in [emisor.get('lugar'), ('C.P. ' + emisor.get('cp', '') if emisor.get('cp') else '')] if v)
-        if lugar_cp:
-            emisor_lineas.append(lugar_cp)
-        if emisor_lineas:
-            separador(4, antes=2, despues=14)
-            izquierda('EMISOR', f_label)
-            avanzar(f_label, 7)
-            for linea in emisor_lineas:
-                for seg in envolver(linea, f_meta, ANCHO_PX - 2):
-                    izquierda(seg, f_meta)
-                    avanzar(f_meta, 2)
     else:
         izquierda('PEDIDO', f_label)
         avanzar(f_label, 7)
@@ -973,6 +977,13 @@ def _componer_ticket_mp210(pedido, mostrar_guia=False):
         for linea in envolver(contacto or 'SIN CONTACTO', f_body, ANCHO_PX - 2):
             izquierda(linea, f_body)
             avanzar(f_body, 2)
+        if pedido.get('domicilio_entrega'):
+            y += 9
+            izquierda('DOMICILIO DE ENTREGA', f_label)
+            avanzar(f_label, 6)
+            for linea in envolver(str(pedido['domicilio_entrega']), f_meta, ANCHO_PX - 2):
+                izquierda(linea, f_meta)
+                avanzar(f_meta, 2)
 
     separador(6, antes=5, despues=15)
     izquierda('PRODUCTO', f_head)
@@ -1182,7 +1193,7 @@ def descargar_tickets_impresos(pedidos, indices):
             if pdf is not None:
                 archivo.writestr("PDF/" + nombre[:-4] + ".pdf", pdf)
     st.markdown("**Descargar tickets seleccionados**")
-    st.caption("MP210 · PDF de 58 mm · PNG nativo de 384 px. Diseño final con encabezado grande, letra más delgada y separadores gruesos. Un archivo por ticket. En Print Fast selecciona la MP210 y papel de 58 mm.")
+    st.caption("MP210 · PDF de 58 mm · PNG de 384 px. Encabezado grande, domicilio del establecimiento, letra delgada y separadores gruesos. Un archivo por ticket. En Print Fast selecciona la MP210 y papel de 58 mm.")
     st.download_button(
         f"📦 Descargar seleccionados ({len(archivos)}) · ZIP",
         data=zip_buf.getvalue(), file_name="tickets_impresos_seleccionados.zip",
@@ -2013,7 +2024,7 @@ def generar_tickets_pdf(pedidos):
 with st.sidebar:
     st.title("🥬 Frutiverdura")
 
-    with st.expander("Datos del emisor para Factura / remisión", expanded=False):
+    with st.expander("Datos del establecimiento para tickets y factura / remisión", expanded=False):
         st.caption("Los datos del emisor están precargados. Puedes revisarlos o corregirlos; se conservan en esta sesión y en los tickets generados.")
         emisor_config = dict(st.session_state.get("emisor_remision", {}))
         for campo, valor in DOMICILIO_EMISOR_PREDETERMINADO.items():
