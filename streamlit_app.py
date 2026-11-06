@@ -1073,27 +1073,50 @@ def _componer_ticket_mp210(pedido, mostrar_guia=False):
 
 
 
+# MP210, formato físico idéntico al PDF de prueba aprobado:
+# hoja 58 mm = 464 puntos a 203 dpi; campo de impresión 48 mm = 384 puntos.
+# Los 5 mm laterales = 40 puntos por lado. En el papel, el 1 cae en x=5 mm
+# y el 10 en x=53 mm. Evita que Print Fast amplíe la versión PNG al
+# ancho completo del papel y cambie la escala respecto del PDF probado.
+MP210_PAPEL_MM = 58
+MP210_AREA_MM = 48
+MP210_DPI = 203
+MP210_PAPEL_PX = 464
+MP210_AREA_PX = 384
+MP210_MARGEN_PX = (MP210_PAPEL_PX - MP210_AREA_PX) // 2
+
+
+def _imagen_ticket_mp210_en_papel(pedido, mostrar_guia=False):
+    """Ráster completo del rollo: misma escala para PNG y PDF."""
+    interior = _componer_ticket_mp210(pedido, mostrar_guia)
+    if interior.width != MP210_AREA_PX:
+        raise ValueError('El ticket térmico debe medir exactamente 384 píxeles útiles.')
+    papel = Image.new('L', (MP210_PAPEL_PX, interior.height), 255)
+    papel.paste(interior, (MP210_MARGEN_PX, 0))
+    return papel
+
+
 def generar_ticket_termico_png(pedido, mostrar_guia=False):
-    """PNG 384 px con el diseño final aprobado para la MP210."""
-    imagen = _componer_ticket_mp210(pedido, mostrar_guia)
+    """PNG de 58 mm con 5 mm laterales para respetar escala física 1–10."""
+    imagen = _imagen_ticket_mp210_en_papel(pedido, mostrar_guia)
     b = io.BytesIO()
-    imagen.save(b, format='PNG', dpi=(203, 203))
+    imagen.save(b, format='PNG', dpi=(MP210_DPI, MP210_DPI))
     return b.getvalue()
 
 
 def generar_ticket_termico_pdf(pedido, mostrar_guia=False):
-    """El mismo diseño final en PDF de 58 mm (48 mm útiles centrados)."""
+    """PDF de 58 mm; contenido centrado en los 48 mm de la prueba aprobada."""
     from reportlab.pdfgen import canvas
     from reportlab.lib.utils import ImageReader
     from reportlab.lib.units import mm
-    imagen = _componer_ticket_mp210(pedido, mostrar_guia)
-    alto_mm = imagen.height / 8  # 203dpi=8 puntos por mm
+    imagen = _imagen_ticket_mp210_en_papel(pedido, mostrar_guia)
+    alto_mm = imagen.height / 8  # escala nominal de 203 dpi usada en la prueba
     b = io.BytesIO()
-    pdf = canvas.Canvas(b, pagesize=(58 * mm, alto_mm * mm))
-    pdf.setTitle('Ticket termico MP210 - ' + str(pedido.get('cliente', '')))
+    pdf = canvas.Canvas(b, pagesize=(MP210_PAPEL_MM * mm, alto_mm * mm))
+    pdf.setTitle('Ticket MP210, escala del 1 al 10 - ' + str(pedido.get('cliente', '')))
     pdf.setAuthor('Frutiverdura a Domicilio')
-    pdf.drawImage(ImageReader(imagen), 5 * mm, 0,
-                  width=48 * mm, height=alto_mm * mm, mask='auto')
+    pdf.drawImage(ImageReader(imagen), 0, 0,
+                  width=MP210_PAPEL_MM * mm, height=alto_mm * mm, mask='auto')
     pdf.showPage()
     pdf.save()
     return b.getvalue()
@@ -1168,7 +1191,7 @@ def seleccionar_tickets_impresos(pedidos):
 
 
 def descargar_tickets_impresos(pedidos, indices):
-    """PDF vectorial para Print Fast y PNG alternativo, solo de tickets marcados."""
+    """PDF y PNG a la misma escala física, solo de tickets marcados."""
     if not indices:
         st.caption("Marca los clientes cuyos tickets quieres imprimir.")
         return
@@ -1193,7 +1216,7 @@ def descargar_tickets_impresos(pedidos, indices):
             if pdf is not None:
                 archivo.writestr("PDF/" + nombre[:-4] + ".pdf", pdf)
     st.markdown("**Descargar tickets seleccionados**")
-    st.caption("MP210 · PDF de 58 mm · PNG de 384 px. Encabezado grande, domicilio del establecimiento, letra delgada y separadores gruesos. Un archivo por ticket. En Print Fast selecciona la MP210 y papel de 58 mm.")
+    st.caption("MP210 · Mismo tamaño para PDF y PNG: papel de 58 mm, área útil del 1 al 10 de 48 mm, con 5 mm laterales. El domicilio permanece en ambos tipos de ticket. Para Print Fast, usa preferentemente el PDF con escala original, sin ampliar ni recortar.")
     st.download_button(
         f"📦 Descargar seleccionados ({len(archivos)}) · ZIP",
         data=zip_buf.getvalue(), file_name="tickets_impresos_seleccionados.zip",
@@ -1202,20 +1225,21 @@ def descargar_tickets_impresos(pedidos, indices):
     )
     for pedido, nombre, png, pdf in archivos:
         st.markdown("**" + pedido["cliente"].replace("*", "") + "**")
-        st.download_button(
-            "🖼️ PNG para impresora · 384 px", data=png, file_name=nombre,
-            mime="image/png", key=f"descargar_impreso_{pedido['_ui_id']}",
-            use_container_width=True,
-        )
-        compartir_ticket_impreso(png, nombre, "image/png")
         if pdf is not None:
             nombre_pdf = nombre[:-4] + ".pdf"
             st.download_button(
-                "📄 PDF para Print Fast · 58 mm", data=pdf, file_name=nombre_pdf,
+                "📄 PDF para Print Fast · escala 1–10 (recomendado)",
+                data=pdf, file_name=nombre_pdf,
                 mime="application/pdf", key=f"descargar_pdf_impreso_{pedido['_ui_id']}",
                 use_container_width=True,
             )
             compartir_ticket_impreso(pdf, nombre_pdf, "application/pdf")
+        st.download_button(
+            "🖼️ PNG · papel 58 mm (464 px)", data=png, file_name=nombre,
+            mime="image/png", key=f"descargar_impreso_{pedido['_ui_id']}",
+            use_container_width=True,
+        )
+        compartir_ticket_impreso(png, nombre, "image/png")
 
 
 def fuentes_ticket_mp210():
