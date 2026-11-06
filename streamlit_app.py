@@ -928,8 +928,7 @@ def _componer_ticket_mp210(pedido, mostrar_guia=False):
                                 ('C.P. ' + str(emisor_configurado.get('cp', '')).strip()
                                  if emisor_configurado.get('cp') else '')] if v)
     if domicilio_emisor or lugar_cp:
-        centro('DOMICILIO', f_label)
-        avanzar(f_label, 6)
+        # Mostrar la dirección directamente, sin el rótulo «DOMICILIO».
         for dato in (domicilio_emisor, lugar_cp):
             for segmento in envolver(dato, f_meta, ANCHO_PX - 4):
                 centro(segmento, f_meta)
