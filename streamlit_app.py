@@ -706,16 +706,139 @@ def cantidad_ticket_kg(gramos):
     return f"{cantidad.quantize(Decimal('0.001'), rounding=ROUND_HALF_UP):.3f} kg"
 
 
-def generar_ticket_termico_png(pedido):
-    """PNG sin pérdida: texto negro con suavizado, a resolución original."""
+class _DibujoTicketImpreso:
+    """Captura el diseño del ticket sin modificar el lienzo ni el estado global."""
+    def __init__(self, dibujo, operaciones):
+        self.dibujo = dibujo
+        self.operaciones = operaciones
+
+    def __getattr__(self, nombre):
+        return getattr(self.dibujo, nombre)
+
+    def text(self, xy, texto, font=None, fill=None, **kwargs):
+        self.operaciones.append(("texto", xy, texto, font))
+        return self.dibujo.text(xy, texto, font=font, fill=fill, **kwargs)
+
+    def line(self, xy, fill=None, width=1, **kwargs):
+        self.operaciones.append(("linea", xy, width))
+        return self.dibujo.line(xy, fill=fill, width=width, **kwargs)
+
+
+def operaciones_ticket_impreso(pedido):
+    """Un único diseño para PDF vectorial y PNG nativo de la MP210."""
+    operaciones = []
     generador = generar_remision_png if pedido.get("tipo") == "factura" else generar_ticket_normal_png
-    original = Image.open(io.BytesIO(generador(pedido, _para_impresion=True)))
-    # PRODUCTO empieza en x=130; conservar 20 px de margen para imprimir.
-    imagen = original.crop((110, 0, original.width, original.height))
-    # Conservar los píxeles y el suavizado originales: sin umbral ni reescalado.
+    generador(pedido, _para_impresion=True, _operaciones=operaciones)
+    ultimo_pixel = 0
+    for op in operaciones:
+        if op[0] == "texto":
+            ultimo_pixel = max(ultimo_pixel, op[1][1] + op[3].getbbox(op[2])[3])
+        else:
+            ultimo_pixel = max(ultimo_pixel, max(p[1] for p in op[1]))
+    return operaciones, max(40, int(ultimo_pixel + 20))
+
+
+def generar_ticket_termico_png(pedido):
+    """PNG nativo de 384 puntos a 203 dpi: texto redibujado, sin ampliar una imagen."""
+    operaciones, alto = operaciones_ticket_impreso(pedido)
+    escala = 384 / 330
+    imagen = Image.new("RGB", (384, int(alto * escala + 0.5)), "white")
+    draw = ImageDraw.Draw(imagen)
+    fuentes = {}
+    for op in operaciones:
+        if op[0] == "texto":
+            _, (x, y), texto, fuente = op
+            ruta = getattr(fuente, "path", None)
+            tamano = max(1, round(getattr(fuente, "size", 13) * escala))
+            clave = (ruta, tamano)
+            if clave not in fuentes:
+                fuentes[clave] = (ImageFont.truetype(ruta, tamano) if ruta
+                                  else ImageFont.load_default(size=tamano))
+            draw.text(((x - 110) * escala, y * escala), texto, font=fuentes[clave], fill="black")
+        else:
+            _, puntos, grosor = op
+            draw.line([((max(110, x) - 110) * escala, y * escala) for x, y in puntos],
+                      fill="black", width=max(1, round(grosor * escala)))
     buf = io.BytesIO()
-    imagen.save(buf, format="PNG")
+    imagen.save(buf, format="PNG", dpi=(203, 203))
     return buf.getvalue()
+
+
+def generar_ticket_termico_pdf(pedido):
+    """Una página de 58 mm de ancho, área útil de 48 mm y largo según contenido."""
+    from reportlab.pdfgen import canvas
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.lib.units import mm
+    import hashlib
+
+    operaciones, alto = operaciones_ticket_impreso(pedido)
+    escala = 48 * mm / 330
+    alto_pdf = alto * escala
+    buf = io.BytesIO()
+    pdf = canvas.Canvas(buf, pagesize=(58 * mm, alto_pdf), pageCompression=1)
+    pdf.setTitle("Ticket impreso - " + pedido["cliente"])
+    pdf.setAuthor("Frutiverdura a Domicilio")
+    pdf.setFillColorRGB(0, 0, 0)
+    pdf.setStrokeColorRGB(0, 0, 0)
+    for op in operaciones:
+        if op[0] == "texto":
+            _, (x, y), texto, fuente = op
+            ruta = getattr(fuente, "path", None)
+            tamano = getattr(fuente, "size", 13)
+            nombre_fuente = "Helvetica"
+            if isinstance(ruta, (str, bytes, os.PathLike)) and os.path.isfile(ruta):
+                nombre_fuente = "Ticket_" + hashlib.sha256(os.fsencode(ruta)).hexdigest()[:16]
+                if nombre_fuente not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(TTFont(nombre_fuente, ruta))
+            pdf.setFont(nombre_fuente, tamano * escala)
+            ascenso = fuente.getmetrics()[0] if hasattr(fuente, "getmetrics") else tamano
+            pdf.drawString(5 * mm + (x - 110) * escala,
+                           alto_pdf - (y + ascenso) * escala, texto)
+        else:
+            _, puntos, grosor = op
+            pdf.setLineWidth(grosor * escala)
+            for inicio, fin in zip(puntos, puntos[1:]):
+                pdf.line(5 * mm + (max(110, inicio[0]) - 110) * escala,
+                         alto_pdf - inicio[1] * escala,
+                         5 * mm + (max(110, fin[0]) - 110) * escala,
+                         alto_pdf - fin[1] * escala)
+    pdf.showPage()
+    pdf.save()
+    return buf.getvalue()
+
+
+def compartir_ticket_impreso(pdf_bytes, nombre):
+    """Compartir archivo desde un gesto del usuario; descarga normal como alternativa."""
+    import base64
+    import json
+    import streamlit.components.v1 as components
+    datos = json.dumps({"nombre": nombre, "base64": base64.b64encode(pdf_bytes).decode("ascii")})
+    datos = datos.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    html = '''<!doctype html><html lang="es"><meta charset="utf-8">
+    <style>body{margin:0;font:14px system-ui;color:#555}button{padding:10px 14px;
+    background:#fff;border:1px solid #aaa;border-radius:8px;cursor:pointer;font:inherit;color:#222}
+    p{margin:6px 0}</style><button id="compartir" type="button">Compartir para imprimir</button>
+    <p id="estado" role="status" aria-live="polite"></p><script>
+    const datos = DATOS_TICKET;
+    const bytes = Uint8Array.from(atob(datos.base64), c => c.charCodeAt(0));
+    const archivo = new File([bytes], datos.nombre, {type: 'application/pdf'});
+    const boton = document.getElementById('compartir');
+    const estado = document.getElementById('estado');
+    const alternativa = 'Descarga el PDF y ábrelo. Luego usa Compartir → Print Fast.';
+    boton.addEventListener('click', async () => {
+      if (!navigator.share || !navigator.canShare || !navigator.canShare({files:[archivo]})) {
+        estado.textContent = alternativa; return;
+      }
+      boton.disabled = true;
+      try { await navigator.share({files:[archivo]});
+        estado.textContent = 'Archivo compartido. Confirma la impresión en Print Fast.';
+      } catch(error) {
+        estado.textContent = error.name === 'AbortError' ? 'Compartir cancelado.' : alternativa;
+      } finally { boton.disabled = false; }
+    });
+    </script></html>'''.replace("DATOS_TICKET", datos)
+    components.html(html, height=110, scrolling=False)
 
 
 def nombre_archivo_ticket_termico(pedido, indice):
@@ -751,35 +874,55 @@ def seleccionar_tickets_impresos(pedidos):
 
 
 def descargar_tickets_impresos(pedidos, indices):
-    """Un PNG por ticket marcado y un ZIP que contiene solo esa selección."""
+    """PDF vectorial para Print Fast y PNG alternativo, solo de tickets marcados."""
     if not indices:
         st.caption("Marca los clientes cuyos tickets quieres imprimir.")
         return
+    try:
+        import reportlab
+        pdf_disponible = True
+    except ImportError:
+        pdf_disponible = False
+        st.warning("Para habilitar PDF y Compartir, añade reportlab>=4.0,<5 a requirements.txt y reinicia la app. Puedes descargar PNG mientras tanto.")
     archivos = []
     for indice in indices:
         pedido = pedidos[indice]
-        archivos.append((pedido, nombre_archivo_ticket_termico(pedido, indice),
-                         generar_ticket_termico_png(pedido)))
+        nombre = nombre_archivo_ticket_termico(pedido, indice)
+        png = generar_ticket_termico_png(pedido)
+        pdf = generar_ticket_termico_pdf(pedido) if pdf_disponible else None
+        archivos.append((pedido, nombre, png, pdf))
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as archivo:
-        for _, nombre, png in archivos:
-            archivo.writestr(nombre, png)
+        for _, nombre, png, pdf in archivos:
+            archivo.writestr("PNG/" + nombre, png)
+            if pdf is not None:
+                archivo.writestr("PDF/" + nombre[:-4] + ".pdf", pdf)
     st.markdown("**Descargar tickets seleccionados**")
+    st.caption("MP210 · PDF de 58 mm con texto vectorial · PNG de 384 px. Un archivo por ticket. En Print Fast selecciona la MP210 y papel de 58 mm.")
     st.download_button(
         f"📦 Descargar seleccionados ({len(archivos)}) · ZIP",
         data=zip_buf.getvalue(), file_name="tickets_impresos_seleccionados.zip",
         mime="application/zip", key="descargar_zip_impresos_seleccionados",
         use_container_width=True,
     )
-    for pedido, nombre, png in archivos:
+    for pedido, nombre, png, pdf in archivos:
+        st.markdown("**" + pedido["cliente"].replace("*", "") + "**")
+        if pdf is not None:
+            nombre_pdf = nombre[:-4] + ".pdf"
+            st.download_button(
+                "📄 PDF para Print Fast · 58 mm", data=pdf, file_name=nombre_pdf,
+                mime="application/pdf", key=f"descargar_pdf_impreso_{pedido['_ui_id']}",
+                use_container_width=True,
+            )
+            compartir_ticket_impreso(pdf, nombre_pdf)
         st.download_button(
-            f"📄 {pedido['cliente']} · PNG", data=png, file_name=nombre,
+            "🖼️ PNG para impresora · 384 px", data=png, file_name=nombre,
             mime="image/png", key=f"descargar_impreso_{pedido['_ui_id']}",
             use_container_width=True,
         )
 
 
-def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False):
+def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _operaciones=None):
     """Genera la imagen del ticket y devuelve los bytes PNG.
     Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
     totales abajo a la derecha.
@@ -873,6 +1016,8 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False):
 
     img = Image.new("RGB", (ancho, alto), c_fondo)
     draw = ImageDraw.Draw(img)
+    if _operaciones is not None:
+        draw = _DibujoTicketImpreso(draw, _operaciones)
 
     # Helper: medir ancho de texto (compatible con varias versiones de PIL)
     def text_width(texto, fuente):
@@ -906,14 +1051,26 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False):
     y += interlinea + 4
 
     pedido_txt = f"PEDIDO : {pedido['cliente'].upper()}"
-    tw = text_width(pedido_txt, f_reg)
-    draw.text((ancho - margen_x - tw, y), pedido_txt, font=f_reg, fill=c_titulo)
-    y += interlinea
-
     contacto_txt = f"CONTACTO : {pedido['contacto']} ({pedido['telefono']})"
-    tw = text_width(contacto_txt, f_reg)
-    draw.text((ancho - margen_x - tw, y), contacto_txt, font=f_reg, fill=c_titulo)
-    y += interlinea + 4
+    for etiqueta in (pedido_txt, contacto_txt):
+        lineas = [etiqueta]
+        if _para_impresion and text_width(etiqueta, f_reg) > col_venta_x - col_producto_x:
+            # El nombre o teléfono largo debe permanecer dentro del rollo.
+            lineas = []
+            resto = etiqueta
+            while resto:
+                corte = len(resto)
+                while corte > 1 and text_width(resto[:corte], f_reg) > col_venta_x - col_producto_x:
+                    corte -= 1
+                if corte < len(resto) and " " in resto[:corte]:
+                    corte = resto.rfind(" ", 0, corte) + 1
+                lineas.append(resto[:corte].rstrip())
+                resto = resto[corte:].lstrip()
+        for linea in lineas:
+            tw = text_width(linea, f_reg)
+            draw.text((ancho - margen_x - tw, y), linea, font=f_reg, fill=c_titulo)
+            y += interlinea
+    y += 4
 
     # Línea separadora
     draw.line([(margen_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
@@ -1032,7 +1189,7 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False):
     return buf.getvalue()
 
 
-def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False):
+def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operaciones=None):
     """Genera la imagen del ticket y devuelve los bytes PNG.
     Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
     totales abajo a la derecha.
@@ -1204,6 +1361,8 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False):
 
     img = Image.new("RGB", (ancho, alto), c_fondo)
     draw = ImageDraw.Draw(img)
+    if _operaciones is not None:
+        draw = _DibujoTicketImpreso(draw, _operaciones)
 
     # Helper: medir ancho de texto (compatible con varias versiones de PIL)
     def text_width(texto, fuente):
@@ -3298,88 +3457,6 @@ with tab_resumen:
     if not pedidos:
         st.info("Aún no hay tickets generados.")
     else:
-        st.subheader("Resumen global de la sesión")
-
-        total_costo = sum(p["subtotal_costo"] for p in pedidos)
-        total_venta_bruta = sum(p["subtotal_venta"] for p in pedidos)
-        total_envios = sum(p["costo_envio"] for p in pedidos)
-        total_descuentos = sum(p["descuento"] for p in pedidos)
-        total_cobrado = sum(p["nuevo_total"] for p in pedidos)
-        utilidad_total = sum(p["utilidad"] for p in pedidos)
-        utilidad_pct = (utilidad_total / total_costo * 100) if total_costo > 0 else 0
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Tickets", len(pedidos))
-        c2.metric("Costo total", f"${total_costo:,.2f}")
-        c3.metric("Total cobrado", f"${total_cobrado:,.2f}")
-        c4.metric("Utilidad", f"${utilidad_total:,.2f}", f"{utilidad_pct:.2f}%")
-
-        c5, c6, c7 = st.columns(3)
-        c5.metric("Venta bruta productos", f"${total_venta_bruta:,.2f}")
-        c6.metric("Envíos cobrados", f"${total_envios:,.2f}")
-        c7.metric("Descuentos", f"${total_descuentos:,.2f}")
-
-        st.divider()
-        st.subheader("👤 Desglose por persona")
-
-        cols_personas = st.columns(len(CONTACTOS))
-        for idx, nombre_contacto in enumerate(CONTACTOS.keys()):
-            pc = [p for p in pedidos if p["contacto"] == nombre_contacto]
-            envios = sum(p["costo_envio"] for p in pc)
-            num_env = sum(1 for p in pc if p["costo_envio"] > 0)
-            costo_c = sum(p["subtotal_costo"] for p in pc)
-            util_c = sum(p["utilidad"] for p in pc)
-            util_pct_c = (util_c / costo_c * 100) if costo_c > 0 else 0
-
-            with cols_personas[idx]:
-                st.markdown(f"### {nombre_contacto}")
-                st.metric("Tickets", f"{len(pc)} ({num_env} con envío)")
-                st.metric("Envíos cobrados", f"${envios:,.2f}")
-                st.metric("Costo", f"${costo_c:,.2f}")
-                st.metric("Utilidad", f"${util_c:,.2f}", f"{util_pct_c:.2f}%")
-
-        st.divider()
-        st.subheader("⚖️ Gramos consumidos por producto")
-
-        gramos_prod = {}
-        for p in pedidos:
-            for nombre, gr, _, _ in p["productos"]:
-                gramos_prod[nombre] = gramos_prod.get(nombre, 0) + gr
-
-        if gramos_prod:
-            df_gramos = pd.DataFrame(
-                [(k, int(v), v / 1000) for k, v in sorted(gramos_prod.items(), key=lambda x: -x[1])],
-                columns=["Producto", "Gramos", "Kilos"],
-            )
-            df_gramos.loc["TOTAL"] = ["TOTAL", df_gramos["Gramos"].sum(), df_gramos["Kilos"].sum()]
-            st.dataframe(df_gramos.reset_index(drop=True), use_container_width=True, hide_index=True)
-
-        st.divider()
-        st.subheader("💾 Guardar al histórico")
-        st.caption(
-            "Guarda permanentemente estos pedidos en Google Sheets para análisis futuros. "
-            "Los datos quedan en las pestañas HISTORICO_TICKETS y HISTORICO_PRODUCTOS."
-        )
-
-        if st.session_state.get("historico_guardado_sesion", False):
-            st.success("✅ Esta sesión ya fue guardada al histórico.")
-            if st.button("Guardar de nuevo (duplicará registros)"):
-                st.session_state["historico_guardado_sesion"] = False
-                st.rerun()
-        else:
-            if st.button("💾 Guardar todos los tickets al histórico", type="primary"):
-                with st.spinner("Guardando en Google Sheets..."):
-                    tickets_g, productos_g = guardar_pedidos_en_historico(pedidos)
-                if tickets_g is None:
-                    st.error(f"Error al guardar: {productos_g}")
-                else:
-                    st.success(
-                        f"✅ Guardados {tickets_g} tickets y {productos_g} productos al histórico. "
-                        "Velos en la pestaña 'Análisis de clientes'."
-                    )
-                    st.session_state["historico_guardado_sesion"] = True
-                    cargar_historico.clear()
-
         st.divider()
         st.subheader("📥 Descargar")
 
@@ -3525,6 +3602,89 @@ with tab_resumen:
                 mime="text/csv",
                 use_container_width=True,
             )
+
+        st.divider()
+        st.subheader("Resumen global de la sesión")
+
+        total_costo = sum(p["subtotal_costo"] for p in pedidos)
+        total_venta_bruta = sum(p["subtotal_venta"] for p in pedidos)
+        total_envios = sum(p["costo_envio"] for p in pedidos)
+        total_descuentos = sum(p["descuento"] for p in pedidos)
+        total_cobrado = sum(p["nuevo_total"] for p in pedidos)
+        utilidad_total = sum(p["utilidad"] for p in pedidos)
+        utilidad_pct = (utilidad_total / total_costo * 100) if total_costo > 0 else 0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Tickets", len(pedidos))
+        c2.metric("Costo total", f"${total_costo:,.2f}")
+        c3.metric("Total cobrado", f"${total_cobrado:,.2f}")
+        c4.metric("Utilidad", f"${utilidad_total:,.2f}", f"{utilidad_pct:.2f}%")
+
+        c5, c6, c7 = st.columns(3)
+        c5.metric("Venta bruta productos", f"${total_venta_bruta:,.2f}")
+        c6.metric("Envíos cobrados", f"${total_envios:,.2f}")
+        c7.metric("Descuentos", f"${total_descuentos:,.2f}")
+
+        st.divider()
+        st.subheader("👤 Desglose por persona")
+
+        cols_personas = st.columns(len(CONTACTOS))
+        for idx, nombre_contacto in enumerate(CONTACTOS.keys()):
+            pc = [p for p in pedidos if p["contacto"] == nombre_contacto]
+            envios = sum(p["costo_envio"] for p in pc)
+            num_env = sum(1 for p in pc if p["costo_envio"] > 0)
+            costo_c = sum(p["subtotal_costo"] for p in pc)
+            util_c = sum(p["utilidad"] for p in pc)
+            util_pct_c = (util_c / costo_c * 100) if costo_c > 0 else 0
+
+            with cols_personas[idx]:
+                st.markdown(f"### {nombre_contacto}")
+                st.metric("Tickets", f"{len(pc)} ({num_env} con envío)")
+                st.metric("Envíos cobrados", f"${envios:,.2f}")
+                st.metric("Costo", f"${costo_c:,.2f}")
+                st.metric("Utilidad", f"${util_c:,.2f}", f"{util_pct_c:.2f}%")
+
+        st.divider()
+        st.subheader("⚖️ Gramos consumidos por producto")
+
+        gramos_prod = {}
+        for p in pedidos:
+            for nombre, gr, _, _ in p["productos"]:
+                gramos_prod[nombre] = gramos_prod.get(nombre, 0) + gr
+
+        if gramos_prod:
+            df_gramos = pd.DataFrame(
+                [(k, int(v), v / 1000) for k, v in sorted(gramos_prod.items(), key=lambda x: -x[1])],
+                columns=["Producto", "Gramos", "Kilos"],
+            )
+            df_gramos.loc["TOTAL"] = ["TOTAL", df_gramos["Gramos"].sum(), df_gramos["Kilos"].sum()]
+            st.dataframe(df_gramos.reset_index(drop=True), use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("💾 Guardar al histórico")
+        st.caption(
+            "Guarda permanentemente estos pedidos en Google Sheets para análisis futuros. "
+            "Los datos quedan en las pestañas HISTORICO_TICKETS y HISTORICO_PRODUCTOS."
+        )
+
+        if st.session_state.get("historico_guardado_sesion", False):
+            st.success("✅ Esta sesión ya fue guardada al histórico.")
+            if st.button("Guardar de nuevo (duplicará registros)"):
+                st.session_state["historico_guardado_sesion"] = False
+                st.rerun()
+        else:
+            if st.button("💾 Guardar todos los tickets al histórico", type="primary"):
+                with st.spinner("Guardando en Google Sheets..."):
+                    tickets_g, productos_g = guardar_pedidos_en_historico(pedidos)
+                if tickets_g is None:
+                    st.error(f"Error al guardar: {productos_g}")
+                else:
+                    st.success(
+                        f"✅ Guardados {tickets_g} tickets y {productos_g} productos al histórico. "
+                        "Velos en la pestaña 'Análisis de clientes'."
+                    )
+                    st.session_state["historico_guardado_sesion"] = True
+                    cargar_historico.clear()
 
         st.divider()
         with st.expander("Ver imágenes de los tickets", expanded=False):
