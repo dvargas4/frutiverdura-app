@@ -804,11 +804,12 @@ def _componer_ticket_mp210(pedido, mostrar_guia=False):
 
     # Tipografías base del diseño aprobado.
     f_body = cargar_fuente(_ruta_regular, 30)
-    f_qty = cargar_fuente(_ruta_regular, 30)
+    f_qty = cargar_fuente(_ruta_regular, 25)  # misma escala que DATOS DEL CLIENTE
     f_meta = cargar_fuente(_ruta_regular, 25)
     f_label = cargar_fuente(_ruta_medium, 23)
-    f_head = cargar_fuente(_ruta_medium, 26)
-    f_total = cargar_fuente(_ruta_semibold, 39)
+    f_head = cargar_fuente(_ruta_medium, 23)  # igual que el encabezado DATOS DEL CLIENTE
+    f_total = cargar_fuente(_ruta_semibold, 39)  # conserva el TOTAL destacado aprobado
+    f_producto = f_meta  # productos, cantidades, precios y precio unitario: 25 px
     f_small = cargar_fuente(_ruta_light, 21)
     f_footer = cargar_fuente(_ruta_regular, 23)
     f_rule = cargar_fuente(_ruta_medium, 14)
@@ -994,29 +995,31 @@ def _componer_ticket_mp210(pedido, mostrar_guia=False):
     productos = sorted(pedido.get('productos', []), key=lambda p: p[3], reverse=True)
     for idx, (nombre, gramos, _costo, venta) in enumerate(productos):
         precio = f'${float(venta):,.2f}'
-        disponible = max(80, ANCHO_PX - ancho(precio, f_body) - 17)
-        for j, segmento in enumerate(envolver(str(nombre).title(), f_body, disponible) or [str(nombre).title()]):
-            izquierda(segmento, f_body)
+        disponible = max(80, ANCHO_PX - ancho(precio, f_producto) - 17)
+        for j, segmento in enumerate(envolver(str(nombre).title(), f_producto, disponible) or [str(nombre).title()]):
+            izquierda(segmento, f_producto)
             if j == 0:
-                derecha(precio, f_body)
-            avanzar(f_body, 3)
+                derecha(precio, f_producto)
+            avanzar(f_producto, 3)
         izquierda(cantidad_ticket_kg(gramos), f_qty)
         avanzar(f_qty, 9 if es_remision and float(gramos or 0) > 0 else 13)
         if es_remision and float(gramos or 0) > 0:
             precio_kg = float(venta) * 1000 / float(gramos)
-            izquierda(f'Precio unitario: ${precio_kg:,.4f}/kg', f_small)
-            avanzar(f_small, 12)
+            for seg in envolver(f'Precio unitario: ${precio_kg:,.4f}/kg', f_producto, ANCHO_PX - 2):
+                izquierda(seg, f_producto)
+                avanzar(f_producto, 3)
+            y += 9
         if idx < len(productos) - 1:
             separador(2, antes=1, despues=14)
 
     totales = totales_pedido(pedido)
     separador(6, antes=3, despues=18)
-    bloque_etiqueta_valor('Productos', str(len(productos)), f_meta, f_body)
-    bloque_etiqueta_valor('Subtotal', f'${totales["subtotal_venta"]:,.2f}', f_meta, f_body)
+    bloque_etiqueta_valor('Productos', str(len(productos)), f_producto, f_producto)
+    bloque_etiqueta_valor('Subtotal', f'${totales["subtotal_venta"]:,.2f}', f_producto, f_producto)
     if totales.get('costo_envio', 0) > 0:
-        bloque_etiqueta_valor('Envío', f'${totales["costo_envio"]:,.2f}', f_meta, f_body)
+        bloque_etiqueta_valor('Envío', f'${totales["costo_envio"]:,.2f}', f_producto, f_producto)
     if pedido.get('descuento', 0) > 0:
-        bloque_etiqueta_valor('Descuento', f'-${pedido["descuento"]:,.2f}', f_meta, f_body)
+        bloque_etiqueta_valor('Descuento', f'-${pedido["descuento"]:,.2f}', f_producto, f_producto)
     separador(7, antes=0, despues=17)
     izquierda('TOTAL', f_total)
     derecha(f'${totales["nuevo_total"]:,.2f}', f_total)
