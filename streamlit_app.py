@@ -708,9 +708,26 @@ def cantidad_ticket_kg(gramos):
 
 class _DibujoTicketImpreso:
     """Captura el diseño del ticket sin modificar el lienzo ni el estado global."""
-    def __init__(self, dibujo, operaciones):
+    def __init__(self, dibujo, operaciones, origen_guia=None):
+        self.origen_guia = origen_guia
         self.dibujo = dibujo
         self.operaciones = operaciones
+
+    def guia_horizontal(self, y, fuente):
+        if self.origen_guia is None:
+            return y
+        # Medir el ancho imprimible completo, sin margen de calibración.
+        inicio = self.origen_guia
+        fin = inicio + 330
+        self.line([(inicio, y + 7), (fin, y + 7)], fill="black", width=2)
+        for indice in range(10):
+            x = inicio + (fin - inicio) * indice / 9
+            self.line([(x, y), (x, y + 8)], fill="black", width=2)
+            numero = str(indice + 1)
+            ancho = self.dibujo.textlength(numero, font=fuente)
+            x_texto = max(inicio, min(x - ancho / 2, fin - ancho))
+            self.text((x_texto, y + 10), numero, font=fuente, fill="black")
+        return y + 38
 
     def __getattr__(self, nombre):
         return getattr(self.dibujo, nombre)
@@ -724,11 +741,11 @@ class _DibujoTicketImpreso:
         return self.dibujo.line(xy, fill=fill, width=width, **kwargs)
 
 
-def operaciones_ticket_impreso(pedido):
+def operaciones_ticket_impreso(pedido, origen_guia=None):
     """Un único diseño para PDF vectorial y PNG nativo de la MP210."""
     operaciones = []
     generador = generar_remision_png if pedido.get("tipo") == "factura" else generar_ticket_normal_png
-    generador(pedido, _para_impresion=True, _operaciones=operaciones)
+    generador(pedido, _para_impresion=True, _operaciones=operaciones, _origen_guia=origen_guia)
     ultimo_pixel = 0
     for op in operaciones:
         if op[0] == "texto":
@@ -738,11 +755,12 @@ def operaciones_ticket_impreso(pedido):
     return operaciones, max(40, int(ultimo_pixel + 20))
 
 
-def generar_ticket_termico_png(pedido):
+def generar_ticket_termico_png(pedido, mostrar_guia=True):
     """PNG nativo de 384 puntos a 203 dpi: texto redibujado, sin ampliar una imagen."""
-    operaciones, alto = operaciones_ticket_impreso(pedido)
     escala = 384 / 330
     ajuste_izquierda_px = 12  # 1.5 mm a 203 dpi en la MP210.
+    origen = 110 + ajuste_izquierda_px / escala if mostrar_guia else None
+    operaciones, alto = operaciones_ticket_impreso(pedido, origen)
     imagen = Image.new("RGB", (384, int(alto * escala + 0.5)), "white")
     draw = ImageDraw.Draw(imagen)
     fuentes = {}
@@ -758,14 +776,16 @@ def generar_ticket_termico_png(pedido):
             draw.text(((x - 110) * escala - ajuste_izquierda_px, y * escala), texto, font=fuentes[clave], fill="black")
         else:
             _, puntos, grosor = op
-            draw.line([(max(0, (max(110, x) - 110) * escala - ajuste_izquierda_px), y * escala) for x, y in puntos],
+            draw.line([(min(imagen.width - 1, max(0, (max(110, x) - 110) * escala - ajuste_izquierda_px)), y * escala) for x, y in puntos],
                       fill="black", width=max(1, round(grosor * escala)))
     buf = io.BytesIO()
-    imagen.save(buf, format="PNG", dpi=(203, 203))
+    # Oscurecer los bordes suavizados manteniendo los blancos y el negro puro.
+    contraste = [round(255 * (tono / 255) ** 1.8) for tono in range(256)]
+    imagen.convert("L").point(contraste).save(buf, format="PNG", dpi=(203, 203))
     return buf.getvalue()
 
 
-def generar_ticket_termico_pdf(pedido):
+def generar_ticket_termico_pdf(pedido, mostrar_guia=True):
     """Una página de 58 mm de ancho, área útil de 48 mm y largo según contenido."""
     from reportlab.pdfgen import canvas
     from reportlab.pdfbase import pdfmetrics
@@ -773,7 +793,7 @@ def generar_ticket_termico_pdf(pedido):
     from reportlab.lib.units import mm
     import hashlib
 
-    operaciones, alto = operaciones_ticket_impreso(pedido)
+    operaciones, alto = operaciones_ticket_impreso(pedido, 110 if mostrar_guia else None)
     escala = 48 * mm / 330
     alto_pdf = alto * escala
     buf = io.BytesIO()
@@ -888,12 +908,13 @@ def descargar_tickets_impresos(pedidos, indices):
     except ImportError:
         pdf_disponible = False
         st.warning("Para habilitar PDF, añade reportlab>=4.0,<5 a requirements.txt y reinicia la app. Puedes descargar PNG mientras tanto.")
+    mostrar_guia = st.checkbox("Incluir guía de ancho del 1 al 10", value=True, key="guia_ancho_mp210")
     archivos = []
     for indice in indices:
         pedido = pedidos[indice]
         nombre = nombre_archivo_ticket_termico(pedido, indice)
-        png = generar_ticket_termico_png(pedido)
-        pdf = generar_ticket_termico_pdf(pedido) if pdf_disponible else None
+        png = generar_ticket_termico_png(pedido, mostrar_guia)
+        pdf = generar_ticket_termico_pdf(pedido, mostrar_guia) if pdf_disponible else None
         archivos.append((pedido, nombre, png, pdf))
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as archivo:
@@ -936,7 +957,7 @@ def fuentes_ticket_mp210():
         return tuple(ImageFont.load_default(size=tamano) for tamano in (22, 18, 16, 20, 14))
 
 
-def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _operaciones=None):
+def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _operaciones=None, _origen_guia=None):
     """Genera la imagen del ticket y devuelve los bytes PNG.
     Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
     totales abajo a la derecha.
@@ -1034,7 +1055,7 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _o
     img = Image.new("RGB", (ancho, alto), c_fondo)
     draw = ImageDraw.Draw(img)
     if _operaciones is not None:
-        draw = _DibujoTicketImpreso(draw, _operaciones)
+        draw = _DibujoTicketImpreso(draw, _operaciones, _origen_guia)
 
     # Helper: medir ancho de texto (compatible con varias versiones de PIL)
     def text_width(texto, fuente):
@@ -1093,6 +1114,9 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _o
     # Línea separadora
     draw.line([(margen_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
     y += 12
+
+    if _operaciones is not None:
+        y = draw.guia_horizontal(y, f_compacta)
 
     # Headers de columna
     if not _para_impresion:
@@ -1207,7 +1231,7 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _o
     return buf.getvalue()
 
 
-def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operaciones=None):
+def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operaciones=None, _origen_guia=None):
     """Genera la imagen del ticket y devuelve los bytes PNG.
     Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
     totales abajo a la derecha.
@@ -1387,7 +1411,7 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
     img = Image.new("RGB", (ancho, alto), c_fondo)
     draw = ImageDraw.Draw(img)
     if _operaciones is not None:
-        draw = _DibujoTicketImpreso(draw, _operaciones)
+        draw = _DibujoTicketImpreso(draw, _operaciones, _origen_guia)
 
     # Helper: medir ancho de texto (compatible con varias versiones de PIL)
     def text_width(texto, fuente):
@@ -1425,6 +1449,9 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
     # Línea separadora
     draw.line([(margen_x, y), (ancho - margen_x, y)], fill=c_titulo, width=1)
     y += 12
+
+    if _operaciones is not None:
+        y = draw.guia_horizontal(y, f_compacta)
 
     # Headers de columna
     if not _para_impresion:
