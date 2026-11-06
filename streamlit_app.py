@@ -755,78 +755,337 @@ def operaciones_ticket_impreso(pedido, origen_guia=None):
     return operaciones, max(40, int(ultimo_pixel + 20))
 
 
-def generar_ticket_termico_png(pedido, mostrar_guia=True):
-    """PNG nativo de 384 puntos a 203 dpi: texto redibujado, sin ampliar una imagen."""
-    escala = 384 / 330
-    ajuste_izquierda_px = 12  # 1.5 mm a 203 dpi en la MP210.
-    origen = 110 + ajuste_izquierda_px / escala if mostrar_guia else None
-    operaciones, alto = operaciones_ticket_impreso(pedido, origen)
-    imagen = Image.new("RGB", (384, int(alto * escala + 0.5)), "white")
-    draw = ImageDraw.Draw(imagen)
-    fuentes = {}
-    for op in operaciones:
-        if op[0] == "texto":
-            _, (x, y), texto, fuente = op
-            ruta = getattr(fuente, "path", None)
-            tamano = max(1, round(getattr(fuente, "size", 13) * escala))
-            clave = (ruta, tamano)
-            if clave not in fuentes:
-                fuentes[clave] = (ImageFont.truetype(ruta, tamano) if ruta
-                                  else ImageFont.load_default(size=tamano))
-            draw.text(((x - 110) * escala - ajuste_izquierda_px, y * escala), texto, font=fuentes[clave], fill="black")
-        else:
-            _, puntos, grosor = op
-            draw.line([(min(imagen.width - 1, max(0, (max(110, x) - 110) * escala - ajuste_izquierda_px)), y * escala) for x, y in puntos],
-                      fill="black", width=max(1, round(grosor * escala)))
-    buf = io.BytesIO()
-    # Oscurecer los bordes suavizados manteniendo los blancos y el negro puro.
-    contraste = [round(255 * (tono / 255) ** 1.8) for tono in range(256)]
-    imagen.convert("L").point(contraste).save(buf, format="PNG", dpi=(203, 203))
-    return buf.getvalue()
+def _componer_ticket_mp210(pedido, mostrar_guia=False):
+    """Diseño final aprobado para la MP210.
+
+    - Encabezado grande «FRUTI VERDURA / A DOMICILIO».
+    - Letra más grande y más delgada.
+    - Separadores gruesos y más visibles.
+    - Mismo estilo para tickets sin factura y con factura/remisión.
+    - La guía 1..10 es opcional y solo para pruebas de impresión.
+    """
+    ANCHO_PX = 384  # 48 mm útiles a 203 dpi
+    try:
+        from pathlib import Path as _Path
+        _font_dir = _Path('/usr/share/fonts/truetype/lato')
+        _ruta_light = str(_font_dir / 'Lato-Light.ttf')
+        _ruta_regular = str(_font_dir / 'Lato-Regular.ttf')
+        _ruta_medium = str(_font_dir / 'Lato-Medium.ttf')
+        _ruta_semibold = str(_font_dir / 'Lato-Semibold.ttf')
+        _ruta_bold = str(_font_dir / 'Lato-Bold.ttf')
+    except Exception:
+        _ruta_light = FUENTE_REG or 'DejaVuSans.ttf'
+        _ruta_regular = FUENTE_REG or 'DejaVuSans.ttf'
+        _ruta_medium = FUENTE_BOLD or 'DejaVuSans-Bold.ttf'
+        _ruta_semibold = FUENTE_BOLD or 'DejaVuSans-Bold.ttf'
+        _ruta_bold = FUENTE_BOLD or 'DejaVuSans-Bold.ttf'
+
+    def cargar_fuente(ruta, tam):
+        try:
+            return ImageFont.truetype(ruta, tam)
+        except OSError:
+            try:
+                return ImageFont.truetype(FUENTE_REG or 'DejaVuSans.ttf', tam)
+            except OSError:
+                return ImageFont.load_default(size=tam)
+
+    medidor = ImageDraw.Draw(Image.new('L', (ANCHO_PX, 10), 255))
+
+    def ancho(texto, font):
+        try:
+            return float(medidor.textlength(str(texto), font=font))
+        except Exception:
+            caja = medidor.textbbox((0, 0), str(texto), font=font)
+            return float(caja[2] - caja[0])
+
+    def alto(font, muestra='ÁgM0123'):
+        caja = font.getbbox(muestra)
+        return int(caja[3] - caja[1])
+
+    # Tipografías base del diseño aprobado.
+    f_body = cargar_fuente(_ruta_regular, 30)
+    f_qty = cargar_fuente(_ruta_regular, 30)
+    f_meta = cargar_fuente(_ruta_regular, 25)
+    f_label = cargar_fuente(_ruta_medium, 23)
+    f_head = cargar_fuente(_ruta_medium, 26)
+    f_total = cargar_fuente(_ruta_semibold, 39)
+    f_small = cargar_fuente(_ruta_light, 21)
+    f_footer = cargar_fuente(_ruta_regular, 23)
+    f_rule = cargar_fuente(_ruta_medium, 14)
+    f_notice = cargar_fuente(_ruta_light, 19)
+    f_notice_bold = cargar_fuente(_ruta_medium, 21)
+
+    def fuente_que_ajusta(texto, ruta, tam_inicial, minimo=18, ancho_max=None):
+        ancho_max = ancho_max if ancho_max is not None else ANCHO_PX - 4
+        tam = tam_inicial
+        font = cargar_fuente(ruta, tam)
+        while tam > minimo and ancho(texto, font) > ancho_max:
+            tam -= 1
+            font = cargar_fuente(ruta, tam)
+        return font
+
+    def envolver(texto, font, limite):
+        texto = str(texto or '').strip()
+        if not texto:
+            return []
+        lineas, linea = [], ''
+        for palabra in texto.split():
+            prueba = (linea + ' ' + palabra).strip()
+            if ancho(prueba, font) <= limite:
+                linea = prueba
+                continue
+            if linea:
+                lineas.append(linea)
+            linea = palabra
+            if ancho(linea, font) > limite:
+                buffer = ''
+                for ch in linea:
+                    if buffer and ancho(buffer + ch, font) > limite:
+                        lineas.append(buffer)
+                        buffer = ''
+                    buffer += ch
+                linea = buffer
+        if linea:
+            lineas.append(linea)
+        return lineas
+
+    ops = []
+    y = 16
+
+    def poner_texto(x, py, contenido, font):
+        ops.append(('texto', int(round(max(0, x))), int(round(py)), str(contenido), font))
+
+    def izquierda(s, font=f_body, yy=None):
+        poner_texto(0, y if yy is None else yy, s, font)
+
+    def derecha(s, font=f_body, yy=None):
+        poner_texto(ANCHO_PX - ancho(s, font), y if yy is None else yy, s, font)
+
+    def centro(s, font=f_body, yy=None):
+        poner_texto((ANCHO_PX - ancho(s, font)) / 2, y if yy is None else yy, s, font)
+
+    def avanzar(font, despues=0):
+        nonlocal y
+        y += alto(font) + despues
+
+    def separador(grueso=5, antes=12, despues=18):
+        nonlocal y
+        y += antes
+        ops.append(('rect', 0, y, ANCHO_PX - 1, y + grueso - 1))
+        y += grueso + despues
+
+    def bloque_etiqueta_valor(etiqueta, valor, font_izq=None, font_der=None, gap=10):
+        nonlocal y
+        font_izq = font_izq or f_meta
+        font_der = font_der or f_body
+        valor = str(valor)
+        limite = max(70, ANCHO_PX - ancho(valor, font_der) - gap)
+        lineas = envolver(str(etiqueta), font_izq, limite)
+        if not lineas:
+            lineas = ['']
+        base_y = y
+        for idx, linea in enumerate(lineas):
+            izquierda(linea, font_izq, base_y + idx * (alto(font_izq) + 2))
+        derecha(valor, font_der, base_y)
+        y = max(base_y + len(lineas) * (alto(font_izq) + 2), base_y + alto(font_der)) + 8
+
+    def guia_ancho():
+        nonlocal y
+        separador(3, antes=4, despues=13)
+        centro('GUÍA DE ANCHO DE IMPRESIÓN', f_small)
+        avanzar(f_small, 13)
+        rule_y = y + 10
+        ops.append(('linea_ancha', 0, rule_y, ANCHO_PX - 1, rule_y, 2))
+        for n in range(1, 11):
+            x = int(round((n - 1) * (ANCHO_PX - 1) / 9))
+            ops.append(('linea_ancha', x, rule_y - 6, x, rule_y + 7, 2))
+            s = str(n)
+            w = ancho(s, f_rule)
+            x_t = max(0, min(ANCHO_PX - w, x - w / 2))
+            poner_texto(x_t, rule_y + 11, s, f_rule)
+        y = rule_y + 41
+
+    # Encabezado principal
+    font_brand = fuente_que_ajusta('FRUTI VERDURA', _ruta_medium, 46, minimo=28, ancho_max=ANCHO_PX - 5)
+    font_sub = fuente_que_ajusta('A DOMICILIO', _ruta_medium, 60, minimo=32, ancho_max=ANCHO_PX - 5)
+    centro('FRUTI VERDURA', font_brand)
+    avanzar(font_brand, 6)
+    centro('A DOMICILIO', font_sub)
+    avanzar(font_sub, 13)
+    fecha_ref = pedido.get('fecha_custom') or pedido.get('fecha_emision') or datetime.now(pytz.timezone(ZONA_HORARIA)).strftime('%d/%m/%Y')
+    fecha_txt = str(fecha_ref).split()[0]
+    centro(fecha_txt, f_meta)
+    avanzar(f_meta, 13)
+    separador(6, antes=6, despues=19)
+
+    es_remision = pedido.get('tipo') == 'factura'
+
+    if es_remision:
+        preparar_remision(pedido)
+        izquierda('DATOS DEL CLIENTE', f_label)
+        avanzar(f_label, 7)
+        for linea in envolver(pedido.get('cliente', ''), f_body, ANCHO_PX - 2):
+            izquierda(linea, f_body)
+            avanzar(f_body, 2)
+        if pedido.get('domicilio_entrega'):
+            y += 6
+            izquierda('ENTREGA', f_label)
+            avanzar(f_label, 6)
+            for linea in envolver(str(pedido['domicilio_entrega']), f_body, ANCHO_PX - 2):
+                izquierda(linea, f_body)
+                avanzar(f_body, 2)
+        y += 7
+        izquierda('DETALLE', f_label)
+        avanzar(f_label, 7)
+        bloque_etiqueta_valor('Folio', str(pedido.get('folio_remision', '')), f_meta, f_meta)
+        bloque_etiqueta_valor('Expedición', str(pedido.get('fecha_emision', fecha_txt)), f_meta, f_meta)
+        if pedido.get('contacto'):
+            bloque_etiqueta_valor('Contacto', str(pedido.get('contacto', '')), f_meta, f_meta)
+        if pedido.get('telefono'):
+            bloque_etiqueta_valor('Teléfono', str(pedido['telefono']), f_meta, f_meta)
+        emisor = pedido.get('emisor_remision') or {}
+        emisor_lineas = []
+        if emisor.get('domicilio'):
+            emisor_lineas.append(str(emisor['domicilio']))
+        lugar_cp = ' '.join(v for v in [emisor.get('lugar'), ('C.P. ' + emisor.get('cp', '') if emisor.get('cp') else '')] if v)
+        if lugar_cp:
+            emisor_lineas.append(lugar_cp)
+        if emisor_lineas:
+            separador(4, antes=2, despues=14)
+            izquierda('EMISOR', f_label)
+            avanzar(f_label, 7)
+            for linea in emisor_lineas:
+                for seg in envolver(linea, f_meta, ANCHO_PX - 2):
+                    izquierda(seg, f_meta)
+                    avanzar(f_meta, 2)
+    else:
+        izquierda('PEDIDO', f_label)
+        avanzar(f_label, 7)
+        for linea in envolver(str(pedido.get('cliente', '')).upper(), f_body, ANCHO_PX - 2):
+            izquierda(linea, f_body)
+            avanzar(f_body, 2)
+        y += 7
+        izquierda('CONTACTO', f_label)
+        avanzar(f_label, 7)
+        contacto = str(pedido.get('contacto', ''))
+        if pedido.get('telefono'):
+            contacto = (contacto + ' · ' if contacto else '') + str(pedido['telefono'])
+        for linea in envolver(contacto or 'SIN CONTACTO', f_body, ANCHO_PX - 2):
+            izquierda(linea, f_body)
+            avanzar(f_body, 2)
+
+    separador(6, antes=5, despues=15)
+    izquierda('PRODUCTO', f_head)
+    derecha('VENTA', f_head)
+    avanzar(f_head, 9)
+    separador(3, antes=2, despues=13)
+
+    productos = sorted(pedido.get('productos', []), key=lambda p: p[3], reverse=True)
+    for idx, (nombre, gramos, _costo, venta) in enumerate(productos):
+        precio = f'${float(venta):,.2f}'
+        disponible = max(80, ANCHO_PX - ancho(precio, f_body) - 17)
+        for j, segmento in enumerate(envolver(str(nombre).title(), f_body, disponible) or [str(nombre).title()]):
+            izquierda(segmento, f_body)
+            if j == 0:
+                derecha(precio, f_body)
+            avanzar(f_body, 3)
+        izquierda(cantidad_ticket_kg(gramos), f_qty)
+        avanzar(f_qty, 9 if es_remision and float(gramos or 0) > 0 else 13)
+        if es_remision and float(gramos or 0) > 0:
+            precio_kg = float(venta) * 1000 / float(gramos)
+            izquierda(f'Precio unitario: ${precio_kg:,.4f}/kg', f_small)
+            avanzar(f_small, 12)
+        if idx < len(productos) - 1:
+            separador(2, antes=1, despues=14)
+
+    totales = totales_pedido(pedido)
+    separador(6, antes=3, despues=18)
+    bloque_etiqueta_valor('Productos', str(len(productos)), f_meta, f_body)
+    bloque_etiqueta_valor('Subtotal', f'${totales["subtotal_venta"]:,.2f}', f_meta, f_body)
+    if totales.get('costo_envio', 0) > 0:
+        bloque_etiqueta_valor('Envío', f'${totales["costo_envio"]:,.2f}', f_meta, f_body)
+    if pedido.get('descuento', 0) > 0:
+        bloque_etiqueta_valor('Descuento', f'-${pedido["descuento"]:,.2f}', f_meta, f_body)
+    separador(7, antes=0, despues=17)
+    izquierda('TOTAL', f_total)
+    derecha(f'${totales["nuevo_total"]:,.2f}', f_total)
+    avanzar(f_total, 10)
+    separador(5, antes=0, despues=22)
+
+    if es_remision:
+        izquierda('PAGO', f_label)
+        avanzar(f_label, 8)
+        bloque_etiqueta_valor('Estado', str(pedido.get('estado_pago', 'Por confirmar')), f_meta, f_meta)
+        if pedido.get('medio_pago'):
+            bloque_etiqueta_valor('Medio', str(pedido['medio_pago']), f_meta, f_meta)
+        if pedido.get('cfdi_referencia'):
+            bloque_etiqueta_valor('CFDI', str(pedido['cfdi_referencia']), f_meta, f_meta)
+        separador(4, antes=4, despues=14)
+        izquierda('RECEPCIÓN DE MERCANCÍA', f_label)
+        avanzar(f_label, 8)
+        if pedido.get('observaciones_remision'):
+            for linea in envolver('Observaciones: ' + str(pedido['observaciones_remision']), f_meta, ANCHO_PX - 2):
+                izquierda(linea, f_meta)
+                avanzar(f_meta, 2)
+            y += 4
+        for s in ['Recibió: ____________________', 'Firma: _____________________', 'Fecha y hora: _____________']:
+            izquierda(s, f_meta)
+            avanzar(f_meta, 8)
+        separador(4, antes=3, despues=16)
+        centro('Este documento no es un CFDI.', f_notice_bold)
+        avanzar(f_notice_bold, 5)
+        centro('La recepción no acredita el pago.', f_notice)
+        avanzar(f_notice, 12)
+    else:
+        centro('GRACIAS POR TU COMPRA', f_footer)
+        avanzar(f_footer, 8)
+        centro('Solo informativo. No es comprobante fiscal.', f_notice)
+        avanzar(f_notice, 10)
+
+    if mostrar_guia:
+        guia_ancho()
+
+    alto_final = max(70, y + 10)
+    img = Image.new('L', (ANCHO_PX, alto_final), 255)
+    d = ImageDraw.Draw(img)
+    for op in ops:
+        if op[0] == 'texto':
+            _, x, py, contenido, font = op
+            d.text((x, py), contenido, font=font, fill=0)
+        elif op[0] == 'rect':
+            _, x1, y1, x2, y2 = op
+            d.rectangle((x1, y1, x2, y2), fill=0)
+        elif op[0] == 'linea_ancha':
+            _, x1, y1, x2, y2, width = op
+            d.line((x1, y1, x2, y2), fill=0, width=width)
+    return img
 
 
-def generar_ticket_termico_pdf(pedido, mostrar_guia=True):
-    """Una página de 58 mm de ancho, área útil de 48 mm y largo según contenido."""
+
+def generar_ticket_termico_png(pedido, mostrar_guia=False):
+    """PNG 384 px con el diseño final aprobado para la MP210."""
+    imagen = _componer_ticket_mp210(pedido, mostrar_guia)
+    b = io.BytesIO()
+    imagen.save(b, format='PNG', dpi=(203, 203))
+    return b.getvalue()
+
+
+def generar_ticket_termico_pdf(pedido, mostrar_guia=False):
+    """El mismo diseño final en PDF de 58 mm (48 mm útiles centrados)."""
     from reportlab.pdfgen import canvas
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.lib.utils import ImageReader
     from reportlab.lib.units import mm
-    import hashlib
-
-    operaciones, alto = operaciones_ticket_impreso(pedido, 110 if mostrar_guia else None)
-    escala = 48 * mm / 330
-    alto_pdf = alto * escala
-    buf = io.BytesIO()
-    pdf = canvas.Canvas(buf, pagesize=(58 * mm, alto_pdf), pageCompression=1)
-    pdf.setTitle("Ticket impreso - " + pedido["cliente"])
-    pdf.setAuthor("Frutiverdura a Domicilio")
-    pdf.setFillColorRGB(0, 0, 0)
-    pdf.setStrokeColorRGB(0, 0, 0)
-    for op in operaciones:
-        if op[0] == "texto":
-            _, (x, y), texto, fuente = op
-            ruta = getattr(fuente, "path", None)
-            tamano = getattr(fuente, "size", 13)
-            nombre_fuente = "Helvetica"
-            if isinstance(ruta, (str, bytes, os.PathLike)) and os.path.isfile(ruta):
-                nombre_fuente = "Ticket_" + hashlib.sha256(os.fsencode(ruta)).hexdigest()[:16]
-                if nombre_fuente not in pdfmetrics.getRegisteredFontNames():
-                    pdfmetrics.registerFont(TTFont(nombre_fuente, ruta))
-            pdf.setFont(nombre_fuente, tamano * escala)
-            ascenso = fuente.getmetrics()[0] if hasattr(fuente, "getmetrics") else tamano
-            pdf.drawString(5 * mm + (x - 110) * escala,
-                           alto_pdf - (y + ascenso) * escala, texto)
-        else:
-            _, puntos, grosor = op
-            pdf.setLineWidth(grosor * escala)
-            for inicio, fin in zip(puntos, puntos[1:]):
-                pdf.line(5 * mm + (max(110, inicio[0]) - 110) * escala,
-                         alto_pdf - inicio[1] * escala,
-                         5 * mm + (max(110, fin[0]) - 110) * escala,
-                         alto_pdf - fin[1] * escala)
+    imagen = _componer_ticket_mp210(pedido, mostrar_guia)
+    alto_mm = imagen.height / 8  # 203dpi=8 puntos por mm
+    b = io.BytesIO()
+    pdf = canvas.Canvas(b, pagesize=(58 * mm, alto_mm * mm))
+    pdf.setTitle('Ticket termico MP210 - ' + str(pedido.get('cliente', '')))
+    pdf.setAuthor('Frutiverdura a Domicilio')
+    pdf.drawImage(ImageReader(imagen), 5 * mm, 0,
+                  width=48 * mm, height=alto_mm * mm, mask='auto')
     pdf.showPage()
     pdf.save()
-    return buf.getvalue()
+    return b.getvalue()
 
 
 def compartir_ticket_impreso(contenido, nombre, mime):
@@ -908,7 +1167,7 @@ def descargar_tickets_impresos(pedidos, indices):
     except ImportError:
         pdf_disponible = False
         st.warning("Para habilitar PDF, añade reportlab>=4.0,<5 a requirements.txt y reinicia la app. Puedes descargar PNG mientras tanto.")
-    mostrar_guia = st.checkbox("Incluir guía de ancho del 1 al 10", value=True, key="guia_ancho_mp210")
+    mostrar_guia = st.checkbox("Mostrar guía de ancho 1–10 (solo prueba)", value=False, key="guia_ancho_mp210")
     archivos = []
     for indice in indices:
         pedido = pedidos[indice]
@@ -923,7 +1182,7 @@ def descargar_tickets_impresos(pedidos, indices):
             if pdf is not None:
                 archivo.writestr("PDF/" + nombre[:-4] + ".pdf", pdf)
     st.markdown("**Descargar tickets seleccionados**")
-    st.caption("MP210 · PDF de 58 mm con texto vectorial · PNG de 384 px. Un archivo por ticket. En Print Fast selecciona la MP210 y papel de 58 mm.")
+    st.caption("MP210 · PDF de 58 mm · PNG nativo de 384 px. Diseño final con encabezado grande, letra más delgada y separadores gruesos. Un archivo por ticket. En Print Fast selecciona la MP210 y papel de 58 mm.")
     st.download_button(
         f"📦 Descargar seleccionados ({len(archivos)}) · ZIP",
         data=zip_buf.getvalue(), file_name="tickets_impresos_seleccionados.zip",
@@ -950,11 +1209,16 @@ def descargar_tickets_impresos(pedidos, indices):
 
 def fuentes_ticket_mp210():
     """Tamaños fijos para título, encabezado, detalle, total y notas del rollo."""
-    ruta = FUENTE_BOLD or "DejaVuSans-Bold.ttf"
-    try:
-        return tuple(ImageFont.truetype(ruta, tamano) for tamano in (22, 18, 16, 20, 14))
-    except OSError:
-        return tuple(ImageFont.load_default(size=tamano) for tamano in (22, 18, 16, 20, 14))
+    regular = FUENTE_REG or "DejaVuSans.ttf"
+    negrita = FUENTE_BOLD or "DejaVuSans-Bold.ttf"
+    def cargar(ruta, tamano):
+        try:
+            return ImageFont.truetype(ruta, tamano)
+        except OSError:
+            return ImageFont.load_default(size=tamano)
+    # La escala nativa de la MP210 convierte estos tamaños a 33, 20 y 16 px.
+    return (cargar(negrita, 28), cargar(negrita, 17), cargar(regular, 14),
+            cargar(negrita, 28), cargar(regular, 14))
 
 
 def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _operaciones=None, _origen_guia=None):
@@ -986,6 +1250,9 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _o
     if _para_impresion:
         f_titulo, f_header, f_reg, f_total_bold, f_compacta = fuentes_ticket_mp210()
 
+    f_producto = f_header if _para_impresion else f_reg
+    f_subtotal = f_header if _para_impresion else f_total_bold
+
     # ---- Dimensiones ----
     ancho = 440
     margen_x = 20
@@ -995,18 +1262,19 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _o
     # Medir y envolver cada descripción dentro de su columna, sin mover importes.
     medidor = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     def medir(texto):
-        bbox = medidor.textbbox((0, 0), texto, font=f_reg)
+        bbox = medidor.textbbox((0, 0), texto, font=f_producto)
         return bbox[2] - bbox[0]
 
     productos_ord = sorted(productos, key=lambda p: p[3], reverse=True)
     ancho_venta = max([medir(f"${p[3]:,.2f}") for p in productos_ord] + [medir("VENTA")])
     ancho_producto = max(1, ancho - margen_x - ancho_venta - 12 - 130)
     filas_producto = []
-    paso_texto = max(18, f_reg.getbbox("Ágj")[3] - f_reg.getbbox("Ágj")[1] + 4)
+    paso_texto = max(18, f_producto.getbbox("Ágj")[3] - f_producto.getbbox("Ágj")[1] + 4)
     for nombre, gramos, costo, venta in productos_ord:
         lineas, linea = [], ""
         cantidad = cantidad_ticket_kg(gramos) if _para_impresion else f"{int(gramos)}g"
-        for palabra in f"{nombre} {cantidad}".split():
+        palabras = [*nombre.split(), cantidad] if _para_impresion else f"{nombre} {cantidad}".split()
+        for palabra in palabras:
             candidato = f"{linea} {palabra}".strip()
             if medir(candidato) <= ancho_producto:
                 linea = candidato
@@ -1135,11 +1403,12 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _o
         if not _para_impresion:
             draw.text((col_costo_x, y), f"${costo:,.2f}", font=f_reg, fill=c_costo)
         for indice_linea, linea in enumerate(lineas):
-            draw.text((col_producto_x, y + indice_linea * paso_texto), linea,
-                      font=f_reg, fill=c_titulo)
+            texto, fuente = linea if isinstance(linea, tuple) else (linea, f_producto)
+            draw.text((col_producto_x, y + indice_linea * paso_texto), texto,
+                      font=fuente, fill=c_titulo)
         venta_txt = f"${venta:,.2f}"
-        tw = text_width(venta_txt, f_reg)
-        draw.text((col_venta_x - tw, y), venta_txt, font=f_reg, fill=c_venta)
+        tw = text_width(venta_txt, f_producto)
+        draw.text((col_venta_x - tw, y), venta_txt, font=f_producto, fill=c_venta)
         y += alto_fila
         cortes_pdf.append(y)
 
@@ -1186,8 +1455,8 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _o
     y += interlinea
 
     sub_txt = f"Subtotal Venta : ${totales['subtotal_venta']:,.2f}"
-    tw = text_width(sub_txt, f_total_bold)
-    draw.text((col_venta_x - tw, y), sub_txt, font=f_total_bold, fill=c_venta)
+    tw = text_width(sub_txt, f_subtotal)
+    draw.text((col_venta_x - tw, y), sub_txt, font=f_subtotal, fill=c_venta)
     y += interlinea
 
     if totales["costo_envio"] > 0:
@@ -1207,6 +1476,10 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _o
     y += 8
 
     total_txt = f"TOTAL : ${totales['nuevo_total']:,.2f}"
+    if _para_impresion and text_width(total_txt, f_total_bold) > col_venta_x - col_producto_x:
+        draw.text((col_producto_x, y), "TOTAL", font=f_total_bold, fill=c_venta)
+        y += f_total_bold.size + 8
+        total_txt = f"${totales['nuevo_total']:,.2f}"
     tw = text_width(total_txt, f_total_bold)
     draw.text((col_venta_x - tw, y), total_txt, font=f_total_bold, fill=c_venta)
     y += interlinea + 8
@@ -1216,9 +1489,9 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _o
         y = max(y, y_izq + 4)
 
     gracias = "GRACIAS POR TU COMPRA"
-    tw = text_width(gracias, f_total_bold)
+    tw = text_width(gracias, f_subtotal)
     # Centrado en zona cliente (entre col_producto_x y borde derecho), no en ancho total
-    draw.text((centro_cliente - tw // 2, y), gracias, font=f_total_bold, fill=c_titulo)
+    draw.text((centro_cliente - tw // 2, y), gracias, font=f_subtotal, fill=c_titulo)
 
     if _para_pdf:
         # Solo el PDF elimina el espacio vacío sobrante del pie.
@@ -1261,6 +1534,9 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
     if _para_impresion:
         f_titulo, f_header, f_reg, f_total_bold, f_compacta = fuentes_ticket_mp210()
 
+    f_producto = f_header if _para_impresion else f_reg
+    f_subtotal = f_header if _para_impresion else f_total_bold
+
     # ---- Dimensiones ----
     ancho = 440
     margen_x = 20
@@ -1270,7 +1546,7 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
     # Medir y envolver cada descripción dentro de su columna, sin mover importes.
     medidor = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     def medir(texto):
-        bbox = medidor.textbbox((0, 0), texto, font=f_reg)
+        bbox = medidor.textbbox((0, 0), texto, font=f_producto)
         return bbox[2] - bbox[0]
 
     def envolver(texto, fuente=f_reg, limite=290):
@@ -1324,7 +1600,7 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
     if pedido.get("domicilio_entrega"):
         agregar_texto(lineas_encabezado, "Entrega: " + pedido["domicilio_entrega"], centrado=True)
     separar(lineas_encabezado)
-    agregar_texto(lineas_encabezado, "NOTA DE REMISIÓN", f_titulo, True)
+    agregar_texto(lineas_encabezado, "NOTA DE REMISIÓN", f_header if _para_impresion else f_titulo, True)
     agregar_texto(lineas_encabezado, "Folio: " + pedido["folio_remision"], centrado=True)
     agregar_texto(lineas_encabezado, "Expedición: " + pedido["fecha_emision"], centrado=True)
     if pedido.get("fecha_custom"):
@@ -1348,7 +1624,7 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
                   "Fecha y hora: _____________________"]:
         agregar_texto(lineas_pie, texto)
     separar(lineas_pie)
-    agregar_texto(lineas_pie, "GRACIAS POR TU COMPRA", f_total_bold, True)
+    agregar_texto(lineas_pie, "GRACIAS POR TU COMPRA", f_subtotal, True)
     agregar_texto(lineas_pie, "Este documento no es un CFDI.", f_compacta, True)
     agregar_texto(lineas_pie, "La recepción no acredita el pago.", f_compacta, True)
 
@@ -1356,11 +1632,12 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
     ancho_venta = max([medir(f"${p[3]:,.2f}") for p in productos_ord] + [medir("VENTA")])
     ancho_producto = max(1, ancho - margen_x - ancho_venta - 12 - 130)
     filas_producto = []
-    paso_texto = max(18, f_reg.getbbox("Ágj")[3] - f_reg.getbbox("Ágj")[1] + 4)
+    paso_texto = max(18, f_producto.getbbox("Ágj")[3] - f_producto.getbbox("Ágj")[1] + 4)
     for nombre, gramos, costo, venta in productos_ord:
         lineas, linea = [], ""
         cantidad = cantidad_ticket_kg(gramos) if _para_impresion else f"{int(gramos)}g"
-        for palabra in f"{nombre} {cantidad}".split():
+        palabras = [*nombre.split(), cantidad] if _para_impresion else f"{nombre} {cantidad}".split()
+        for palabra in palabras:
             candidato = f"{linea} {palabra}".strip()
             if medir(candidato) <= ancho_producto:
                 linea = candidato
@@ -1377,7 +1654,9 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
         if linea:
             lineas.append(linea)
         if gramos > 0:
-            lineas.extend(envolver(f"P. unitario: ${venta * 1000 / gramos:,.4f}/kg", limite=ancho_producto))
+            detalle = f"P. unitario: ${venta * 1000 / gramos:,.4f}/kg"
+            for renglon in envolver(detalle, limite=290 if _para_impresion else ancho_producto):
+                lineas.append((renglon, f_reg))
         filas_producto.append((costo, venta, lineas, max(interlinea, len(lineas) * paso_texto + 8)))
 
     # Calcular altura dinámicamente
@@ -1440,7 +1719,7 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
             else:
                 x = centro_cliente - text_width(texto, fuente) / 2 if centrado else col_producto_x
                 draw.text((x, y_actual), texto, font=fuente, fill=c_titulo)
-            y_actual += 28 if _para_impresion else 22
+            y_actual += (max(26, fuente.size + 8) if fuente else 26) if _para_impresion else 22
         return y_actual
 
     y = dibujar_bloques(lineas_encabezado, y)
@@ -1470,11 +1749,12 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
         if not _para_impresion:
             draw.text((col_costo_x, y), f"${costo:,.2f}", font=f_reg, fill=c_costo)
         for indice_linea, linea in enumerate(lineas):
-            draw.text((col_producto_x, y + indice_linea * paso_texto), linea,
-                      font=f_reg, fill=c_titulo)
+            texto, fuente = linea if isinstance(linea, tuple) else (linea, f_producto)
+            draw.text((col_producto_x, y + indice_linea * paso_texto), texto,
+                      font=fuente, fill=c_titulo)
         venta_txt = f"${venta:,.2f}"
-        tw = text_width(venta_txt, f_reg)
-        draw.text((col_venta_x - tw, y), venta_txt, font=f_reg, fill=c_venta)
+        tw = text_width(venta_txt, f_producto)
+        draw.text((col_venta_x - tw, y), venta_txt, font=f_producto, fill=c_venta)
         y += alto_fila
         cortes_pdf.append(y)
 
@@ -1521,8 +1801,8 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
     y += interlinea
 
     sub_txt = f"Subtotal Venta : ${totales['subtotal_venta']:,.2f}"
-    tw = text_width(sub_txt, f_total_bold)
-    draw.text((col_venta_x - tw, y), sub_txt, font=f_total_bold, fill=c_venta)
+    tw = text_width(sub_txt, f_subtotal)
+    draw.text((col_venta_x - tw, y), sub_txt, font=f_subtotal, fill=c_venta)
     y += interlinea
 
     if totales["costo_envio"] > 0:
@@ -1542,6 +1822,10 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
     y += 8
 
     total_txt = f"TOTAL : ${totales['nuevo_total']:,.2f}"
+    if _para_impresion and text_width(total_txt, f_total_bold) > col_venta_x - col_producto_x:
+        draw.text((col_producto_x, y), "TOTAL", font=f_total_bold, fill=c_venta)
+        y += f_total_bold.size + 8
+        total_txt = f"${totales['nuevo_total']:,.2f}"
     tw = text_width(total_txt, f_total_bold)
     draw.text((col_venta_x - tw, y), total_txt, font=f_total_bold, fill=c_venta)
     y += interlinea + 8
