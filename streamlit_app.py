@@ -742,6 +742,7 @@ def generar_ticket_termico_png(pedido):
     """PNG nativo de 384 puntos a 203 dpi: texto redibujado, sin ampliar una imagen."""
     operaciones, alto = operaciones_ticket_impreso(pedido)
     escala = 384 / 330
+    ajuste_izquierda_px = 12  # 1.5 mm a 203 dpi en la MP210.
     imagen = Image.new("RGB", (384, int(alto * escala + 0.5)), "white")
     draw = ImageDraw.Draw(imagen)
     fuentes = {}
@@ -754,10 +755,10 @@ def generar_ticket_termico_png(pedido):
             if clave not in fuentes:
                 fuentes[clave] = (ImageFont.truetype(ruta, tamano) if ruta
                                   else ImageFont.load_default(size=tamano))
-            draw.text(((x - 110) * escala, y * escala), texto, font=fuentes[clave], fill="black")
+            draw.text(((x - 110) * escala - ajuste_izquierda_px, y * escala), texto, font=fuentes[clave], fill="black")
         else:
             _, puntos, grosor = op
-            draw.line([((max(110, x) - 110) * escala, y * escala) for x, y in puntos],
+            draw.line([(max(0, (max(110, x) - 110) * escala - ajuste_izquierda_px), y * escala) for x, y in puntos],
                       fill="black", width=max(1, round(grosor * escala)))
     buf = io.BytesIO()
     imagen.save(buf, format="PNG", dpi=(203, 203))
@@ -808,12 +809,14 @@ def generar_ticket_termico_pdf(pedido):
     return buf.getvalue()
 
 
-def compartir_ticket_impreso(pdf_bytes, nombre):
+def compartir_ticket_impreso(contenido, nombre, mime):
     """Compartir archivo desde un gesto del usuario; descarga normal como alternativa."""
     import base64
     import json
     import streamlit.components.v1 as components
-    datos = json.dumps({"nombre": nombre, "base64": base64.b64encode(pdf_bytes).decode("ascii")})
+    formato = "PNG" if mime == "image/png" else "PDF"
+    datos = json.dumps({"nombre": nombre, "mime": mime, "formato": formato,
+                        "base64": base64.b64encode(contenido).decode("ascii")})
     datos = datos.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     html = '''<!doctype html><html lang="es"><meta charset="utf-8">
     <style>body{margin:0;font:14px system-ui;color:#555}button{padding:10px 14px;
@@ -822,10 +825,11 @@ def compartir_ticket_impreso(pdf_bytes, nombre):
     <p id="estado" role="status" aria-live="polite"></p><script>
     const datos = DATOS_TICKET;
     const bytes = Uint8Array.from(atob(datos.base64), c => c.charCodeAt(0));
-    const archivo = new File([bytes], datos.nombre, {type: 'application/pdf'});
+    const archivo = new File([bytes], datos.nombre, {type: datos.mime});
     const boton = document.getElementById('compartir');
     const estado = document.getElementById('estado');
-    const alternativa = 'Descarga el PDF y ábrelo. Luego usa Compartir → Print Fast.';
+    boton.textContent = 'Compartir ' + datos.formato + ' para imprimir';
+    const alternativa = 'Descarga el ' + datos.formato + ' y ábrelo. Luego usa Compartir → Print Fast.';
     boton.addEventListener('click', async () => {
       if (!navigator.share || !navigator.canShare || !navigator.canShare({files:[archivo]})) {
         estado.textContent = alternativa; return;
@@ -883,7 +887,7 @@ def descargar_tickets_impresos(pedidos, indices):
         pdf_disponible = True
     except ImportError:
         pdf_disponible = False
-        st.warning("Para habilitar PDF y Compartir, añade reportlab>=4.0,<5 a requirements.txt y reinicia la app. Puedes descargar PNG mientras tanto.")
+        st.warning("Para habilitar PDF, añade reportlab>=4.0,<5 a requirements.txt y reinicia la app. Puedes descargar PNG mientras tanto.")
     archivos = []
     for indice in indices:
         pedido = pedidos[indice]
@@ -907,6 +911,12 @@ def descargar_tickets_impresos(pedidos, indices):
     )
     for pedido, nombre, png, pdf in archivos:
         st.markdown("**" + pedido["cliente"].replace("*", "") + "**")
+        st.download_button(
+            "🖼️ PNG para impresora · 384 px", data=png, file_name=nombre,
+            mime="image/png", key=f"descargar_impreso_{pedido['_ui_id']}",
+            use_container_width=True,
+        )
+        compartir_ticket_impreso(png, nombre, "image/png")
         if pdf is not None:
             nombre_pdf = nombre[:-4] + ".pdf"
             st.download_button(
@@ -914,12 +924,7 @@ def descargar_tickets_impresos(pedidos, indices):
                 mime="application/pdf", key=f"descargar_pdf_impreso_{pedido['_ui_id']}",
                 use_container_width=True,
             )
-            compartir_ticket_impreso(pdf, nombre_pdf)
-        st.download_button(
-            "🖼️ PNG para impresora · 384 px", data=png, file_name=nombre,
-            mime="image/png", key=f"descargar_impreso_{pedido['_ui_id']}",
-            use_container_width=True,
-        )
+            compartir_ticket_impreso(pdf, nombre_pdf, "application/pdf")
 
 
 def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _operaciones=None):
