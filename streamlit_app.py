@@ -927,6 +927,15 @@ def descargar_tickets_impresos(pedidos, indices):
             compartir_ticket_impreso(pdf, nombre_pdf, "application/pdf")
 
 
+def fuentes_ticket_mp210():
+    """Tamaños fijos para título, encabezado, detalle, total y notas del rollo."""
+    ruta = FUENTE_BOLD or "DejaVuSans-Bold.ttf"
+    try:
+        return tuple(ImageFont.truetype(ruta, tamano) for tamano in (22, 18, 16, 20, 14))
+    except OSError:
+        return tuple(ImageFont.load_default(size=tamano) for tamano in (22, 18, 16, 20, 14))
+
+
 def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _operaciones=None):
     """Genera la imagen del ticket y devuelve los bytes PNG.
     Layout estilo Imagen 2: header centrado, 3 columnas (COSTO | PRODUCTO | VENTA),
@@ -953,10 +962,13 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _o
         f_total_bold = default
         f_compacta = default
 
+    if _para_impresion:
+        f_titulo, f_header, f_reg, f_total_bold, f_compacta = fuentes_ticket_mp210()
+
     # ---- Dimensiones ----
     ancho = 440
     margen_x = 20
-    interlinea = 26
+    interlinea = 32 if _para_impresion else 26
     interlinea_pequena = 22
 
     # Medir y envolver cada descripción dentro de su columna, sin mover importes.
@@ -1044,10 +1056,11 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _o
     centro_cliente = (col_producto_x + (ancho - margen_x)) // 2
 
     y = 18
-    titulo = "FRUTIVERDURA A DOMICILIO"
-    tw = text_width(titulo, f_titulo)
-    draw.text((centro_cliente - tw // 2, y), titulo, font=f_titulo, fill=c_titulo)
-    y += interlinea + 4
+    titulos = ("FRUTIVERDURA", "A DOMICILIO") if _para_impresion else ("FRUTIVERDURA A DOMICILIO",)
+    for titulo in titulos:
+        tw = text_width(titulo, f_titulo)
+        draw.text((centro_cliente - tw // 2, y), titulo, font=f_titulo, fill=c_titulo)
+        y += interlinea + 4
 
     mx_time = datetime.now(pytz.timezone(ZONA_HORARIA))
     fecha = mx_time.strftime("%d/%m/%Y")
@@ -1221,10 +1234,13 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
         f_total_bold = default
         f_compacta = default
 
+    if _para_impresion:
+        f_titulo, f_header, f_reg, f_total_bold, f_compacta = fuentes_ticket_mp210()
+
     # ---- Dimensiones ----
     ancho = 440
     margen_x = 20
-    interlinea = 26
+    interlinea = 32 if _para_impresion else 26
     interlinea_pequena = 22
 
     # Medir y envolver cada descripción dentro de su columna, sin mover importes.
@@ -1264,7 +1280,11 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
     def separar(destino):
         destino.append((None, None, False))
 
-    agregar_texto(lineas_encabezado, "FRUTIVERDURA A DOMICILIO" if _para_impresion else (emisor.get("nombre") or "NOMBRE DEL NEGOCIO"), f_titulo, True)
+    if _para_impresion:
+        for titulo in ("FRUTIVERDURA", "A DOMICILIO"):
+            agregar_texto(lineas_encabezado, titulo, f_titulo, True)
+    else:
+        agregar_texto(lineas_encabezado, emisor.get("nombre") or "NOMBRE DEL NEGOCIO", f_titulo, True)
     agregar_texto(lineas_encabezado, emisor.get("domicilio") or "Domicilio: pendiente", centrado=True)
     agregar_texto(lineas_encabezado,
                   (emisor.get("lugar") or "Lugar: pendiente") + " · C.P. " + (emisor.get("cp") or "pendiente"), centrado=True)
@@ -1396,7 +1416,7 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
             else:
                 x = centro_cliente - text_width(texto, fuente) / 2 if centrado else col_producto_x
                 draw.text((x, y_actual), texto, font=fuente, fill=c_titulo)
-            y_actual += 22
+            y_actual += 28 if _para_impresion else 22
         return y_actual
 
     y = dibujar_bloques(lineas_encabezado, y)
