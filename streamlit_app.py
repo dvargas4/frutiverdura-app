@@ -48,6 +48,82 @@ CATALOGOS = {
     "DOS V": {"hoja": "DOS V", "producto": 0, "costo": 5, "precio": 7},
     "MAYOREO": {"hoja": "NEGOCIOS", "producto": 0, "costo": 5, "precio": 7},
 }
+# El precio de las columnas originales sigue siendo por kg para las filas antiguas.
+# Para filas con UNIDAD=pz/costal, esas mismas columnas expresan $/pz o $/costal.
+UNIDADES_BASE = ("kg", "pz", "costal")
+COLUMNAS_UNIDADES = ("UNIDAD", "GRAMOS_POR_UNIDAD")
+
+
+class LineaProducto(tuple):
+    """Compatible con las antiguas tuplas (nombre, gramos, costo, venta).
+
+    El segundo valor conserva los gramos equivalentes, o 0 si se desconoce el
+    peso de una pieza/costal. La cantidad vendida vive aparte y nunca se adivina.
+    """
+    def __new__(cls, nombre, gramos, costo, venta, unidad="g", cantidad=None):
+        obj = super().__new__(cls, (nombre, float(gramos), float(costo), float(venta)))
+        obj.unidad = unidad
+        obj.cantidad = float(gramos if cantidad is None else cantidad)
+        return obj
+
+    def __getnewargs__(self):
+        return tuple(self)
+
+
+def unidad_base_producto(nombre, precios):
+    return precios.get(nombre, {}).get("unidad_base", "kg")
+
+
+def unidad_visual_linea(linea):
+    return getattr(linea, "unidad", "g")
+
+
+def cantidad_linea(linea):
+    return getattr(linea, "cantidad", linea[1])
+
+
+def cantidad_etiqueta(linea, termico=False):
+    unidad = unidad_visual_linea(linea)
+    cantidad = cantidad_linea(linea)
+    if unidad in ("g", "kg"):
+        return cantidad_ticket_kg(linea[1]) if termico else f"{cantidad:g} g"
+    etiqueta = "pz" if unidad == "pz" else ("costal" if cantidad == 1 else "costales")
+    return f"{cantidad:g} {etiqueta}"
+
+
+def etiqueta_precio_unitario(linea):
+    unidad = unidad_visual_linea(linea)
+    if unidad in ("g", "kg"):
+        cantidad = float(linea[1]) / 1000
+        etiqueta = "kg"
+    else:
+        cantidad = cantidad_linea(linea)
+        etiqueta = unidad
+    return f"${linea[3] / cantidad:,.4f}/{etiqueta}" if cantidad else "Sin cantidad"
+
+
+def cantidad_y_unidad_preview(prod, precios):
+    nombre = prod.get("match")
+    base = unidad_base_producto(nombre, precios)
+    if base == "kg":
+        return float(prod.get("gramos", 0)), "g"
+    if prod.get("unidad_detectada") == base:
+        return float(prod.get("cantidad", 0)), base
+    return float(prod.get("cantidad", 0)), base
+
+
+def peso_equivalente_preview(prod, precios):
+    cantidad, unidad = cantidad_y_unidad_preview(prod, precios)
+    if unidad == "g":
+        return cantidad
+    peso_unitario = float(precios[prod["match"]].get("gramos_por_unidad", 0))
+    return peso_unitario * cantidad
+
+
+def cantidad_valida_preview(prod, precios):
+    return cantidad_y_unidad_preview(prod, precios)[0] > 0
+
+
 DATOS_POR_CATALOGO = ("pedidos", "gastos_sesion", "historico_guardado_sesion")
 
 CONTACTOS = {
@@ -121,8 +197,16 @@ def limpiar_valor(valor):
     return numero
 
 
-def catalogo_desde_filas(filas, modalidad):
+def _indice_encabezado(encabezados, candidatos):
+    valores = [str(x).strip().upper() for x in encabezados]
+    return next((i for i, valor in enumerate(valores) if valor in candidatos), None)
+
+
+def catalogo_desde_filas(filas, modalidad, encabezados=None):
     config = CATALOGOS[modalidad]
+    encabezados = encabezados or []
+    col_unidad = _indice_encabezado(encabezados, {"UNIDAD", "UNIDAD_VENTA"})
+    col_peso = _indice_encabezado(encabezados, {"GRAMOS_POR_UNIDAD", "PESO_POR_UNIDAD_G"})
     precios, costos = {}, {}
     for numero_fila, fila in enumerate(filas, start=2):
         col_nombre = config["producto"]
@@ -131,16 +215,25 @@ def catalogo_desde_filas(filas, modalidad):
             continue
         contexto = f"Hoja {config['hoja']}, fila {numero_fila}, producto {nombre}"
         if nombre in precios:
-            raise ValueError(f"{contexto}: nombre duplicado. Deja una sola fila por producto.")
+            raise ValueError(f"{contexto}: nombre duplicado.")
         if len(fila) <= max(config["costo"], config["precio"]):
             raise ValueError(f"{contexto}: falta costo o precio.")
         try:
             costo = limpiar_valor(fila[config["costo"]])
             precio = limpiar_valor(fila[config["precio"]])
+            raw_unidad = str(fila[col_unidad]).strip().lower() if col_unidad is not None and len(fila) > col_unidad else ""
+            unidad = {"pieza": "pz", "piezas": "pz", "costales": "costal", "g": "kg"}.get(raw_unidad, raw_unidad or "kg")
+            if unidad not in UNIDADES_BASE:
+                raise ValueError("UNIDAD debe ser kg, pz o costal")
+            raw_peso = fila[col_peso] if col_peso is not None and len(fila) > col_peso else ""
+            gramos_por_unidad = (1000.0 if unidad == "kg" else 0.0) if raw_peso in ("", None) else limpiar_valor(raw_peso)
+            if unidad == "kg":
+                gramos_por_unidad = 1000.0
         except ValueError as error:
             raise ValueError(f"{contexto}: {error}") from error
-        precios[nombre] = {"precio_venta_kg": precio}
-        costos[nombre] = {"costo_kg": costo}
+        precios[nombre] = {"precio_venta_kg": precio, "precio_unitario": precio,
+                           "unidad_base": unidad, "gramos_por_unidad": gramos_por_unidad}
+        costos[nombre] = {"costo_kg": costo, "costo_unitario": costo, "unidad_base": unidad}
     if not precios:
         raise ValueError(f"La hoja {config['hoja']} no contiene productos válidos desde la fila 2.")
     return precios, costos
@@ -157,7 +250,8 @@ def cargar_catalogo_gsheets(modalidad):
     )
     client = gspread.authorize(creds)
     sheet = client.open_by_url(SPREADSHEET_URL).worksheet(config["hoja"])
-    return catalogo_desde_filas(sheet.get_all_values(value_render_option="UNFORMATTED_VALUE")[1:], modalidad)
+    valores = sheet.get_all_values(value_render_option="UNFORMATTED_VALUE")
+    return catalogo_desde_filas(valores[1:], modalidad, valores[0] if valores else [])
 
 
 def limpiar_estado_catalogo():
@@ -219,6 +313,7 @@ HEADERS_TICKETS = [
 ]
 HEADERS_PRODUCTOS = [
     "fecha", "cliente", "contacto", "producto", "gramos", "costo", "venta",
+    "unidad", "cantidad", "peso_equivalente_g", "precio_unitario",
 ]
 # Gastos: bitácora independiente. NO se mezcla con tickets/productos ni
 # afecta utilidad, análisis de clientes ni resultados. Es solo un registro
@@ -241,7 +336,37 @@ def _abrir_spreadsheet():
 
 
 
-def guardar_producto_en_hoja(modalidad, nombre, costo, precio):
+def _asegurar_columnas_unidades(ws):
+    """Agrega encabezados al final de la hoja sin mover columnas ni fórmulas existentes."""
+    filas = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
+    encabezados = [str(v).strip() for v in filas[0]] if filas else []
+    if not encabezados:
+        raise ValueError("La hoja debe tener encabezados en la primera fila.")
+    existentes = {x.upper() for x in encabezados}
+    faltantes = [x for x in COLUMNAS_UNIDADES if x not in existentes]
+    if faltantes:
+        from gspread.utils import rowcol_to_a1
+        inicio = max([len(encabezados)] + [len(fila) for fila in filas]) + 1
+        ws.update(range_name=f"{rowcol_to_a1(1, inicio)}:{rowcol_to_a1(1, inicio + len(faltantes) - 1)}",
+                  values=[faltantes])
+        encabezados.extend([""] * (inicio - 1 - len(encabezados)))
+        encabezados.extend(faltantes)
+    return encabezados
+
+
+def preparar_columnas_tres_catalogos():
+    ss = _abrir_spreadsheet()
+    resultado = {}
+    for conf in CATALOGOS.values():
+        hoja = conf["hoja"]
+        encabezados = _asegurar_columnas_unidades(ss.worksheet(hoja))
+        resultado[hoja] = [[h.strip().upper() for h in encabezados].index(c) + 1 for c in COLUMNAS_UNIDADES]
+    ws = _obtener_o_crear_pestaña(ss, "HISTORICO_PRODUCTOS", HEADERS_PRODUCTOS)
+    _asegurar_encabezados_historico(ws, HEADERS_PRODUCTOS)
+    return resultado
+
+
+def guardar_producto_en_hoja(modalidad, nombre, costo, precio, unidad="kg", gramos_por_unidad=0):
     """Guarda en la pestaña elegida y sólo publica precios releídos de Sheets."""
     if (modalidad != st.session_state.get("catalogo_activo")
             or modalidad != st.session_state.get("selector_catalogo")):
@@ -252,8 +377,12 @@ def guardar_producto_en_hoja(modalidad, nombre, costo, precio):
     if not nombre:
         raise ValueError("Escribe el nombre del producto.")
     costo, precio = limpiar_valor(costo), limpiar_valor(precio)
+    if unidad not in UNIDADES_BASE:
+        raise ValueError("La unidad debe ser kg, pz o costal.")
+    gramos_por_unidad = 1000.0 if unidad == "kg" else limpiar_valor(gramos_por_unidad)
     ss = _abrir_spreadsheet()
     ws = ss.worksheet(config["hoja"])
+    encabezados = _asegurar_columnas_unidades(ws)
     filas = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
     if not filas or not any(str(v).strip() for v in filas[0]):
         raise ValueError("La hoja necesita sus encabezados en la fila 1 antes de agregar productos.")
@@ -265,10 +394,13 @@ def guardar_producto_en_hoja(modalidad, nombre, costo, precio):
 
     # appendCells determina la última fila ocupada en el servidor, incluso con
     # huecos o fórmulas. No calcula una fila local que pueda sobrescribir datos.
-    celdas = [{} for _ in range(max(config["producto"], config["costo"], config["precio"]) + 1)]
+    celdas = [{} for _ in range(max(len(encabezados), config["producto"] + 1, config["costo"] + 1, config["precio"] + 1))]
     celdas[col] = {"userEnteredValue": {"stringValue": nombre}}
     celdas[config["costo"]] = {"userEnteredValue": {"numberValue": costo}}
     celdas[config["precio"]] = {"userEnteredValue": {"numberValue": precio}}
+    indices_headers = [str(h).strip().upper() for h in encabezados]
+    celdas[indices_headers.index("UNIDAD")] = {"userEnteredValue": {"stringValue": unidad}}
+    celdas[indices_headers.index("GRAMOS_POR_UNIDAD")] = {"userEnteredValue": {"numberValue": gramos_por_unidad}}
     try:
         ss.batch_update({"requests": [{"appendCells": {
             "sheetId": ws.id, "rows": [{"values": celdas}], "fields": "userEnteredValue",
@@ -283,7 +415,7 @@ def guardar_producto_en_hoja(modalidad, nombre, costo, precio):
     resultado = {"clave": clave, "hoja": config["hoja"], "sincronizado": False}
     try:
         filas = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
-        precios, costos = catalogo_desde_filas(filas[1:], modalidad)
+        precios, costos = catalogo_desde_filas(filas[1:], modalidad, filas[0])
         if clave not in precios:
             raise ValueError("El producto guardado todavía no aparece en la lectura.")
         numero = next(i for i, fila in enumerate(filas[1:], start=2)
@@ -306,6 +438,52 @@ def guardar_producto_en_hoja(modalidad, nombre, costo, precio):
     return resultado
 
 
+def actualizar_producto_existente(modalidad, nombre, unidad, gramos_por_unidad, costo, precio):
+    """Edita una única fila existente; no duplica productos ni mueve otras columnas."""
+    if modalidad != st.session_state.get("catalogo_activo"):
+        raise ValueError("Cambió el catálogo activo. Recarga antes de editar.")
+    if unidad not in UNIDADES_BASE:
+        raise ValueError("Unidad de venta no válida.")
+    costo, precio = limpiar_valor(costo), limpiar_valor(precio)
+    gramos_por_unidad = (1000.0 if unidad == "kg" else limpiar_valor(gramos_por_unidad))
+    ss = _abrir_spreadsheet()
+    conf = CATALOGOS[modalidad]
+    ws = ss.worksheet(conf["hoja"])
+    encabezados = _asegurar_columnas_unidades(ws)
+    filas = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
+    candidatas = [numero for numero, fila in enumerate(filas[1:], start=2)
+                  if len(fila) > conf["producto"] and str(fila[conf["producto"]]).strip().lower() == nombre.lower()]
+    if len(candidatas) != 1:
+        raise ValueError("El producto no se encontró exactamente una vez. No se hizo ninguna modificación.")
+    fila_n = candidatas[0]
+    from gspread.utils import rowcol_to_a1
+    headers_mayus = [str(h).strip().upper() for h in encabezados]
+    nuevos_valores = {
+        conf["costo"] + 1: costo,
+        conf["precio"] + 1: precio,
+        headers_mayus.index("UNIDAD") + 1: unidad,
+        headers_mayus.index("GRAMOS_POR_UNIDAD") + 1: gramos_por_unidad,
+    }
+    ws.batch_update([{"range": rowcol_to_a1(fila_n, col), "values": [[valor]]}
+                     for col, valor in nuevos_valores.items()], value_input_option="USER_ENTERED")
+    # Lectura verificada: si la red falla tras escribir, no invita a guardar dos veces.
+    try:
+        nuevas_filas = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
+        precios, costos = catalogo_desde_filas(nuevas_filas[1:], modalidad, nuevas_filas[0])
+    except Exception as error:
+        st.session_state["catalogo_cargado"] = None
+        raise RuntimeError("Se enviaron los cambios a Sheets, pero falló la verificación. "
+                           "Recarga el catálogo antes de intentar otra edición.") from error
+    st.session_state["precios_dict"] = precios
+    st.session_state["costos_dict"] = costos
+    st.session_state["catalogo_cargado"] = modalidad
+    for clave in ("preview_pedidos", "factura_preview_pedidos", "catalogo_generado"):
+        st.session_state.pop(clave, None)
+    st.session_state["pegar_reset_count"] = st.session_state.get("pegar_reset_count", 0) + 1
+    st.session_state["factura_reset_count"] = st.session_state.get("factura_reset_count", 0) + 1
+    return fila_n
+
+
 def formulario_nuevo_producto(clave_formulario, sugerencia=""):
     modalidad = st.session_state["catalogo_activo"]
     config = CATALOGOS[modalidad]
@@ -313,13 +491,18 @@ def formulario_nuevo_producto(clave_formulario, sugerencia=""):
         "en una fila nueva al final de los datos.")
     with st.form(f"alta_{modalidad}_{clave_formulario}", clear_on_submit=False):
         nombre = st.text_input("Nombre del producto", value=sugerencia)
-        costo = st.number_input("Costo por kg ($)", min_value=0.0, step=1.0, format="%.2f")
-        precio = st.number_input("Precio de venta por kg ($)", min_value=0.0, step=1.0, format="%.2f")
+        unidad = st.selectbox("Unidad de venta", UNIDADES_BASE,
+            format_func=lambda v: {"kg": "Kilogramo", "pz": "Pieza", "costal": "Costal"}[v])
+        st.caption("Las columnas originales de costo y precio representan ahora la unidad seleccionada.")
+        costo = st.number_input("Costo por unidad ($)", min_value=0.0, step=1.0, format="%.2f")
+        precio = st.number_input("Precio de venta por unidad ($)", min_value=0.0, step=1.0, format="%.2f")
+        gramos_por_unidad = (st.number_input("Peso estimado de cada pieza/costal (g), opcional",
+            min_value=0.0, step=100.0) if unidad != "kg" else 1000.0)
         enviar = st.form_submit_button(f"Guardar producto en {config['hoja']}")
     if not enviar:
         return None
     try:
-        resultado = guardar_producto_en_hoja(modalidad, nombre, costo, precio)
+        resultado = guardar_producto_en_hoja(modalidad, nombre, costo, precio, unidad, gramos_por_unidad)
     except Exception as error:
         st.error(str(error))
         return None
@@ -333,7 +516,7 @@ def formulario_nuevo_producto(clave_formulario, sugerencia=""):
 
 
 def formulario_producto_preview(prod, clave_formulario, clave_selector):
-    sugerencia = re.sub(r"^[\d\.\,/]+\s*\w*\s*", "", prod["descripcion_original"]).strip()
+    sugerencia = re.sub(r"^\s*\d+(?:[.,]\d+)?\s*(?:costales?|piezas?|pzas?|pz)?\s*(?:de\s+)?", "", prod["descripcion_original"], flags=re.I).strip()
     nuevo = formulario_nuevo_producto(clave_formulario, sugerencia)
     if nuevo:
         prod["match"] = nuevo
@@ -341,6 +524,25 @@ def formulario_producto_preview(prod, clave_formulario, clave_selector):
         # El widget ya se dibujó en esta pasada; recrearlo evita un valor anterior.
         st.session_state.pop(clave_selector, None)
         st.rerun()
+
+
+def _asegurar_encabezados_historico(ws, headers):
+    primera_fila = ws.row_values(1)
+    if not primera_fila:
+        ws.update("A1", [headers])
+        return list(headers)
+    faltantes = [c for c in headers if c not in primera_fila]
+    if faltantes:
+        from gspread.utils import rowcol_to_a1
+        pos = len(primera_fila) + 1
+        ws.update(range_name=rowcol_to_a1(1, pos), values=[faltantes])
+        primera_fila.extend(faltantes)
+    return primera_fila
+
+
+def _ordenar_fila_historico(headers_reales, headers, valores):
+    datos = dict(zip(headers, valores))
+    return [datos.get(h, "") for h in headers_reales]
 
 
 def _obtener_o_crear_pestaña(spreadsheet, nombre, headers):
@@ -364,6 +566,8 @@ def guardar_pedidos_en_historico(pedidos):
         ss = _abrir_spreadsheet()
         ws_tickets = _obtener_o_crear_pestaña(ss, "HISTORICO_TICKETS", HEADERS_TICKETS)
         ws_productos = _obtener_o_crear_pestaña(ss, "HISTORICO_PRODUCTOS", HEADERS_PRODUCTOS)
+        cols_tickets = _asegurar_encabezados_historico(ws_tickets, HEADERS_TICKETS)
+        cols_productos = _asegurar_encabezados_historico(ws_productos, HEADERS_PRODUCTOS)
 
         fecha_ahora = datetime.now(pytz.timezone(ZONA_HORARIA)).strftime("%Y-%m-%d %H:%M")
 
@@ -389,21 +593,22 @@ def guardar_pedidos_en_historico(pedidos):
                 round(p["utilidad"], 2),
             ])
 
-            for nombre, gramos, costo, venta in p["productos"]:
+            for linea in p["productos"]:
+                nombre, gramos, costo, venta = linea
+                unidad = unidad_visual_linea(linea)
+                cantidad = cantidad_linea(linea)
+                cantidad_tarifa = gramos / 1000 if unidad in ("g", "kg") else cantidad
                 filas_productos.append([
-                    fecha_p,
-                    p["cliente"],
-                    p["contacto"],
-                    nombre,
-                    int(gramos),
-                    round(costo, 2),
-                    round(venta, 2),
+                    fecha_p, p["cliente"], p["contacto"], nombre,
+                    round(gramos, 4), round(costo, 2), round(venta, 2),
+                    unidad, cantidad, round(gramos, 4),
+                    round(venta / cantidad_tarifa, 4) if cantidad_tarifa else 0,
                 ])
 
         if filas_tickets:
-            ws_tickets.append_rows(filas_tickets, value_input_option="RAW")
+            ws_tickets.append_rows([_ordenar_fila_historico(cols_tickets, HEADERS_TICKETS, f) for f in filas_tickets], value_input_option="RAW")
         if filas_productos:
-            ws_productos.append_rows(filas_productos, value_input_option="RAW")
+            ws_productos.append_rows([_ordenar_fila_historico(cols_productos, HEADERS_PRODUCTOS, f) for f in filas_productos], value_input_option="RAW")
 
         return len(filas_tickets), len(filas_productos)
     except Exception as e:
@@ -466,8 +671,11 @@ def cargar_historico():
                 return pd.DataFrame(columns=headers_default)
             if not valores or len(valores) < 2:
                 return pd.DataFrame(columns=headers_default)
-            headers = valores[0]
-            filas = valores[1:]
+            headers = list(valores[0])
+            filas = [list(f) for f in valores[1:]]
+            ancho = max([len(headers)] + [len(f) for f in filas])
+            headers += [f"columna_extra_{i}" for i in range(len(headers) + 1, ancho + 1)]
+            filas = [fila + [""] * (ancho - len(fila)) for fila in filas]
             return pd.DataFrame(filas, columns=headers)
 
         df_t = hoja_a_df("HISTORICO_TICKETS", HEADERS_TICKETS)
@@ -493,9 +701,17 @@ def cargar_historico():
             if col in df_p.columns:
                 df_p[col] = df_p[col].apply(parsear_dinero)
         if "gramos" in df_p.columns:
-            df_p["gramos"] = pd.to_numeric(
-                df_p["gramos"], errors="coerce"
-            ).fillna(0).astype(int)
+            df_p["gramos"] = pd.to_numeric(df_p["gramos"], errors="coerce").fillna(0)
+        if "unidad" not in df_p.columns:
+            df_p["unidad"] = "g"
+        else:
+            df_p["unidad"] = df_p["unidad"].replace("", "g").fillna("g")
+        if "cantidad" not in df_p.columns:
+            df_p["cantidad"] = df_p["gramos"]
+        else:
+            df_p["cantidad"] = pd.to_numeric(df_p["cantidad"], errors="coerce").fillna(df_p["gramos"])
+        if "peso_equivalente_g" not in df_p.columns:
+            df_p["peso_equivalente_g"] = df_p["gramos"]
 
         if "fecha" in df_t.columns:
             df_t["fecha_dt"] = pd.to_datetime(df_t["fecha"], errors="coerce")
@@ -511,45 +727,100 @@ def cargar_historico():
 # ============================
 # Cálculo de totales
 # ============================
-def calcular_linea_catalogo(nombre, gramos, precios, costos):
-    """Siempre parte del precio/kg del catálogo, nunca del importe anterior."""
+def calcular_linea_catalogo(nombre, cantidad, precios, costos, unidad=None):
+    """Tarifa siempre por unidad BASE; los gramos no se convierten a piezas."""
     from decimal import Decimal, ROUND_HALF_UP
-    cantidad = Decimal(str(gramos))
-    precio = Decimal(str(precios[nombre]["precio_venta_kg"]))
-    costo = Decimal(str(costos[nombre]["costo_kg"]))
-    if any(not n.is_finite() or n < 0 for n in (cantidad, precio, costo)):
-        raise ValueError("Cantidad, precio y costo deben ser finitos y no negativos.")
-    def importe(tarifa):
-        return float((cantidad * tarifa / 1000).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP))
-    return (nombre.title(), float(cantidad), importe(costo), importe(precio))
+    base = unidad_base_producto(nombre, precios)
+    unidad = unidad or ("g" if base == "kg" else base)
+    if (base == "kg" and unidad not in ("g", "kg")) or (base != "kg" and unidad != base):
+        raise ValueError(f"{nombre}: la hoja define {base}, no {unidad}.")
+    cantidad_dec = Decimal(str(cantidad))
+    factor = (cantidad_dec / 1000 if unidad == "g" else cantidad_dec)
+    venta = Decimal(str(precios[nombre]["precio_unitario"]))
+    costo = Decimal(str(costos[nombre]["costo_unitario"]))
+    if any(not x.is_finite() or x < 0 for x in (cantidad_dec, venta, costo)):
+        raise ValueError("Cantidad, costo y precio deben ser finitos y no negativos.")
+    gramos_equivalentes = (cantidad_dec if unidad == "g" else
+        cantidad_dec * 1000 if unidad == "kg" else
+        cantidad_dec * Decimal(str(precios[nombre].get("gramos_por_unidad", 0))))
+    def redondear(x):
+        return float(x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    return LineaProducto(nombre.title(), float(gramos_equivalentes), redondear(factor * costo),
+                         redondear(factor * venta), unidad=unidad, cantidad=float(cantidad_dec))
 
 
 def lineas_desde_preview(productos, precios, costos):
-    return [calcular_linea_catalogo(p["match"], p["gramos"], precios, costos)
-            for p in productos if not p.get("omitido", False) and p["match"] in precios
-            and p["match"] in costos and p["gramos"] > 0]
+    lineas = []
+    for p in productos:
+        if not p.get("omitido") and p.get("match") in precios and p.get("match") in costos:
+            cantidad, unidad = cantidad_y_unidad_preview(p, precios)
+            if cantidad > 0:
+                lineas.append(calcular_linea_catalogo(p["match"], cantidad, precios, costos, unidad))
+    return lineas
 
 
 def producto_pendiente_preview(prod, precios, costos):
     return not prod.get("omitido", False) and (
         prod.get("match") not in precios or prod.get("match") not in costos
-        or prod.get("gramos", 0) <= 0)
+        or not cantidad_valida_preview(prod, precios))
 
 
 def seleccionar_producto_preview(prod, opciones, clave):
-    # Valores iniciales estables: una edición no cambia el valor por defecto.
     if clave not in st.session_state:
         st.session_state[clave] = ("(omitir)" if prod.get("omitido") else
             prod["match"] if prod["match"] in opciones else "Producto no encontrado")
     return st.selectbox("Mapear a", opciones, key=clave, label_visibility="collapsed")
 
 
-def editar_gramos_preview(prod, clave):
-    if clave not in st.session_state:
-        st.session_state[clave] = float(prod["gramos"])
-    return st.number_input("g", min_value=0.0, step=10.0,
-        key=clave, label_visibility="collapsed")
+def editar_cantidad_preview(prod, clave, precios):
+    nombre = prod.get("match")
+    base = unidad_base_producto(nombre, precios)
+    unidad = "g" if base == "kg" else base
+    widget_key = f"{clave}_{unidad}"
+    if widget_key not in st.session_state:
+        if unidad == "g":
+            inicial = float(prod.get("gramos", 0))
+        else:
+            inicial = (float(prod.get("cantidad", 0)) if prod.get("unidad_detectada") == unidad
+                       else float(prod.get("cantidad", 0)) if prod.get("unidad") == unidad else 0.0)
+        st.session_state[widget_key] = inicial
+    nueva = st.number_input(unidad, min_value=0.0,
+        step=10.0 if unidad == "g" else 1.0, key=widget_key, label_visibility="collapsed")
+    prod["unidad"] = unidad
+    if unidad == "g":
+        prod["gramos"] = nueva
+    else:
+        prod["cantidad"] = nueva
+        prod["gramos"] = float(precios.get(nombre, {}).get("gramos_por_unidad", 0)) * nueva
+    return nueva
+
+
+def preview_texto_cantidad(prod, precios):
+    cantidad, unidad = cantidad_y_unidad_preview(prod, precios)
+    return f"{cantidad:g} {unidad}"
+
+
+def construir_producto_preview(desc, gramos, catalogo_keys, precios):
+    original = str(desc)
+    encontrado = re.search(r"(?:^|\s)(\d+(?:[.,]\d+)?)\s*(costales?|piezas?|pzas?|pz)\b", original, flags=re.I)
+    unidad_detectada = None
+    cantidad = 0.0
+    limpio = original
+    if encontrado:
+        unidad_detectada = "costal" if encontrado.group(2).lower().startswith("costal") else "pz"
+        cantidad = float(encontrado.group(1).replace(",", "."))
+        limpio = (original[:encontrado.start()] + " " + original[encontrado.end():]).strip()
+        limpio = re.sub(r"^de\s+", "", limpio, flags=re.I)
+    match = buscar_match_catalogo(limpio, catalogo_keys)
+    if match in precios and unidad_base_producto(match, precios) == "kg":
+        # Antiguo parser: (gramos) sigue siendo la fuente autorizada.
+        if not gramos:
+            peso = re.search(r"(?:^|\s)(\d+(?:[.,]\d+)?)\s*(kg|kilos?|g|gramos?)\b", limpio, flags=re.I)
+            if peso:
+                medida = peso.group(2).lower()
+                gramos = float(peso.group(1).replace(",", ".")) * (1000 if medida.startswith(("k",)) else 1)
+    return {"descripcion_original": original, "gramos": float(gramos), "cantidad": cantidad,
+            "unidad_detectada": unidad_detectada, "match": match}
 
 
 def tarifa_envio_actual():
@@ -617,63 +888,57 @@ def calcular_totales(productos, lleva_envio, descuento=0.0, modalidad=None, tari
 
 # Factura: importes internos, integrados en las líneas de producto.
 def calcular_productos_factura(lineas, envio=0.0, comision=0.0, modalidad=None):
-    """Ajusta costos y prorratea cargos en centavos sin alterar el catálogo.
-
-    Cada línea contiene nombre, gramos, costo_kg, precio_kg e incremento_pct.
-    El incremento monetario del costo se traslada a la venta. Los dos cargos
-    adicionales se integran solo en la venta.
-    """
+    """Costo y venta unitarios; prorratea envío/comisión sin deformar unidades."""
     from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR
-
-    def numero(valor):
-        resultado = Decimal(str(valor))
-        if not resultado.is_finite() or resultado < 0:
-            raise ValueError("Los importes, porcentajes y cantidades deben ser finitos y no negativos.")
-        return resultado
-
-    def centavos(valor):
-        return int((valor * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-
-    bases, costos, cantidades = [], [], []
+    def numero(v):
+        x = Decimal(str(v))
+        if not x.is_finite() or x < 0:
+            raise ValueError("Importes y cantidades deben ser finitos y no negativos.")
+        return x
+    def centavos(x):
+        return int((x * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    bases, costos, pesos, cantidades, unidades = [], [], [], [], []
     for linea in lineas:
-        gramos = numero(linea["gramos"])
-        if gramos <= 0:
-            raise ValueError("Cada producto debe tener una cantidad mayor que cero.")
-        cantidades.append(gramos)
-        costo_base = gramos * numero(linea["costo_kg"]) / 1000
+        unidad = linea.get("unidad", "g")
+        cantidad = numero(linea.get("cantidad", linea.get("gramos", 0)))
+        if cantidad <= 0:
+            raise ValueError("Cada producto requiere una cantidad mayor que cero.")
+        factor = cantidad / 1000 if unidad == "g" else cantidad
+        gramos = (cantidad if unidad == "g" else cantidad * 1000 if unidad == "kg"
+            else cantidad * numero(linea.get("gramos_por_unidad", 0)))
         tasa = numero(linea.get("incremento_pct", 0)) / 100
         if tasa >= 1:
-            raise ValueError("El porcentaje de impuestos debe ser menor que 100%.")
-        costo_ajustado = centavos(costo_base / (1 - tasa))
-        aumento_costo = costo_ajustado - centavos(costo_base)
-        costos.append(costo_ajustado)
-        bases.append(centavos(gramos * numero(linea["precio_kg"]) / 1000) + aumento_costo)
+            raise ValueError("Impuestos deben ser menores que 100%.")
+        costo_base = factor * numero(linea.get("costo_kg", 0))
+        ajustado = centavos(costo_base / (1 - tasa))
+        aumento = ajustado - centavos(costo_base)
+        costos.append(ajustado)
+        bases.append(centavos(factor * numero(linea.get("precio_kg", 0))) + aumento)
+        pesos.append(gramos)
+        cantidades.append(cantidad)
+        unidades.append(unidad)
     modalidad = modalidad or st.session_state.get("catalogo_activo", "MENUDEO")
-    envio_aplicado, _, _ = resolver_envio(cantidades, True, modalidad, numero(envio))
+    envio_aplicado, _, _ = resolver_envio(pesos, True, modalidad, numero(envio))
     extras = centavos(numero(envio_aplicado)) + centavos(numero(comision))
     if not lineas:
         if extras:
-            raise ValueError("Agrega productos antes de distribuir el adicional a la venta o la comisión.")
+            raise ValueError("Agrega productos antes de distribuir cargos.")
         return []
-    # Cada línea de producto recibe la misma parte; diferencia máxima: un centavo.
-    pesos = [Decimal(1)] * len(lineas)
-    total_pesos = sum(pesos)
-    cuotas = [Decimal(extras) * peso / total_pesos for peso in pesos]
-    reparto = [int(cuota.to_integral_value(rounding=ROUND_FLOOR)) for cuota in cuotas]
-    orden = sorted(range(len(lineas)), key=lambda i: cuotas[i] - reparto[i], reverse=True)
-    for i in orden[:extras - sum(reparto)]:
+    cuotas = [Decimal(extras) / len(lineas)] * len(lineas)
+    reparto = [int(x.to_integral_value(rounding=ROUND_FLOOR)) for x in cuotas]
+    for i in range(extras - sum(reparto)):
         reparto[i] += 1
-    return [(linea["nombre"], float(cantidades[i]), costos[i] / 100,
-             (bases[i] + reparto[i]) / 100) for i, linea in enumerate(lineas)]
+    return [LineaProducto(linea["nombre"], float(pesos[i]), costos[i] / 100,
+            (bases[i] + reparto[i]) / 100, unidad=unidades[i], cantidad=float(cantidades[i]))
+            for i, linea in enumerate(lineas)]
 
 
 def mostrar_resumen_factura(productos):
-    st.dataframe(pd.DataFrame([
-        {"Producto": n, "Gramos": g, "Costo ajustado ($)": c,
-         "Precio venta/kg ($)": round(v * 1000 / g, 4),
-         "Venta final ($)": v, "Utilidad ($)": round(v - c, 2)}
-        for n, g, c, v in productos
-    ]), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame([{
+        "Producto": p[0], "Cantidad": cantidad_linea(p), "Unidad": unidad_visual_linea(p),
+        "Costo ajustado ($)": p[2], "Precio unitario final": etiqueta_precio_unitario(p),
+        "Venta final ($)": p[3], "Utilidad ($)": round(p[3] - p[2], 2)}
+        for p in productos]), use_container_width=True, hide_index=True)
     totales = calcular_totales(productos, False)
     a, b, c = st.columns(3)
     a.metric("Costo ajustado", f"${totales['subtotal_costo']:,.2f}")
@@ -992,7 +1257,8 @@ def _componer_ticket_mp210(pedido, mostrar_guia=False):
     separador(3, antes=2, despues=13)
 
     productos = sorted(pedido.get('productos', []), key=lambda p: p[3], reverse=True)
-    for idx, (nombre, gramos, _costo, venta) in enumerate(productos):
+    for idx, linea in enumerate(productos):
+        nombre, gramos, _costo, venta = linea
         precio = f'${float(venta):,.2f}'
         disponible = max(80, ANCHO_PX - ancho(precio, f_producto) - 17)
         for j, segmento in enumerate(envolver(str(nombre).title(), f_producto, disponible) or [str(nombre).title()]):
@@ -1000,11 +1266,10 @@ def _componer_ticket_mp210(pedido, mostrar_guia=False):
             if j == 0:
                 derecha(precio, f_producto)
             avanzar(f_producto, 3)
-        izquierda(cantidad_ticket_kg(gramos), f_qty)
-        avanzar(f_qty, 9 if es_remision and float(gramos or 0) > 0 else 13)
-        if es_remision and float(gramos or 0) > 0:
-            precio_kg = float(venta) * 1000 / float(gramos)
-            for seg in envolver(f'Precio unitario: ${precio_kg:,.4f}/kg', f_producto, ANCHO_PX - 2):
+        izquierda(cantidad_etiqueta(linea, termico=True), f_qty)
+        avanzar(f_qty, 9 if es_remision and cantidad_linea(linea) > 0 else 13)
+        if es_remision and cantidad_linea(linea) > 0:
+            for seg in envolver(f'Precio unitario: {etiqueta_precio_unitario(linea)}', f_producto, ANCHO_PX - 2):
                 izquierda(seg, f_producto)
                 avanzar(f_producto, 3)
             y += 9
@@ -1307,9 +1572,10 @@ def generar_ticket_normal_png(pedido, _para_pdf=False, _para_impresion=False, _o
     ancho_producto = max(1, ancho - margen_x - ancho_venta - 12 - 130)
     filas_producto = []
     paso_texto = max(18, f_producto.getbbox("Ágj")[3] - f_producto.getbbox("Ágj")[1] + 4)
-    for nombre, gramos, costo, venta in productos_ord:
+    for producto_linea in productos_ord:
+        nombre, gramos, costo, venta = producto_linea
         lineas, linea = [], ""
-        cantidad = cantidad_ticket_kg(gramos) if _para_impresion else f"{int(gramos)}g"
+        cantidad = cantidad_etiqueta(producto_linea, termico=_para_impresion)
         palabras = [*nombre.split(), cantidad] if _para_impresion else f"{nombre} {cantidad}".split()
         for palabra in palabras:
             candidato = f"{linea} {palabra}".strip()
@@ -1670,9 +1936,10 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
     ancho_producto = max(1, ancho - margen_x - ancho_venta - 12 - 130)
     filas_producto = []
     paso_texto = max(18, f_producto.getbbox("Ágj")[3] - f_producto.getbbox("Ágj")[1] + 4)
-    for nombre, gramos, costo, venta in productos_ord:
+    for producto_linea in productos_ord:
+        nombre, gramos, costo, venta = producto_linea
         lineas, linea = [], ""
-        cantidad = cantidad_ticket_kg(gramos) if _para_impresion else f"{int(gramos)}g"
+        cantidad = cantidad_etiqueta(producto_linea, termico=_para_impresion)
         palabras = [*nombre.split(), cantidad] if _para_impresion else f"{nombre} {cantidad}".split()
         for palabra in palabras:
             candidato = f"{linea} {palabra}".strip()
@@ -1690,8 +1957,8 @@ def generar_remision_png(pedido, _para_pdf=False, _para_impresion=False, _operac
                 linea += caracter
         if linea:
             lineas.append(linea)
-        if gramos > 0:
-            detalle = f"P. unitario: ${venta * 1000 / gramos:,.4f}/kg"
+        if cantidad_linea(producto_linea) > 0:
+            detalle = f"P. unitario: {etiqueta_precio_unitario(producto_linea)}"
             for renglon in envolver(detalle, limite=290 if _para_impresion else ancho_producto):
                 lineas.append((renglon, f_reg))
         filas_producto.append((costo, venta, lineas, max(interlinea, len(lineas) * paso_texto + 8)))
@@ -2095,11 +2362,25 @@ with st.sidebar:
         st.caption("Envío gratis en pedidos de más de 35 kg. Con 35 kg o menos se cobra esta tarifa. "
                    "Aplica al catálogo y a los pedidos nuevos. Se conserva durante esta sesión.")
     config_catalogo = CATALOGOS[modalidad]
+    st.caption("Precio/costo: por kg si UNIDAD=kg; por pieza si UNIDAD=pz; por costal si UNIDAD=costal.")
     st.caption(f"Hoja: {config_catalogo['hoja']} · "
         f"Producto: {chr(65 + config_catalogo['producto'])} · "
-        f"Costo/kg: {chr(65 + config_catalogo['costo'])} · "
-        f"Venta/kg: {chr(65 + config_catalogo['precio'])}")
+        f"Costo por unidad: {chr(65 + config_catalogo['costo'])} · "
+        f"Venta por unidad: {chr(65 + config_catalogo['precio'])}")
     st.button("🔄 Cargar / Recargar catálogo", on_click=recargar_catalogo_activo)
+    with st.expander("⚙️ Activar piezas y costales en Google Sheets"):
+        st.caption("Agrega UNIDAD y GRAMOS_POR_UNIDAD al FINAL de PRECIOS, DOS V y NEGOCIOS, "
+                   "y columnas de cantidad al histórico. No mueve las columnas originales ni sus fórmulas. "
+                   "Las filas existentes continúan como kg; edita UNIDAD para poner pz o costal. "
+                   "El peso de cada pieza/costal es opcional, pero necesario para calcular kg de envío.")
+        if st.button("Preparar columnas en las 3 hojas", key="preparar_columnas_unidades"):
+            try:
+                ubicaciones = preparar_columnas_tres_catalogos()
+                st.success("Columnas creadas o verificadas: " + ", ".join(
+                    f"{hoja} (columnas {inds[0]} y {inds[1]})" for hoja, inds in ubicaciones.items()))
+                recargar_catalogo_activo()
+            except Exception as e:
+                st.error(f"No se pudo actualizar Google Sheets: {e}")
     if st.session_state.get("error_catalogo"):
         st.error(st.session_state["error_catalogo"])
         st.info("No se cargaron precios. Corrige la hoja seleccionada o sus permisos y vuelve a cargar.")
@@ -2111,6 +2392,38 @@ with st.sidebar:
         nuevo_guardado = formulario_nuevo_producto("panel_lateral")
         if nuevo_guardado:
             st.rerun()
+    with st.expander("✏️ Cambiar unidad y precios de un producto existente"):
+        st.caption("Selecciona una fila ya registrada. Al cambiar de kg a pz o costal, "
+                   "especifica el costo y precio por esa NUEVA unidad. Se actualizará Google Sheets.")
+        if st.session_state.get("catalogo_cargado") == modalidad and st.session_state.precios_dict:
+            opciones_editar = sorted(st.session_state.precios_dict)
+            producto_editar = st.selectbox("Producto a modificar", opciones_editar, key=f"editor_unidad_prod_{modalidad}")
+            datos = st.session_state.precios_dict[producto_editar]
+            datos_costo = st.session_state.costos_dict[producto_editar]
+            with st.form(f"editor_presentacion_{modalidad}_{producto_editar}"):
+                base_anterior = datos["unidad_base"]
+                unidad_editar = st.selectbox("Unidad de venta", UNIDADES_BASE,
+                    index=UNIDADES_BASE.index(base_anterior),
+                    format_func=lambda x: {"kg": "Kg", "pz": "Pieza", "costal": "Costal"}[x])
+                costo_editar = st.number_input("Costo por unidad ($)", min_value=0.0,
+                    value=float(datos_costo["costo_unitario"]), format="%.2f")
+                venta_editar = st.number_input("Precio de venta por unidad ($)", min_value=0.0,
+                    value=float(datos["precio_unitario"]), format="%.2f")
+                peso_editar = st.number_input("Gramos por pieza/costal (0 si no se conoce)",
+                    min_value=0.0, value=float(datos["gramos_por_unidad"] if base_anterior != "kg" else 0),
+                    step=100.0, help="Cuando UNIDAD es kg, este campo se fija automáticamente en 1,000 g.")
+                confirmar = st.form_submit_button("Guardar cambios en Google Sheets")
+            if confirmar:
+                try:
+                    fila_editada = actualizar_producto_existente(modalidad, producto_editar,
+                        unidad_editar, peso_editar, costo_editar, venta_editar)
+                    st.success(f"Actualizado {producto_editar.title()} en fila {fila_editada}.")
+                    st.rerun()
+                except Exception as error:
+                    st.error(str(error))
+        else:
+            st.info("Carga el catálogo antes de editar un producto.")
+
     if st.session_state.get("aviso_producto_guardado"):
         st.success(st.session_state.pop("aviso_producto_guardado"))
     st.caption("Al cambiar de lista se descartan borradores y catálogos generados. "
@@ -2926,11 +3239,8 @@ Laura Canales
                     productos_match = []
                     for desc, gramos in productos_raw:
                         match = buscar_match_catalogo(desc, catalogo_keys)
-                        productos_match.append({
-                            "descripcion_original": desc,
-                            "gramos": gramos,
-                            "match": match,
-                        })
+                        productos_match.append(construir_producto_preview(
+                            desc, gramos, catalogo_keys, st.session_state.precios_dict))
                     preview.append({
                         "cliente": cliente,
                         "lleva_envio": envio_rapido,
@@ -2947,11 +3257,8 @@ Laura Canales
                     productos_match = []
                     for desc, gramos in productos_raw:
                         match = buscar_match_catalogo(desc, catalogo_keys)
-                        productos_match.append({
-                            "descripcion_original": desc,
-                            "gramos": gramos,
-                            "match": match,
-                        })
+                        productos_match.append(construir_producto_preview(
+                            desc, gramos, catalogo_keys, st.session_state.precios_dict))
                     preview.append({
                         "cliente": cliente,
                         "lleva_envio": lleva_envio,
@@ -2959,7 +3266,7 @@ Laura Canales
                     })
 
             if not preview:
-                st.error("No se pudieron detectar productos. Revisa que cada línea termine con (gramos).")
+                st.error("No se pudieron detectar productos. Admite (gramos), 2 pz o 1 costal.")
             else:
                 revision_preview += 1
                 st.session_state["pegar_preview_revision"] = revision_preview
@@ -2972,7 +3279,7 @@ Laura Canales
                 )
                 if no_match == 0:
                     st.success(
-                        f"✅ {total_prods} productos detectados, todos con producto y peso. "
+                        f"✅ {total_prods} productos detectados, todos con producto y cantidad. "
                         "Revisa abajo y dale 'Generar' si todo está bien."
                     )
                 else:
@@ -3013,8 +3320,8 @@ Laura Canales
                 for j, prod in enumerate(ped["productos"]):
                     col1, col2, col3 = st.columns([3, 3, 1])
                     with col1:
-                        etiqueta = f"{prod['descripcion_original']} ({int(prod['gramos'])}g)"
-                        if tiene_indicador_empaque(prod['descripcion_original']):
+                        etiqueta = str(prod["descripcion_original"])
+                        if tiene_indicador_empaque(prod["descripcion_original"]):
                             etiqueta = "📦 " + etiqueta
                         st.text(etiqueta)
                     with col2:
@@ -3028,21 +3335,21 @@ Laura Canales
                         else:
                             prod["match"] = nuevo_match
                     with col3:
-                        nuevos_g = editar_gramos_preview(prod, f"pegar_{rk}_{revision_preview}_prev_gr_{i}_{j}")
-                        prod["gramos"] = nuevos_g
+                        editar_cantidad_preview(prod, f"pegar_{rk}_{revision_preview}_prev_cant_{i}_{j}", st.session_state.precios_dict)
                     if not prod.get("omitido"):
                         if prod["match"] is None:
-                            st.error("Producto no encontrado en esta lista. Asígnalo, selecciona (omitir) o usa Crear nuevo producto para guardarlo en esta hoja.")
-                        if prod["gramos"] <= 0:
-                            st.warning("Peso no encontrado o inválido. Captura los gramos o selecciona (omitir).")
-
-                    if (prod["match"] in st.session_state.precios_dict
-                            and prod["match"] in st.session_state.costos_dict):
-                        linea_base = calcular_linea_catalogo(prod["match"], prod["gramos"],
-                            st.session_state.precios_dict, st.session_state.costos_dict)
-                        tarifa = st.session_state.precios_dict[prod["match"]]["precio_venta_kg"]
-                        st.caption(f"{prod['gramos']:g} g ÷ 1,000 × ${tarifa:,.2f}/kg = ${linea_base[3]:,.2f} de venta base")
-
+                            st.error("Producto no encontrado en esta lista. Asígnalo o crea uno nuevo.")
+                        if not cantidad_valida_preview(prod, st.session_state.precios_dict):
+                            st.warning("Cantidad pendiente. Introduce gramos, piezas o costales según la unidad de la hoja.")
+                    if prod["match"] in st.session_state.precios_dict and prod["match"] in st.session_state.costos_dict:
+                        cant, unidad = cantidad_y_unidad_preview(prod, st.session_state.precios_dict)
+                        linea_base = calcular_linea_catalogo(prod["match"], cant,
+                            st.session_state.precios_dict, st.session_state.costos_dict, unidad)
+                        tarifa = st.session_state.precios_dict[prod["match"]]["precio_unitario"]
+                        divisor = 1000 if unidad == "g" else 1
+                        st.caption(f"{cant:g} {unidad} × ${tarifa:,.2f}/{st.session_state.precios_dict[prod['match']]['unidad_base']}" +
+                                   (" ÷ 1,000" if divisor == 1000 else "") +
+                                   f" = ${linea_base[3]:,.2f} de venta base")
                     if prod["match"] == "__nuevo__":
                         formulario_producto_preview(prod, f"pegar_{rk}_{revision_preview}_nuevo_{i}_{j}",
                             f"pegar_{rk}_{revision_preview}_prev_match_{i}_{j}")
@@ -3056,19 +3363,13 @@ Laura Canales
                     if p["match"]
                     and p["match"] in st.session_state.precios_dict
                     and p["match"] in st.session_state.costos_dict
-                    and p["gramos"] > 0
+                    and cantidad_valida_preview(p, st.session_state.precios_dict)
                 ]
 
                 if len(productos_validos) >= MIN_PRODUCTOS_DESCUENTO:
                     # Calcular subtotales con productos válidos para saber el descuento máximo
-                    subtotal_costo_prev = sum(
-                        (p["gramos"] * st.session_state.costos_dict[p["match"]]["costo_kg"]) / 1000
-                        for p in productos_validos
-                    )
-                    subtotal_venta_prev = sum(
-                        (p["gramos"] * st.session_state.precios_dict[p["match"]]["precio_venta_kg"]) / 1000
-                        for p in productos_validos
-                    )
+                    subtotal_costo_prev = sum(p[2] for p in ped["productos_calculados"])
+                    subtotal_venta_prev = sum(p[3] for p in ped["productos_calculados"])
                     costo_envio_prev = calcular_totales(
                         ped["productos_calculados"], ped["lleva_envio"])["costo_envio"]
                     utilidad_prev = subtotal_venta_prev + costo_envio_prev - subtotal_costo_prev
@@ -3097,7 +3398,9 @@ Laura Canales
                     ped["lleva_envio"], ped.get("descuento", 0.0))
                 st.metric("Total del pedido", f"${resumen['nuevo_total']:,.2f}")
                 if ped["lleva_envio"]:
-                    st.caption(f"Peso del pedido: {resumen['peso_kg']:g} kg · " +
+                    if any(unidad_visual_linea(p) in ("pz", "costal") and p[1] <= 0 for p in ped["productos_calculados"]):
+                        st.warning("Hay piezas/costales sin peso equivalente. No contarán para alcanzar 35 kg de envío gratis.")
+                    st.caption(f"Peso conocido del pedido: {resumen['peso_kg']:g} kg · " +
                         ("Envío gratis por superar 35 kg" if resumen["envio_gratis"] else
                          f"Envío: ${resumen['costo_envio']:,.2f}"))
 
@@ -3112,19 +3415,19 @@ Laura Canales
                     productos_sin_asignar.append({
                         "cliente": ped["cliente"],
                         "descripcion": prod["descripcion_original"],
-                        "gramos": prod["gramos"],
+                        "cantidad_txt": preview_texto_cantidad(prod, st.session_state.precios_dict),
                     })
 
         if productos_sin_asignar:
             st.error(
                 f"⚠️ Hay {len(productos_sin_asignar)} productos pendientes de revisar. "
-                "Asigna o crea cada producto y verifica su peso. "
+                "Asigna o crea cada producto y verifica su cantidad. "
                 "Para excluirlo, selecciona (omitir) en esa línea."
             )
             with st.expander("Ver productos pendientes", expanded=True):
                 for sa in productos_sin_asignar:
                     st.markdown(
-                        f"- **{sa['cliente']}**: `{sa['descripcion']}` ({int(sa['gramos'])}g)"
+                        f"- **{sa['cliente']}**: `{sa['descripcion']}` ({sa['cantidad_txt']})"
                     )
 
         col_g1, col_g2 = st.columns(2)
@@ -3310,11 +3613,8 @@ Laura Canales
                     productos_match = []
                     for desc, gramos in productos_raw:
                         match = buscar_match_catalogo(desc, catalogo_keys)
-                        productos_match.append({
-                            "descripcion_original": desc,
-                            "gramos": gramos,
-                            "match": match,
-                        })
+                        productos_match.append(construir_producto_preview(
+                            desc, gramos, catalogo_keys, st.session_state.precios_dict))
                     preview.append({
                         "cliente": cliente,
                         "lleva_envio": envio_rapido,
@@ -3331,11 +3631,8 @@ Laura Canales
                     productos_match = []
                     for desc, gramos in productos_raw:
                         match = buscar_match_catalogo(desc, catalogo_keys)
-                        productos_match.append({
-                            "descripcion_original": desc,
-                            "gramos": gramos,
-                            "match": match,
-                        })
+                        productos_match.append(construir_producto_preview(
+                            desc, gramos, catalogo_keys, st.session_state.precios_dict))
                     preview.append({
                         "cliente": cliente,
                         "lleva_envio": lleva_envio,
@@ -3343,7 +3640,7 @@ Laura Canales
                     })
 
             if not preview:
-                st.error("No se pudieron detectar productos. Revisa que cada línea termine con (gramos).")
+                st.error("No se pudieron detectar productos. Admite (gramos), 2 pz o 1 costal.")
             else:
                 for ped in preview:
                     ped["envio_integrado"] = envio_default
@@ -3367,7 +3664,7 @@ Laura Canales
                 )
                 if no_match == 0:
                     st.success(
-                        f"✅ {total_prods} productos detectados, todos con producto y peso. "
+                        f"✅ {total_prods} productos detectados, todos con producto y cantidad. "
                         "Revisa abajo y dale 'Generar' si todo está bien."
                     )
                 else:
@@ -3412,8 +3709,8 @@ Laura Canales
                 for j, prod in enumerate(ped["productos"]):
                     col1, col2, col3 = st.columns([3, 3, 1])
                     with col1:
-                        etiqueta = f"{prod['descripcion_original']} ({int(prod['gramos'])}g)"
-                        if tiene_indicador_empaque(prod['descripcion_original']):
+                        etiqueta = str(prod["descripcion_original"])
+                        if tiene_indicador_empaque(prod["descripcion_original"]):
                             etiqueta = "📦 " + etiqueta
                         st.text(etiqueta)
                     with col2:
@@ -3427,23 +3724,21 @@ Laura Canales
                         else:
                             prod["match"] = nuevo_match
                     with col3:
-                        nuevos_g = editar_gramos_preview(prod, f"factura_{rk}_prev_gr_{i}_{j}")
-                        prod["gramos"] = nuevos_g
+                        editar_cantidad_preview(prod, f"factura_{rk}_prev_cant_{i}_{j}", st.session_state.precios_dict)
                     if not prod.get("omitido"):
                         if prod["match"] is None:
-                            st.error("Producto no encontrado en esta lista. Asígnalo, selecciona (omitir) o usa Crear nuevo producto para guardarlo en esta hoja.")
-                        if prod["gramos"] <= 0:
-                            st.warning("Peso no encontrado o inválido. Captura los gramos o selecciona (omitir).")
-
-                    prod["incremento_pct"] = incremento_default
-
-                    if (prod["match"] in st.session_state.precios_dict
-                            and prod["match"] in st.session_state.costos_dict):
-                        linea_base = calcular_linea_catalogo(prod["match"], prod["gramos"],
-                            st.session_state.precios_dict, st.session_state.costos_dict)
-                        tarifa = st.session_state.precios_dict[prod["match"]]["precio_venta_kg"]
-                        st.caption(f"{prod['gramos']:g} g ÷ 1,000 × ${tarifa:,.2f}/kg = ${linea_base[3]:,.2f} de venta base")
-
+                            st.error("Producto no encontrado en esta lista. Asígnalo o crea uno nuevo.")
+                        if not cantidad_valida_preview(prod, st.session_state.precios_dict):
+                            st.warning("Cantidad pendiente. Introduce gramos, piezas o costales según la unidad de la hoja.")
+                    if prod["match"] in st.session_state.precios_dict and prod["match"] in st.session_state.costos_dict:
+                        cant, unidad = cantidad_y_unidad_preview(prod, st.session_state.precios_dict)
+                        linea_base = calcular_linea_catalogo(prod["match"], cant,
+                            st.session_state.precios_dict, st.session_state.costos_dict, unidad)
+                        tarifa = st.session_state.precios_dict[prod["match"]]["precio_unitario"]
+                        divisor = 1000 if unidad == "g" else 1
+                        st.caption(f"{cant:g} {unidad} × ${tarifa:,.2f}/{st.session_state.precios_dict[prod['match']]['unidad_base']}" +
+                                   (" ÷ 1,000" if divisor == 1000 else "") +
+                                   f" = ${linea_base[3]:,.2f} de venta base")
                     if prod["match"] == "__nuevo__":
                         formulario_producto_preview(prod, f"factura_{rk}_nuevo_{i}_{j}",
                             f"factura_{rk}_prev_match_{i}_{j}")
@@ -3451,14 +3746,17 @@ Laura Canales
                 lineas_factura = []
                 for prod in ped["productos"]:
                     nombre = prod["match"]
-                    if nombre in st.session_state.precios_dict and prod["gramos"] > 0:
+                    if nombre in st.session_state.precios_dict and cantidad_valida_preview(prod, st.session_state.precios_dict):
                         if nombre not in st.session_state.costos_dict:
                             st.error(f"Falta el costo de {nombre}. Carga o corrige el catálogo.")
                             continue
+                        cant, unidad = cantidad_y_unidad_preview(prod, st.session_state.precios_dict)
                         lineas_factura.append({
-                            "nombre": nombre.title(), "gramos": prod["gramos"],
-                            "costo_kg": st.session_state.costos_dict[nombre]["costo_kg"],
-                            "precio_kg": st.session_state.precios_dict[nombre]["precio_venta_kg"],
+                            "nombre": nombre.title(), "gramos": peso_equivalente_preview(prod, st.session_state.precios_dict),
+                            "cantidad": cant, "unidad": unidad,
+                            "gramos_por_unidad": st.session_state.precios_dict[nombre]["gramos_por_unidad"],
+                            "costo_kg": st.session_state.costos_dict[nombre]["costo_unitario"],
+                            "precio_kg": st.session_state.precios_dict[nombre]["precio_unitario"],
                             "incremento_pct": prod["incremento_pct"],
                         })
                 ped["lineas_factura"] = lineas_factura
@@ -3470,7 +3768,9 @@ Laura Canales
                     if ped["productos_calculados"]:
                         mostrar_resumen_factura(ped["productos_calculados"])
                         envio_cobrado, envio_gratis, peso_kg = resolver_envio(
-                            (p["gramos"] for p in lineas_factura), True,
+                            ((p["cantidad"] if p["unidad"] == "g" else p["cantidad"] *
+                              (1000 if p["unidad"] == "kg" else p["gramos_por_unidad"]))
+                             for p in lineas_factura), True,
                             st.session_state["catalogo_activo"], ped["envio_integrado"])
                         st.caption(f"Peso: {peso_kg:g} kg · " +
                             ("Envío gratis por superar 35 kg" if envio_gratis else
@@ -3490,19 +3790,19 @@ Laura Canales
                     productos_sin_asignar.append({
                         "cliente": ped["cliente"],
                         "descripcion": prod["descripcion_original"],
-                        "gramos": prod["gramos"],
+                        "cantidad_txt": preview_texto_cantidad(prod, st.session_state.precios_dict),
                     })
 
         if productos_sin_asignar:
             st.error(
                 f"⚠️ Hay {len(productos_sin_asignar)} productos pendientes de revisar. "
-                "Asigna o crea cada producto y verifica su peso. "
+                "Asigna o crea cada producto y verifica su cantidad. "
                 "Para excluirlo, selecciona (omitir) en esa línea."
             )
             with st.expander("Ver productos pendientes", expanded=True):
                 for sa in productos_sin_asignar:
                     st.markdown(
-                        f"- **{sa['cliente']}**: `{sa['descripcion']}` ({int(sa['gramos'])}g)"
+                        f"- **{sa['cliente']}**: `{sa['descripcion']}` ({sa['cantidad_txt']})"
                     )
 
         col_g1, col_g2 = st.columns(2)
@@ -3663,17 +3963,25 @@ with tab_modificar:
                         nombre_edit = st.selectbox("Producto", opciones_edit,
                             index=opciones_edit.index(clave_actual),
                             key=f"fe_prod_{edit_key}_{rev_factura}_{j}")
-                        gramos_edit = st.number_input("Gramos (0 para quitar)", min_value=0.0,
-                            value=float(linea["gramos"]), key=f"fe_gr_{edit_key}_{rev_factura}_{j}")
-
-                        if gramos_edit > 0 and nombre_edit not in st.session_state.precios_dict:
+                        base = unidad_base_producto(nombre_edit, st.session_state.precios_dict)
+                        unidad_edit = "g" if base == "kg" else base
+                        cantidad_original = float(linea.get("cantidad", linea.get("gramos", 0)))
+                        if unidad_edit != linea.get("unidad", "g"):
+                            cantidad_original = 0.0
+                        cantidad_edit = st.number_input(f"Cantidad ({unidad_edit}, 0 para quitar)", min_value=0.0,
+                            value=cantidad_original, step=10.0 if unidad_edit == "g" else 1.0,
+                            key=f"fe_cant_{edit_key}_{rev_factura}_{j}")
+                        if cantidad_edit > 0 and nombre_edit not in st.session_state.precios_dict:
                             faltan_precios_edit = True
-                            st.error("Producto ausente de la hoja actual. Elige uno disponible o usa 0 gramos para quitarlo.")
-                        elif gramos_edit > 0:
+                            st.error("Producto ausente del catálogo actual.")
+                        elif cantidad_edit > 0:
+                            peso_unit = st.session_state.precios_dict[nombre_edit]["gramos_por_unidad"]
+                            peso = cantidad_edit if unidad_edit == "g" else cantidad_edit * peso_unit
                             lineas_edit.append({**linea, "nombre": nombre_edit.title(),
-                                "gramos": gramos_edit, "incremento_pct": pct_edit,
-                                "precio_kg": st.session_state.precios_dict[nombre_edit]["precio_venta_kg"],
-                                "costo_kg": st.session_state.costos_dict[nombre_edit]["costo_kg"]})
+                                "gramos": peso, "cantidad": cantidad_edit, "unidad": unidad_edit,
+                                "gramos_por_unidad": peso_unit, "incremento_pct": pct_edit,
+                                "precio_kg": st.session_state.precios_dict[nombre_edit]["precio_unitario"],
+                                "costo_kg": st.session_state.costos_dict[nombre_edit]["costo_unitario"]})
                     if st.form_submit_button("Guardar cambios de factura"):
                         if faltan_precios_edit:
                             st.error("No se guardaron cambios: faltan precios en la hoja seleccionada.")
@@ -3723,14 +4031,14 @@ with tab_modificar:
                         nombre_edit = col_p.selectbox("Producto", opciones_edit,
                             index=opciones_edit.index(clave_actual), key=f"prod_{edit_key}_{i}")
                         with col_g:
-                            nuevos_gr = st.number_input(
-                                "g",
-                                min_value=1,
-                                value=max(1, int(gr)),
-                                step=50,
-                                key=f"gr_{edit_key}_{i}",
-                                label_visibility="collapsed",
-                            )
+                            base_edit = unidad_base_producto(nombre_edit, st.session_state.precios_dict)
+                            unidad_edit = "g" if base_edit == "kg" else base_edit
+                            previa = cantidad_linea(pedido["productos"][i])
+                            if unidad_edit != unidad_visual_linea(pedido["productos"][i]):
+                                previa = 0.0
+                            nuevos_gr = st.number_input(unidad_edit, min_value=0.0,
+                                value=float(previa), step=50.0 if unidad_edit == "g" else 1.0,
+                                key=f"gr_{edit_key}_{i}_{unidad_edit}", label_visibility="collapsed")
                         with col_b:
                             if st.button("🗑️", key=f"del_{edit_key}_{i}"):
                                 pedido["productos"].pop(i)
@@ -3742,19 +4050,14 @@ with tab_modificar:
                                 pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
                                 st.rerun()
 
-                        if (nuevos_gr != int(gr) or nombre_edit != clave_actual) and nuevos_gr > 0:
+                        if (nuevos_gr != cantidad_linea(pedido["productos"][i]) or nombre_edit != clave_actual) and nuevos_gr > 0:
                             key = nombre_edit
                             if key not in st.session_state.precios_dict:
                                 st.error("Producto ausente de la hoja actual. Selecciona uno disponible o elimina la línea.")
-                            elif gr > 0:
-                                precio_kg = st.session_state.precios_dict[key]["precio_venta_kg"]
-                                costo_kg = st.session_state.costos_dict[key]["costo_kg"]
-                                pedido["productos"][i] = (
-                                    nombre_edit.title(),
-                                    float(nuevos_gr),
-                                    round(nuevos_gr * costo_kg / 1000, 2),
-                                    round(nuevos_gr * precio_kg / 1000, 2),
-                                )
+                            else:
+                                pedido["productos"][i] = calcular_linea_catalogo(
+                                    key, nuevos_gr, st.session_state.precios_dict,
+                                    st.session_state.costos_dict, unidad_edit)
                                 totales = totales_pedido(pedido, descuento=0.0)
                                 pedido.update(totales)
                                 pedido["descuento"] = 0.0
@@ -3774,27 +4077,18 @@ with tab_modificar:
                         label_visibility="collapsed",
                     )
                 with col_ng:
-                    nuevos_g = st.number_input(
-                        "g",
-                        min_value=0,
-                        value=500,
-                        step=50,
-                        key=f"nuevo_g_{edit_key}",
-                        label_visibility="collapsed",
-                    )
+                    unidad_nuevo = ("g" if unidad_base_producto(nuevo_prod, st.session_state.precios_dict) == "kg"
+                                    else unidad_base_producto(nuevo_prod, st.session_state.precios_dict))
+                    nuevos_g = st.number_input(unidad_nuevo, min_value=0.0,
+                        value=500.0 if unidad_nuevo == "g" else 1.0,
+                        step=50.0 if unidad_nuevo == "g" else 1.0,
+                        key=f"nuevo_g_{edit_key}_{unidad_nuevo}", label_visibility="collapsed")
                 with col_nb:
                     if st.button("➕", key=f"add_{edit_key}"):
                         if nuevo_prod and nuevo_prod != "➕ Crear nuevo producto" and nuevos_g > 0:
-                            precio_kg = st.session_state.precios_dict[nuevo_prod]["precio_venta_kg"]
-                            costo_kg = st.session_state.costos_dict[nuevo_prod]["costo_kg"]
-                            pedido["productos"].append(
-                                (
-                                    nuevo_prod.title(),
-                                    float(nuevos_g),
-                                    round(nuevos_g * costo_kg / 1000, 2),
-                                    round(nuevos_g * precio_kg / 1000, 2),
-                                )
-                            )
+                            pedido["productos"].append(calcular_linea_catalogo(
+                                nuevo_prod, nuevos_g, st.session_state.precios_dict,
+                                st.session_state.costos_dict, unidad_nuevo))
                             totales = totales_pedido(pedido, descuento=0.0)
                             pedido.update(totales)
                             pedido["descuento"] = 0.0
@@ -3808,8 +4102,10 @@ with tab_modificar:
                         clave_nueva = formulario_nuevo_producto(f"modificar_{edit_key}")
                         if clave_nueva:
                             pedido["productos"].append(calcular_linea_catalogo(
-                                clave_nueva, nuevos_g, st.session_state.precios_dict,
-                                st.session_state.costos_dict))
+                                clave_nueva, nuevos_g if unidad_nuevo == "g" else 1,
+                                st.session_state.precios_dict, st.session_state.costos_dict,
+                                "g" if unidad_base_producto(clave_nueva, st.session_state.precios_dict) == "kg"
+                                    else unidad_base_producto(clave_nueva, st.session_state.precios_dict)))
                             pedido.update(totales_pedido(pedido, descuento=0.0))
                             pedido["descuento"] = 0.0
                             pedido["_ui_revision"] = pedido.get("_ui_revision", 0) + 1
@@ -4018,20 +4314,17 @@ with tab_resumen:
                 st.metric("Utilidad", f"${util_c:,.2f}", f"{util_pct_c:.2f}%")
 
         st.divider()
-        st.subheader("⚖️ Gramos consumidos por producto")
-
-        gramos_prod = {}
+        st.subheader("⚖️ Cantidad consumida por producto y unidad")
+        cantidades_prod = {}
         for p in pedidos:
-            for nombre, gr, _, _ in p["productos"]:
-                gramos_prod[nombre] = gramos_prod.get(nombre, 0) + gr
-
-        if gramos_prod:
-            df_gramos = pd.DataFrame(
-                [(k, int(v), v / 1000) for k, v in sorted(gramos_prod.items(), key=lambda x: -x[1])],
-                columns=["Producto", "Gramos", "Kilos"],
-            )
-            df_gramos.loc["TOTAL"] = ["TOTAL", df_gramos["Gramos"].sum(), df_gramos["Kilos"].sum()]
-            st.dataframe(df_gramos.reset_index(drop=True), use_container_width=True, hide_index=True)
+            for linea in p["productos"]:
+                clave = (linea[0], unidad_visual_linea(linea))
+                cantidades_prod[clave] = cantidades_prod.get(clave, 0) + cantidad_linea(linea)
+        if cantidades_prod:
+            st.dataframe(pd.DataFrame([
+                {"Producto": nombre, "Unidad": unidad, "Cantidad": cantidad}
+                for (nombre, unidad), cantidad in sorted(cantidades_prod.items())
+            ]), use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("💾 Guardar al histórico")
@@ -4169,7 +4462,11 @@ def mostrar_analisis_clientes():
     k5, k6, k7, k8 = st.columns(4)
     k5.metric("Ticket promedio", f"${df_t['total_final'].mean():,.2f}")
     k6.metric("Productos vendidos", int(df_t["num_productos"].sum()))
-    k7.metric("Kg vendidos", f"{df_p['gramos'].sum() / 1000:,.2f}")
+    k7.metric("Kg equivalentes conocidos", f"{df_p['gramos'].sum() / 1000:,.2f}")
+    if not df_p.empty:
+        k_piezas, k_costales = st.columns(2)
+        k_piezas.metric("Piezas vendidas", f"{df_p.loc[df_p['unidad'] == 'pz', 'cantidad'].sum():,.0f}")
+        k_costales.metric("Costales vendidos", f"{df_p.loc[df_p['unidad'] == 'costal', 'cantidad'].sum():,.0f}")
     margen_pct = (df_t['utilidad'].sum() / df_t['subtotal_costo'].sum() * 100) if df_t['subtotal_costo'].sum() > 0 else 0
     k8.metric("Margen sobre costo", f"{margen_pct:.1f}%")
 
@@ -4266,9 +4563,11 @@ def mostrar_analisis_clientes():
     if df_p.empty:
         st.info("No hay datos de productos suficientes para graficar costos.")
     else:
-        # Calcular costo y venta por kg
+        # Solo productos vendidos realmente por peso para el precio por kg.
         df_costos = df_p.copy()
-        df_costos = df_costos[df_costos["gramos"] > 0].copy()
+        df_costos = df_costos[(df_costos["gramos"] > 0) & (df_costos["unidad"].isin(["g", "kg"]))].copy()
+        if df_costos.empty:
+            st.info("No hay ventas por peso en este período. Las piezas y costales se conservan en el histórico, pero no se mezclan con los precios por kg.")
         df_costos["costo_por_kg"] = df_costos["costo"] / (df_costos["gramos"] / 1000)
         df_costos["venta_por_kg"] = df_costos["venta"] / (df_costos["gramos"] / 1000)
         df_costos["fecha_dia"] = df_costos["fecha_dt"].dt.date
@@ -4490,6 +4789,7 @@ UNIDADES_COMPRA = {
     "l": "L", "lt": "L", "lts": "L", "litro": "L", "litros": "L",
     "ml": "ml", "mililitro": "ml", "mililitros": "ml",
     "pz": "pieza", "pza": "pieza", "pzas": "pieza", "pieza": "pieza", "piezas": "pieza",
+    "costal": "costal", "costales": "costal",
     **{variante: unidad for unidad, variantes in {
         "bolsa": ("bolsa", "bolsas"), "bolsita": ("bolsita", "bolsitas"),
         "domo": ("domo", "domos"), "domito": ("domito", "domitos"),
@@ -4628,7 +4928,7 @@ def construir_lista_compra(texto, catalogo_keys, modalidad):
 def cantidad_compra_texto(cantidad, unidad):
     if unidad == "kg" and 0 < cantidad < 1:
         return f"{cantidad * 1000:g} g"
-    plurales = {"pieza": "piezas", "bolsa": "bolsas", "bolsita": "bolsitas", "domo": "domos",
+    plurales = {"pieza": "piezas", "costal": "costales", "bolsa": "bolsas", "bolsita": "bolsitas", "domo": "domos",
         "domito": "domitos", "caja": "cajas", "cajita": "cajitas", "cartón": "cartones", "cono": "conos",
         "manojo": "manojos", "cabeza": "cabezas", "penca": "pencas", "lata": "latas", "frasco": "frascos",
         "paquete": "paquetes", "ramo": "ramos", "atado": "atados", "racimo": "racimos", "charola": "charolas"}
@@ -5014,8 +5314,12 @@ def detectar_unidad_producto(nombre):
 
 
 def unidad_default_producto(nombre):
-    """Devuelve la unidad por default que debería tener un producto al ser agregado al catálogo.
-    Por ejemplo, fresas por 1/2 kg por default, berries por 170g, aceites por Lt, etc."""
+    base = unidad_base_producto(nombre, st.session_state.get("precios_dict", {}))
+    if base == "pz":
+        return "1 pz"
+    if base == "costal":
+        return "1 costal"
+    # Para los productos por peso se conservan las presentaciones del catálogo previo.
     n = nombre.lower()
 
     # Fresas por 1/2 kg por default
@@ -5140,7 +5444,12 @@ def nombre_visible_catalogo(nombre, mostrar_precios=True):
 
 
 def opciones_unidad_catalogo(nombre):
-    """Permite elegir pieza expresamente, conservando las presentaciones originales."""
+    """La presentación fija es la declarada en Sheets, no una conversión desde kg."""
+    base = unidad_base_producto(nombre, st.session_state.get("precios_dict", {}))
+    if base == "pz":
+        return ["1 pz"]
+    if base == "costal":
+        return ["1 costal"]
     etiqueta, fraccionable = detectar_unidad_producto(nombre)
     if fraccionable:
         return ["1/4 kg", "1/2 kg", "1 kg", "1 pz"]
@@ -5159,6 +5468,11 @@ def precio_unidad_catalogo(precio_kg, unidad):
 
 
 def unidad_corregida_catalogo(nombre, unidad):
+    base = unidad_base_producto(nombre, st.session_state.get("precios_dict", {}))
+    if base == "costal":
+        return "1 costal"
+    if base == "pz":
+        return "1 pz"
     if unidad in ("1 pz", "pz", "1 pieza", "1 Pieza"):
         return "1 pz"
     n = normalizar_categoria_nombre(nombre)
@@ -5404,7 +5718,7 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
             continue
         prod = dict(prod)
         cat = categorizar_producto(prod["nombre"])[0] or prod.get("categoria")
-        prod["unidad"] = unidad_corregida_catalogo(prod["nombre"], prod["unidad"])
+        prod["unidad"] = unidad_corregida_catalogo(prod.get("clave_catalogo", prod["nombre"]), prod["unidad"])
         prod["nombre"] = nombre_visible_catalogo(prod["nombre"], mostrar_precios=mostrar_precios)
         if cat not in CATEGORIAS_CATALOGO:
             raise ValueError("Confirma la categoría de: " + prod["nombre"])
@@ -6084,7 +6398,7 @@ with tab_catalogo:
                 "Escribe para buscar...",
                 opciones_busqueda,
                 format_func=lambda x: (
-                    f"{(emoji_para_producto(x) + ' ') if emoji_para_producto(x) else ''}{nombre_visible_catalogo(x).title()} (${st.session_state.precios_dict[x]['precio_venta_kg']:.2f} precio base)"
+                    f"{(emoji_para_producto(x) + ' ') if emoji_para_producto(x) else ''}{nombre_visible_catalogo(x).title()} (${st.session_state.precios_dict[x]['precio_unitario']:.2f}/{unidad_base_producto(x, st.session_state.precios_dict)})"
                     if x else "Selecciona un producto..."
                 ),
                 key="busqueda_producto",
@@ -6101,10 +6415,10 @@ with tab_catalogo:
                     format_func=lambda u: "pz" if u == "1 pz" else u,
                     key=f"unidad_nueva_{producto_a_agregar}")
 
-        if producto_a_agregar and unidad_nueva == "1 pz":
+        if producto_a_agregar and unidad_nueva in ("1 pz", "1 costal"):
             precio_pieza = precio_unidad_catalogo(
                 st.session_state.precios_dict[producto_a_agregar]["precio_venta_kg"], unidad_nueva)
-            st.caption(f"${precio_pieza:,.2f} por pz. Se utiliza el precio completo de la hoja, sin fraccionarlo.")
+            st.caption(f"${precio_pieza:,.2f} por {unidad_nueva.replace('1 ', '')}. Se utiliza el precio de la hoja para esta presentación.")
 
         if producto_a_agregar:
             if st.button(f"➕ Agregar {nombre_visible_catalogo(producto_a_agregar).title()}", use_container_width=True):
@@ -6136,7 +6450,8 @@ with tab_catalogo:
                         st.session_state.catalogo_seleccionados[prod] = nueva_u
                         st.rerun()
                 with col_p:
-                    sufijo = " / pz" if unidad_actual == "1 pz" else ""
+                    sufijo = (" / pz" if unidad_actual == "1 pz" else
+                              " / costal" if unidad_actual == "1 costal" else "")
                     st.write(f"**${precio_final:,.2f}{sufijo}**")
                 with col_x:
                     if st.button("🗑️", key=f"del_{prod}", help="Quitar del catálogo"):
@@ -6155,6 +6470,7 @@ with tab_catalogo:
             precio_final = precio_unidad_catalogo(precio_kg, unidad)
             productos_incluidos.append({
                 "nombre": nombre_visible_catalogo(prod),
+                "clave_catalogo": prod,
                 "unidad": unidad,
                 "precio": precio_final,
                 "emoji": emoji_para_producto(prod),
