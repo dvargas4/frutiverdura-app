@@ -778,11 +778,14 @@ def editar_cantidad_preview(prod, clave, precios):
     unidad = "g" if base == "kg" else base
     widget_key = f"{clave}_{unidad}"
     if widget_key not in st.session_state:
-        if unidad == "g":
+        # Al cambiar el producto mapeado a otra unidad, rescatar el valor original
+        # de los paréntesis, nunca convertir el peso estimado en piezas.
+        if prod.get("cantidad_parentesis", 0) > 0:
+            inicial = float(prod["cantidad_parentesis"])
+        elif unidad == "g":
             inicial = float(prod.get("gramos", 0))
         else:
-            inicial = (float(prod.get("cantidad", 0)) if prod.get("unidad_detectada") == unidad
-                       else float(prod.get("cantidad", 0)) if prod.get("unidad") == unidad else 0.0)
+            inicial = float(prod.get("cantidad_explicita", 0) or prod.get("cantidad", 0))
         st.session_state[widget_key] = inicial
     nueva = st.number_input(unidad, min_value=0.0,
         step=10.0 if unidad == "g" else 1.0, key=widget_key, label_visibility="collapsed")
@@ -800,27 +803,71 @@ def preview_texto_cantidad(prod, precios):
     return f"{cantidad:g} {unidad}"
 
 
-def construir_producto_preview(desc, gramos, catalogo_keys, precios):
-    original = str(desc)
-    encontrado = re.search(r"(?:^|\s)(\d+(?:[.,]\d+)?)\s*(costales?|piezas?|pzas?|pz)\b", original, flags=re.I)
-    unidad_detectada = None
-    cantidad = 0.0
+def construir_producto_preview(desc, gramos, catalogo_keys, precios, origen_cantidad="parentesis"):
+    """Interpreta el número recibido según la UNIDAD del producto en Sheets.
+
+    El parser anterior extrae el valor entre paréntesis (o los gramos finales).
+    Esa cantidad NO es necesariamente un peso: para pz/costal es el número de
+    unidades; para kg representa gramos. La descripción sirve para encontrar
+    el producto, no para decidir en qué unidad se cobra.
+    """
+    original = str(desc).strip()
     limpio = original
-    if encontrado:
-        unidad_detectada = "costal" if encontrado.group(2).lower().startswith("costal") else "pz"
-        cantidad = float(encontrado.group(1).replace(",", "."))
-        limpio = (original[:encontrado.start()] + " " + original[encontrado.end():]).strip()
-        limpio = re.sub(r"^de\s+", "", limpio, flags=re.I)
-    match = buscar_match_catalogo(limpio, catalogo_keys)
-    if match in precios and unidad_base_producto(match, precios) == "kg":
-        # Antiguo parser: (gramos) sigue siendo la fuente autorizada.
-        if not gramos:
-            peso = re.search(r"(?:^|\s)(\d+(?:[.,]\d+)?)\s*(kg|kilos?|g|gramos?)\b", limpio, flags=re.I)
-            if peso:
-                medida = peso.group(2).lower()
-                gramos = float(peso.group(1).replace(",", ".")) * (1000 if medida.startswith(("k",)) else 1)
-    return {"descripcion_original": original, "gramos": float(gramos), "cantidad": cantidad,
-            "unidad_detectada": unidad_detectada, "match": match}
+    unidad_detectada = None
+    cantidad_explicita = 0.0
+
+    # Ejemplos: "5pz de lechuga", "2 costales de papa", "1 pieza apio".
+    # El nombre de producto se limpia antes de buscar coincidencias.
+    expresion_unidad = re.match(
+        r"^\s*(\d+(?:[.,]\d+)?)\s*(costales?|piezas?|pzas?|pz)\b\s*(?:de\s+)?",
+        limpio, flags=re.I)
+    if expresion_unidad:
+        unidad_detectada = ("costal" if expresion_unidad.group(2).lower().startswith("costal") else "pz")
+        cantidad_explicita = float(expresion_unidad.group(1).replace(",", "."))
+        limpio = limpio[expresion_unidad.end():].strip()
+    else:
+        # "1 de papa (500)" y "2 de jitomate (2000)".
+        # El número inicial no sustituye los gramos de un producto por kg.
+        expresion_numero = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s+de\s+", limpio, flags=re.I)
+        if expresion_numero:
+            cantidad_explicita = float(expresion_numero.group(1).replace(",", "."))
+            limpio = limpio[expresion_numero.end():].strip()
+
+    # Se respeta tanto el catálogo exacto como los aliases ya conocidos.
+    # Evita que un alias "papa blanca" impida encontrar una fila llamada "papa".
+    match = resolver_clave_catalogo(limpio, catalogo_keys) or buscar_match_catalogo(limpio, catalogo_keys)
+    cantidad_parentesis = float(gramos or 0) if origen_cantidad == "parentesis" else 0.0
+    cantidad = 0.0
+    # Un número final SIN paréntesis sigue siendo un peso legacy, no piezas.
+    gramos_efectivos = float(gramos or 0)
+    aviso = None
+
+    if match in precios:
+        base = unidad_base_producto(match, precios)
+        if base == "kg":
+            # Compatibilidad: 2 kg de jitomate sin paréntesis => 2000 g.
+            if not gramos_efectivos:
+                peso = re.search(r"(?:^|\s)(\d+(?:[.,]\d+)?)\s*(kg|kilos?|g|gramos?)\b", original, flags=re.I)
+                if peso:
+                    medida = peso.group(2).lower()
+                    gramos_efectivos = float(peso.group(1).replace(",", ".")) * (1000 if medida.startswith("k") else 1)
+        else:
+            # Prioridad absoluta al número entre paréntesis. Si no existe,
+            # se usa la cantidad escrita antes de "pz" o "costal".
+            cantidad = cantidad_parentesis if cantidad_parentesis > 0 else cantidad_explicita
+        if unidad_detectada is not None and unidad_detectada != base:
+            aviso = (f"El pedido dice {unidad_detectada}, pero el producto en Google Sheets "
+                     f"está registrado por {base}. Se utilizará la unidad de la hoja.")
+        elif (base != "kg" and cantidad_parentesis > 0 and cantidad_explicita > 0
+              and abs(cantidad_parentesis - cantidad_explicita) > 0.000001):
+            aviso = (f"Hay dos cantidades distintas ({cantidad_explicita:g} en el texto y "
+                     f"{cantidad_parentesis:g} entre paréntesis). Se utilizará "
+                     f"({cantidad_parentesis:g}) conforme al catálogo.")
+
+    return {"descripcion_original": original, "gramos": gramos_efectivos,
+            "cantidad": cantidad, "cantidad_parentesis": cantidad_parentesis,
+            "cantidad_explicita": cantidad_explicita, "unidad_detectada": unidad_detectada,
+            "match": match, "aviso_unidad": aviso}
 
 
 def tarifa_envio_actual():
@@ -2471,8 +2518,28 @@ import re
 import difflib
 
 
+def leer_numero_pedido(numero):
+    """Admite (500), (2,000), (2.000) y (1.5) sin multiplicar decimales."""
+    valor = str(numero).strip().replace(" ", "")
+    if not re.fullmatch(r"\d[\d.,]*", valor):
+        raise ValueError(f"Cantidad no válida: {numero!r}")
+    if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", valor):
+        return float(valor.replace(",", "").replace(".", ""))
+    if "," in valor and "." in valor:
+        # Se toma el separador que aparece al final como decimal.
+        decimal = "," if valor.rfind(",") > valor.rfind(".") else "."
+        miles = "." if decimal == "," else ","
+        valor = valor.replace(miles, "").replace(decimal, ".")
+    else:
+        valor = valor.replace(",", ".")
+    resultado = float(valor)
+    if not (0 <= resultado <= 1_000_000):
+        raise ValueError("Cantidad fuera de rango (0 a 1,000,000).")
+    return resultado
+
+
 def parsear_bloque_pedido(texto):
-    """Parsea un bloque de texto y extrae (nombre_cliente, [(descripcion, gramos), ...]).
+    """Extrae (cliente, [(descripcion, numero, origen), ...]).
 
     Soporta formatos variados:
       Abue Lucero
@@ -2491,6 +2558,8 @@ def parsear_bloque_pedido(texto):
     if not lineas:
         return None, []
 
+    # El valor entre paréntesis se entrega sin asignarle unidad todavía.
+    # La UNIDAD de la fila en Google Sheets decide si son g, pz o costales.
     # Regex para detectar viñetas, incluyendo checkboxes tipo Markdown [x] [ ] [X]
     patron_viñeta = r"^(?:(?:[\*\-\u2022]|\d+[\.\)])\s*(?:\[\s*[xX]?\s*\]\s*)?|\[\s*[xX]?\s*\]\s*)"
 
@@ -2506,14 +2575,15 @@ def parsear_bloque_pedido(texto):
         if not contenido:
             continue
 
-        # Estrategia 1: gramos entre paréntesis al final, ej: "tomate (1500)"
-        gramos = None
+        # Estrategia 1: número entre paréntesis al final, ej: "apio (1)"
+        # Su unidad se resuelve DESPUÉS de encontrar el producto en el catálogo.
+        gramos = None  # nombre heredado para conservar compatibilidad
+        origen_cantidad = None
         m = re.search(r"\(\s*([\d.,]+)\s*\)\s*$", contenido)
         if m:
-            num_str = m.group(1).replace(",", "").replace(".", "")
-            if num_str.isdigit():
-                gramos = int(num_str)
-                contenido = re.sub(r"\s*\([\d.,\s]+\)\s*$", "", contenido)
+            gramos = leer_numero_pedido(m.group(1))
+            origen_cantidad = "parentesis"
+            contenido = contenido[:m.start()].strip()
 
         # Estrategia 2: gramos como número final sin paréntesis, ej: "Caja huevo 17,100"
         if gramos is None:
@@ -2525,6 +2595,7 @@ def parsear_bloque_pedido(texto):
                     # Validar que sea un número razonable (10g a 100kg)
                     if 10 <= posibles_gramos <= 100000:
                         gramos = posibles_gramos
+                        origen_cantidad = "peso_final"
                         contenido = contenido[: m.start()].strip()
 
         # Conservar la línea para que se corrija el peso en la vista previa.
@@ -2538,7 +2609,7 @@ def parsear_bloque_pedido(texto):
         # Quitar puntos sueltos al final
         desc = re.sub(r"[\.\,]+$", "", desc).strip()
 
-        productos_raw.append((desc or contenido or linea, gramos))
+        productos_raw.append((desc or contenido or linea, gramos, origen_cantidad))
 
     return cliente, productos_raw
 
@@ -3180,9 +3251,10 @@ with tab_pegar:
     with col_e:
         envio_rapido = st.checkbox("Lleva envío", key=f"rapido_envio_{rk}", value=False)
 
-    ejemplo_simple = """* 1k dominico 🍏 (1130)
-* 6 manzanas golden 🍏 (772)
-* 4 zanahorias 🧑🏿‍🌾 (529)"""
+    ejemplo_simple = """-[x] 1 de papa (500)
+-[x] 5 pz de lechuga (5)
+-[x] 2 de jitomate (2000)
+-[x] bolsa de apio (1)"""
 
     ejemplo_multi = """Abue Lucero
 * 1k dominico (1130)
@@ -3237,10 +3309,11 @@ Laura Canales
                 cliente, productos_raw = parsear_bloque_pedido(bloque)
                 if cliente and productos_raw:
                     productos_match = []
-                    for desc, gramos in productos_raw:
+                    for desc, gramos, origen_cantidad in productos_raw:
                         match = buscar_match_catalogo(desc, catalogo_keys)
                         productos_match.append(construir_producto_preview(
-                            desc, gramos, catalogo_keys, st.session_state.precios_dict))
+                            desc, gramos, catalogo_keys, st.session_state.precios_dict,
+                            origen_cantidad=origen_cantidad))
                     preview.append({
                         "cliente": cliente,
                         "lleva_envio": envio_rapido,
@@ -3255,10 +3328,11 @@ Laura Canales
                         continue
                     lleva_envio = any(e in cliente.lower() for e in envios_set)
                     productos_match = []
-                    for desc, gramos in productos_raw:
+                    for desc, gramos, origen_cantidad in productos_raw:
                         match = buscar_match_catalogo(desc, catalogo_keys)
                         productos_match.append(construir_producto_preview(
-                            desc, gramos, catalogo_keys, st.session_state.precios_dict))
+                            desc, gramos, catalogo_keys, st.session_state.precios_dict,
+                            origen_cantidad=origen_cantidad))
                     preview.append({
                         "cliente": cliente,
                         "lleva_envio": lleva_envio,
@@ -3266,7 +3340,7 @@ Laura Canales
                     })
 
             if not preview:
-                st.error("No se pudieron detectar productos. Admite (gramos), 2 pz o 1 costal.")
+                st.error("No se pudieron detectar productos. Escribe (cantidad) según la UNIDAD registrada en Google Sheets.")
             else:
                 revision_preview += 1
                 st.session_state["pegar_preview_revision"] = revision_preview
@@ -3294,7 +3368,8 @@ Laura Canales
         st.markdown("### Vista previa - corrige los matches incorrectos")
         st.caption(
             "Si algún producto quedó mal asignado, cámbialo del dropdown. "
-            "Producto no encontrado: asígnalo, créalo o elige (omitir). Si falta el peso, captúralo en gramos."
+            "Producto no encontrado: asígnalo, créalo o elige (omitir). "
+            "Los paréntesis son gramos si UNIDAD=kg, piezas si UNIDAD=pz o costales si UNIDAD=costal."
         )
 
         catalogo_keys = sorted(st.session_state.precios_dict.keys())
@@ -3337,6 +3412,8 @@ Laura Canales
                     with col3:
                         editar_cantidad_preview(prod, f"pegar_{rk}_{revision_preview}_prev_cant_{i}_{j}", st.session_state.precios_dict)
                     if not prod.get("omitido"):
+                        if prod.get("aviso_unidad"):
+                            st.warning(prod["aviso_unidad"])
                         if prod["match"] is None:
                             st.error("Producto no encontrado en esta lista. Asígnalo o crea uno nuevo.")
                         if not cantidad_valida_preview(prod, st.session_state.precios_dict):
@@ -3558,9 +3635,10 @@ with tab_factura:
     with col_e:
         envio_rapido = False
 
-    ejemplo_simple = """* 1k dominico 🍏 (1130)
-* 6 manzanas golden 🍏 (772)
-* 4 zanahorias 🧑🏿‍🌾 (529)"""
+    ejemplo_simple = """-[x] 1 de papa (500)
+-[x] 5 pz de lechuga (5)
+-[x] 2 de jitomate (2000)
+-[x] bolsa de apio (1)"""
 
     ejemplo_multi = """Abue Lucero
 * 1k dominico (1130)
@@ -3611,10 +3689,11 @@ Laura Canales
                 cliente, productos_raw = parsear_bloque_pedido(bloque)
                 if cliente and productos_raw:
                     productos_match = []
-                    for desc, gramos in productos_raw:
+                    for desc, gramos, origen_cantidad in productos_raw:
                         match = buscar_match_catalogo(desc, catalogo_keys)
                         productos_match.append(construir_producto_preview(
-                            desc, gramos, catalogo_keys, st.session_state.precios_dict))
+                            desc, gramos, catalogo_keys, st.session_state.precios_dict,
+                            origen_cantidad=origen_cantidad))
                     preview.append({
                         "cliente": cliente,
                         "lleva_envio": envio_rapido,
@@ -3629,10 +3708,11 @@ Laura Canales
                         continue
                     lleva_envio = any(e in cliente.lower() for e in envios_set)
                     productos_match = []
-                    for desc, gramos in productos_raw:
+                    for desc, gramos, origen_cantidad in productos_raw:
                         match = buscar_match_catalogo(desc, catalogo_keys)
                         productos_match.append(construir_producto_preview(
-                            desc, gramos, catalogo_keys, st.session_state.precios_dict))
+                            desc, gramos, catalogo_keys, st.session_state.precios_dict,
+                            origen_cantidad=origen_cantidad))
                     preview.append({
                         "cliente": cliente,
                         "lleva_envio": lleva_envio,
@@ -3640,7 +3720,7 @@ Laura Canales
                     })
 
             if not preview:
-                st.error("No se pudieron detectar productos. Admite (gramos), 2 pz o 1 costal.")
+                st.error("No se pudieron detectar productos. Escribe (cantidad) según la UNIDAD registrada en Google Sheets.")
             else:
                 for ped in preview:
                     ped["envio_integrado"] = envio_default
@@ -3679,7 +3759,8 @@ Laura Canales
         st.markdown("### Vista previa - corrige los matches incorrectos")
         st.caption(
             "Si algún producto quedó mal asignado, cámbialo del dropdown. "
-            "Producto no encontrado: asígnalo, créalo o elige (omitir). Si falta el peso, captúralo en gramos."
+            "Producto no encontrado: asígnalo, créalo o elige (omitir). "
+            "Los paréntesis son gramos si UNIDAD=kg, piezas si UNIDAD=pz o costales si UNIDAD=costal."
         )
 
         catalogo_keys = sorted(st.session_state.precios_dict.keys())
@@ -3726,6 +3807,8 @@ Laura Canales
                     with col3:
                         editar_cantidad_preview(prod, f"factura_{rk}_prev_cant_{i}_{j}", st.session_state.precios_dict)
                     if not prod.get("omitido"):
+                        if prod.get("aviso_unidad"):
+                            st.warning(prod["aviso_unidad"])
                         if prod["match"] is None:
                             st.error("Producto no encontrado en esta lista. Asígnalo o crea uno nuevo.")
                         if not cantidad_valida_preview(prod, st.session_state.precios_dict):
@@ -5314,27 +5397,13 @@ def detectar_unidad_producto(nombre):
 
 
 def unidad_default_producto(nombre):
+    """La unidad declarada en Sheets manda, incluso si el nombre dice 'bolsa'."""
     base = unidad_base_producto(nombre, st.session_state.get("precios_dict", {}))
     if base == "pz":
         return "1 pz"
     if base == "costal":
         return "1 costal"
-    # Para los productos por peso se conservan las presentaciones del catálogo previo.
-    n = nombre.lower()
-
-    # Fresas por 1/2 kg por default
-    if "fresa" in n:
-        return "1/2 kg"
-
-    etiq, admite_frac = detectar_unidad_producto(nombre)
-    if admite_frac:
-        return "1 kg"
-    if etiq == "Pieza":
-        return "1 pz"
-    # Si la etiqueta ya contiene cantidad (ej "170g"), usarla tal cual sin "1 "
-    if etiq[0].isdigit():
-        return etiq
-    return f"1 {etiq.lower()}"
+    return "1/2 kg" if "fresa" in nombre.lower() else "1 kg"
 
 
 CATEGORIAS_CATALOGO = [
@@ -5444,19 +5513,13 @@ def nombre_visible_catalogo(nombre, mostrar_precios=True):
 
 
 def opciones_unidad_catalogo(nombre):
-    """La presentación fija es la declarada en Sheets, no una conversión desde kg."""
+    """Sólo ofrece presentaciones que corresponden al precio de Google Sheets."""
     base = unidad_base_producto(nombre, st.session_state.get("precios_dict", {}))
     if base == "pz":
         return ["1 pz"]
     if base == "costal":
         return ["1 costal"]
-    etiqueta, fraccionable = detectar_unidad_producto(nombre)
-    if fraccionable:
-        return ["1/4 kg", "1/2 kg", "1 kg", "1 pz"]
-    unidad_fija = etiqueta if etiqueta[0].isdigit() else "1 " + etiqueta.lower()
-    if etiqueta == "Pieza":
-        return ["1 pz"]
-    return [unidad_fija, "1 pz"]
+    return ["1/4 kg", "1/2 kg", "1 kg"]
 
 
 def precio_unidad_catalogo(precio_kg, unidad):
@@ -5468,20 +5531,14 @@ def precio_unidad_catalogo(precio_kg, unidad):
 
 
 def unidad_corregida_catalogo(nombre, unidad):
+    """Evita publicar un precio por kilo como si fuera una pieza/costal."""
     base = unidad_base_producto(nombre, st.session_state.get("precios_dict", {}))
-    if base == "costal":
-        return "1 costal"
-    if base == "pz":
-        return "1 pz"
-    if unidad in ("1 pz", "pz", "1 pieza", "1 Pieza"):
-        return "1 pz"
-    n = normalizar_categoria_nombre(nombre)
-    etiqueta, fraccionable = detectar_unidad_producto(nombre)
-    if re.search(r"\barandanos?\b", n) and unidad not in ("1/4 kg", "1/2 kg", "1 kg"):
-        return "1 kg"
-    if es_garrafon_catalogo(nombre):
-        return etiqueta if etiqueta[0].isdigit() else "1 " + etiqueta.lower()
-    return unidad
+    permitidas = opciones_unidad_catalogo(nombre)
+    if unidad in permitidas:
+        return unidad
+    if base == "kg":
+        return unidad_default_producto(nombre)
+    return "1 pz" if base == "pz" else "1 costal"
 
 
 def es_garrafon_catalogo(nombre):
@@ -5718,7 +5775,13 @@ def generar_catalogo_imagen(productos, contacto_nombre, contacto_tel, dia_entreg
             continue
         prod = dict(prod)
         cat = categorizar_producto(prod["nombre"])[0] or prod.get("categoria")
-        prod["unidad"] = unidad_corregida_catalogo(prod.get("clave_catalogo", prod["nombre"]), prod["unidad"])
+        clave_catalogo = prod.get("clave_catalogo", prod["nombre"])
+        prod["unidad"] = unidad_corregida_catalogo(clave_catalogo, prod["unidad"])
+        precio_origen = st.session_state.get("precios_dict", {}).get(clave_catalogo)
+        if precio_origen:
+            # Recalcular con la tarifa real para no mostrar precios viejos/incorrectos
+            # cuando el producto cambió de kg a pieza o costal.
+            prod["precio"] = precio_unidad_catalogo(precio_origen["precio_unitario"], prod["unidad"])
         prod["nombre"] = nombre_visible_catalogo(prod["nombre"], mostrar_precios=mostrar_precios)
         if cat not in CATEGORIAS_CATALOGO:
             raise ValueError("Confirma la categoría de: " + prod["nombre"])
@@ -6233,7 +6296,8 @@ def generar_promocion_negocios(contacto_nombre, contacto_tel, marca="MINI SÚPER
 
 with tab_catalogo:
     st.subheader("🛍️ Generar catálogo para clientes")
-    st.caption("Selecciona productos, define unidades, día de entrega y genera un catálogo bonito en PNG o PDF para mandar por WhatsApp.")
+    st.caption("Los precios y las unidades se toman de la hoja activa de Google Sheets. "
+               "Las filas por kg admiten 1/4, 1/2 o 1 kg; las filas por pieza o costal muestran su precio completo.")
 
     with st.expander("Modelo para promocionarnos a restaurantes y negocios"):
         marca_negocios = st.text_input("Nombre del negocio en la promoción", value="MINI SÚPER DOS V", max_chars=60)
@@ -6336,9 +6400,9 @@ with tab_catalogo:
                 if unidad != seleccionados[producto]:
                     seleccionados[producto] = unidad
                     st.session_state.pop(f"sel_unit_{producto}", None)
-        if st.session_state.get("catalogo_revision_rubros") != 6:
+        if st.session_state.get("catalogo_revision_rubros") != 7:
             st.session_state.pop("catalogo_generado", None)
-            st.session_state["catalogo_revision_rubros"] = 6
+            st.session_state["catalogo_revision_rubros"] = 7
 
         faltantes = [
             producto
