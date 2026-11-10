@@ -1411,10 +1411,22 @@ def _imagen_ticket_mp210_en_papel(pedido, mostrar_guia=False):
 
 
 def generar_ticket_termico_png(pedido, mostrar_guia=False):
-    """PNG de 58 mm con 5 mm laterales para respetar escala física 1–10."""
-    imagen = _imagen_ticket_mp210_en_papel(pedido, mostrar_guia)
+    """PNG nativo de la MP210: exactamente 384 puntos de ancho útil.
+
+    El PNG anterior era de 464 px (58 mm incluyendo márgenes de 5 mm),
+    pero Print Fast podía reducirlo a los 384 puntos del cabezal térmico,
+    provocando letras pequeñas y márgenes extra. Para enviar la IMAGEN
+    directamente a la impresora no se debe añadir el lienzo de 464 px.
+    El PDF, por separado, sí conserva su página física de 58 mm.
+    """
+    imagen = _componer_ticket_mp210(pedido, mostrar_guia)
+    if imagen.width != MP210_AREA_PX:
+        raise ValueError('La imagen de la MP210 debe medir 384 píxeles de ancho.')
+    # Blanco y negro puro, sin tramado: evita que el controlador térmico
+    # convierta tonos de gris en un patrón de puntos que haga ver mal la letra.
+    imagen = imagen.point(lambda nivel: 0 if nivel < 195 else 255, mode='1')
     b = io.BytesIO()
-    imagen.save(b, format='PNG', dpi=(MP210_DPI, MP210_DPI))
+    imagen.save(b, format='PNG', dpi=(MP210_DPI, MP210_DPI), optimize=True)
     return b.getvalue()
 
 
@@ -1530,7 +1542,7 @@ def descargar_tickets_impresos(pedidos, indices):
             if pdf is not None:
                 archivo.writestr("PDF/" + nombre[:-4] + ".pdf", pdf)
     st.markdown("**Descargar tickets seleccionados**")
-    st.caption("MP210 · Mismo tamaño para PDF y PNG: papel de 58 mm, área útil del 1 al 10 de 48 mm, con 5 mm laterales. El domicilio permanece en ambos tipos de ticket. Para Print Fast, usa preferentemente el PDF con escala original, sin ampliar ni recortar.")
+    st.caption("MP210: el PNG se genera en 384 píxeles nativos (sin márgenes blancos extra), para que Print Fast no reduzca la imagen. El PDF conserva papel de 58 mm y el área imprimible de 48 mm centrada. El domicilio aparece en ambos. Evita opciones de ampliar, ajustar o recortar si Print Fast las muestra.")
     st.download_button(
         f"📦 Descargar seleccionados ({len(archivos)}) · ZIP",
         data=zip_buf.getvalue(), file_name="tickets_impresos_seleccionados.zip",
@@ -1542,14 +1554,14 @@ def descargar_tickets_impresos(pedidos, indices):
         if pdf is not None:
             nombre_pdf = nombre[:-4] + ".pdf"
             st.download_button(
-                "📄 PDF para Print Fast · escala 1–10 (recomendado)",
+                "📄 PDF de 58 mm · escala original (alternativa)",
                 data=pdf, file_name=nombre_pdf,
                 mime="application/pdf", key=f"descargar_pdf_impreso_{pedido['_ui_id']}",
                 use_container_width=True,
             )
             compartir_ticket_impreso(pdf, nombre_pdf, "application/pdf")
         st.download_button(
-            "🖼️ PNG · papel 58 mm (464 px)", data=png, file_name=nombre,
+            "🖼️ PNG nativo MP210 · 384 px (para imprimir imagen)", data=png, file_name=nombre,
             mime="image/png", key=f"descargar_impreso_{pedido['_ui_id']}",
             use_container_width=True,
         )
