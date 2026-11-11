@@ -102,13 +102,15 @@ def limpiar_pregunta(ws, numero: int):
 
 
 def respuesta_actual(ws, numero: int, pregunta_id: str):
-    """Lee el comando y la respuesta de una pregunta sin confundir respuestas antiguas."""
-    comando = (ws.acell(f"E{numero}").value or "").strip().upper()
+    """Lee comando E y respuesta J con UNA solicitud de lectura, no dos."""
+    valores = ws.get(range_name=f"E{numero}:J{numero}")
+    fila = (valores[0] if valores else []) + [""] * 6
+    comando = (fila[0] or "").strip().upper()
     if comando not in ("RESPONDER_SAT", "BUSCAR_SAT"):
         return None
-    raw = ws.acell(f"J{numero}").value or ""
+    raw = fila[5] or ""
     if not raw:
-        return None  # quizá la red todavía esté reflejando la actualización
+        return None
     respuesta = json.loads(raw)
     if respuesta.get("id") != pregunta_id:
         raise ValueError("La respuesta corresponde a otra pregunta SAT. No se aplicará.")
@@ -259,8 +261,12 @@ def pendientes(ss) -> list[tuple[int, list[str]]]:
 
 
 def actualizar(ws, numero: int, *, estado: str, mensaje: str = "", paso: str = ""):
-    # C..H, se borra comando para evitar aplicar una instrucción antigua.
-    ws.update(range_name=f"C{numero}:H{numero}", values=[[estado, ws.acell(f'D{numero}').value or "", "", mensaje[:2000], paso[:240], _ahora()]], value_input_option="RAW")
+    # Preserva D (pedido) y actualiza C, E:H en UNA escritura batch.
+    # Evita la lectura adicional de D en cada cambio de estado.
+    ws.batch_update([
+        {"range": f"C{numero}", "values": [[estado]]},
+        {"range": f"E{numero}:H{numero}", "values": [["", mensaje[:2000], paso[:240], _ahora()]]},
+    ], value_input_option="RAW")
 
 
 def comando_actual(ws, numero: int) -> str:
