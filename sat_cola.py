@@ -13,6 +13,7 @@ import json
 import re
 import uuid
 import zlib
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 
@@ -459,3 +460,82 @@ def consultar_archivos(ss, id_trabajo: str):
             continue
         resultado[tipo]={"bytes": datos, "nombre":filas[0][7], "uuid":uuid}
     return resultado
+
+
+# ======= PDF DE VISTA PREVIA (BORRADOR, NO CFDI TIMBRADO) =======
+HOJA_PDF_PREVIA = 'Sat_Previas_PDF'
+CABECERAS_PDF_PREVIA = ['Trabajo', 'SHA256', 'Parte', 'Contenido zlib base64', 'Total partes', 'Fecha UTC', 'Nombre']
+
+
+def _hoja_pdf_previa(ss, crear=False):
+    import gspread
+    try:
+        ws = ss.worksheet(HOJA_PDF_PREVIA)
+    except gspread.WorksheetNotFound:
+        if not crear:
+            return None
+        ws = ss.add_worksheet(title=HOJA_PDF_PREVIA, rows=800, cols=7)
+        ws.update(range_name='A1:G1', values=[CABECERAS_PDF_PREVIA], value_input_option='RAW')
+    if ws.row_values(1)[:7] != CABECERAS_PDF_PREVIA:
+        raise ValueError('Encabezados no reconocidos en Sat_Previas_PDF. Sin cambios.')
+    return ws
+
+
+def _validar_pdf_previa(datos):
+    if not isinstance(datos, bytes) or len(datos) < 32 or not datos.startswith(b'%PDF-') or b'%%EOF' not in datos[-2048:]:
+        raise ValueError('Vista Previa no es un archivo PDF real')
+    if len(datos) > 3_000_000:
+        raise ValueError('Vista Previa supera 3 MB y no se puede sincronizar en Sheets')
+
+
+def publicar_pdf_previa(ss, id_trabajo, datos, nombre='Vista_Previa_SAT.pdf'):
+    """Publica PDF descargado realmente al pulsar Vista Previa, nunca un PDF inventado.
+
+    Es un BORRADOR. No se mezcla con XML/PDF oficiales timbrados de Sat_Archivos.
+    """
+    _validar_pdf_previa(datos)
+    if not re.fullmatch(r'[a-f0-9]{32}', str(id_trabajo)):
+        raise ValueError('Trabajo SAT inválido')
+    ws = _hoja_pdf_previa(ss, crear=True)
+    huella = hashlib.sha256(datos).hexdigest()
+    codificado = base64.b64encode(zlib.compress(datos,9)).decode('ascii')
+    bloques = [codificado[i:i+30000] for i in range(0,len(codificado),30000)]
+    if not bloques or len(bloques) > 150:
+        raise ValueError('Vista Previa supera el máximo de partes permitido')
+    registros = ws.get_all_values()
+    otras = [(n,fila) for n,fila in enumerate(registros, 1) if n>1 and fila and fila[0]==id_trabajo]
+    # Al actualizar un borrador se conservan otros trabajos, no otros PDF de este trabajo.
+    for n,_ in reversed(otras):
+        ws.delete_rows(n)
+    nombre = Path(str(nombre or 'Vista_Previa_SAT.pdf')).name
+    if not nombre.lower().endswith('.pdf'):
+        nombre += '.pdf'
+    fecha = _ahora()
+    ws.append_rows([[id_trabajo,huella,i,trozo,len(bloques),fecha,nombre] for i,trozo in enumerate(bloques,1)],value_input_option='RAW')
+    return huella
+
+
+def consultar_pdf_previa(ss,id_trabajo):
+    ws = _hoja_pdf_previa(ss)
+    if ws is None:
+        return None
+    filas = [r for r in ws.get_all_values()[1:] if len(r)>=7 and r[0]==id_trabajo]
+    if not filas:
+        return None
+    try:
+        versiones = {r[1] for r in filas}
+        totales = {int(r[4]) for r in filas}
+        if len(versiones)!=1 or len(totales)!=1:
+            return None
+        cantidad = next(iter(totales))
+        partes = {int(r[2]):r[3] for r in filas}
+        if len(filas)!=cantidad or sorted(partes)!=list(range(1,cantidad+1)):
+            return None
+        datos = zlib.decompress(base64.b64decode(''.join(partes[n] for n in range(1,cantidad+1)),validate=True))
+        _validar_pdf_previa(datos)
+        huella = hashlib.sha256(datos).hexdigest()
+        if huella != next(iter(versiones)):
+            return None
+        return {'bytes':datos,'hash':huella,'fecha':filas[0][5], 'nombre':filas[0][6]}
+    except (ValueError,TypeError,KeyError,IndexError,zlib.error):
+        return None
