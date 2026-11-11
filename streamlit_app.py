@@ -6613,7 +6613,7 @@ with tab_catalogo:
 CLIENTES_FACTURA_HOJA = "Clientes_Factura"
 CLIENTES_FACTURA_CABECERAS = [
     "Cliente", "RFC", "Nombre o Razón Social", "Código Postal", "Régimen Fiscal",
-    "Forma de Pago", "Método de Pago", "Moneda",
+    "Forma de Pago", "Método de Pago", "Moneda", "Uso del CFDI",
 ]
 
 
@@ -6624,22 +6624,24 @@ def _cf_normalizar(valor):
 
 
 def _cf_parsear_filas(valores):
-    """La estructura se fija en A:H. Detecta registros incompletos sin inventar datos."""
+    """La estructura se fija en A:I. Detecta registros incompletos sin inventar datos."""
     import re
     if not valores:
         raise ValueError("Clientes_Factura no tiene encabezados.")
-    recibidos = [_cf_normalizar(v) for v in (list(valores[0][:8]) + [""]*8)[:8]]
+    recibidos = [_cf_normalizar(v) for v in (list(valores[0][:9]) + [""]*9)[:9]]
     requeridos = [_cf_normalizar(v) for v in CLIENTES_FACTURA_CABECERAS]
-    if recibidos != requeridos:
-        raise ValueError("Clientes_Factura requiere columnas A:H en este orden: " +
+    nombres_uso = {"uso del cfdi", "uso de cfdi", "uso cfdi", "uso de la factura", "uso de factura"}
+    if recibidos[:8] != requeridos[:8] or recibidos[8] not in nombres_uso:
+        raise ValueError("Clientes_Factura requiere columnas A:I en este orden: " +
                          ", ".join(CLIENTES_FACTURA_CABECERAS) +
-                         ". No se modificaron los datos existentes.")
+                         ". La columna I debe titularse USO DEL CFDI. "
+                         "No se modificaron los datos existentes.")
     lista = []
     for nro, fila in enumerate(valores[1:], 2):
-        c = [str(v).strip() for v in (list(fila[:8]) + [""]*8)[:8]]
+        c = [str(v).strip() for v in (list(fila[:9]) + [""]*9)[:9]]
         if not any(c):
             continue
-        nombre, rfc, razon, cp, regimen, forma, metodo, moneda = c
+        nombre, rfc, razon, cp, regimen, forma, metodo, moneda, uso_cfdi = c
         # Puede haber nombres comerciales repetidos o distintos para el mismo RFC.
         # La selección del receptor se hará por razón social + RFC, NO por el ticket.
         if not nombre:
@@ -6658,13 +6660,15 @@ def _cf_parsear_filas(valores):
             errores.append("Forma de pago faltante")
         if not metodo:
             errores.append("Método de pago faltante")
+        if not uso_cfdi:
+            errores.append("Uso del CFDI faltante en columna I")
         # Todos los CFDI se emitirán en MXN, sin enviar tipo de cambio.
         if moneda and _cf_normalizar(moneda) not in ("mxn", "peso mexicano", "pesos mexicanos"):
             errores.append("Moneda debe ser MXN o Peso Mexicano")
         lista.append({
             "cliente": nombre, "rfc": rfc.upper(), "nombre_razon_social": razon,
             "codigo_postal": cp, "regimen_fiscal": regimen, "forma_pago": forma,
-            "metodo_pago": metodo, "moneda": "MXN", "fila": nro,
+            "metodo_pago": metodo, "moneda": "MXN", "uso_cfdi": uso_cfdi, "fila": nro,
             "errores": errores, "normalizado": clave,
         })
     return lista
@@ -6681,7 +6685,7 @@ def _cf_leer_directo():
         ws = ss.worksheet(CLIENTES_FACTURA_HOJA)
     except gspread.WorksheetNotFound:
         raise FileNotFoundError('Crea manualmente la hoja Clientes_Factura con '
-                                'las columnas A:H indicadas. No se creó otra hoja.') from None
+                                'las columnas A:I indicadas. No se creó otra hoja.') from None
     filas = ws.get_all_values(value_render_option="FORMATTED_VALUE")
     return _cf_parsear_filas(filas)
 
@@ -6697,7 +6701,7 @@ def _cf_datos_para_robot(registro):
         raise ValueError("Faltan datos fiscales válidos del cliente en Clientes_Factura")
     return {campo: registro[campo] for campo in (
         "cliente", "rfc", "nombre_razon_social", "codigo_postal", "regimen_fiscal",
-        "forma_pago", "metodo_pago", "moneda")}
+        "forma_pago", "metodo_pago", "moneda", "uso_cfdi")}
 
 
 SAT_HOJA = "Sat"
@@ -7503,6 +7507,7 @@ with tab_sat:
                             "Forma de pago": registro_cliente_sat["forma_pago"],
                             "Método de pago": registro_cliente_sat["metodo_pago"],
                             "Moneda": "MXN",
+                            "Uso del CFDI": registro_cliente_sat["uso_cfdi"],
                         }]), hide_index=True, use_container_width=True)
                         if registro_cliente_sat["errores"]:
                             error_cliente_sat = ("Clientes_Factura fila " +
@@ -7515,7 +7520,7 @@ with tab_sat:
             if error_cliente_sat:
                 st.warning(error_cliente_sat)
             st.caption("Si el cliente es nuevo, registra RFC, nombre fiscal, CP, régimen, "
-                       "forma y método en la hoja Clientes_Factura. Moneda: MXN. "
+                       "forma, método y uso del CFDI en la hoja Clientes_Factura. Moneda: MXN. "
                        "Pulsa Actualizar y selecciónalo aquí.")
             tabla_factura = []
             pendientes = [error_cliente_sat] if error_cliente_sat else []
