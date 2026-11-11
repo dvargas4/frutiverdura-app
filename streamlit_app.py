@@ -7178,7 +7178,7 @@ with tab_sat:
                 # La contraseña de timbrado se verifica EXCLUSIVAMENTE en Streamlit.
                 _vista_sat = None
                 if _estado_sat["estado"] in ("REVISION_MOVIL", "RESULTADO_SELLO", "FINALIZADO", "FINALIZADO_PDF_PENDIENTE", "CERRADO_SIN_XML"):
-                    st.markdown("#### Vista del SAT para revisión desde teléfono")
+                    st.markdown("#### 2. Vista Previa del SAT para revisión desde teléfono")
                     try:
                         _vista_sat = _sat_vista_control_cache(_id_act_sat)
                     except Exception as exc:
@@ -7199,8 +7199,8 @@ with tab_sat:
                                 _sat_limpiar_cache_control(); st.rerun()
                             except Exception as exc: st.error(str(exc))
                     if _estado_sat["estado"] == "REVISION_MOVIL":
-                        st.markdown("#### Autorización exclusiva de timbrado")
-                        st.caption("Verifica RFC, razón social, CP, régimen fiscal, conceptos, impuestos y total. "
+                        st.markdown("#### 3. Sellar factura (solo después de Guardar y Vista Previa)")
+                        st.caption("El robot pulsó Guardar y Vista Previa antes de habilitar Sellar. Verifica RFC, razón social, CP, régimen fiscal, conceptos, impuestos y total. "
                                    "La clave de timbrado es distinta de la clave para iniciar la captura. "
                                    "La misma clave debe haberse configurado UNA VEZ en el agente de tu Mac.")
                         if not _pin_timbrado:
@@ -7213,17 +7213,17 @@ with tab_sat:
                             with st.form(f"sat_confirmar_timbrado_{_id_act_sat}", clear_on_submit=True):
                                 _comprobado = st.checkbox("Revisé la vista previa real del SAT y verifico que todos los datos son correctos")
                                 _clave_sellado = st.text_input("Segunda contraseña: autorización de timbrado", type="password")
-                                _confirmacion_sellado = st.text_input("Escribe TIMBRAR para confirmar")
+                                _confirmacion_sellado = st.text_input("Escribe SELLAR para confirmar")
                                 _autorizar = st.form_submit_button(
-                                    "🔐 Autorizar timbrado de esta factura", type="primary",
+                                    "🔐 SELLAR factura con segunda contraseña", type="primary",
                                     disabled=bool(_estado_sat["comando"]), use_container_width=True)
                             if _autorizar:
                                 if not _comprobado:
                                     st.error("Primero debes marcar que revisaste la factura.")
                                 elif not hmac.compare_digest(_clave_sellado, _pin_timbrado):
                                     st.error("Contraseña exclusiva de timbrado incorrecta. No se envió ninguna orden.")
-                                elif _confirmacion_sellado.strip().upper() != "TIMBRAR":
-                                    st.error("Escribe TIMBRAR para autorizar la emisión.")
+                                elif _confirmacion_sellado.strip().upper() != "SELLAR":
+                                    st.error("Escribe SELLAR para autorizar la emisión.")
                                 else:
                                     try:
                                         sat_cola.enviar_comando(
