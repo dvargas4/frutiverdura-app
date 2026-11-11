@@ -6980,6 +6980,35 @@ def _sat_exportar_pedido(pedido, registros_sat, retener_isr):
     return json.dumps(paquete, indent=2, ensure_ascii=False).encode("utf-8")
 
 
+# Lecturas compartidas entre sesiones Streamlit: evitan saturar la API de Sheets.
+# La caché se invalida al pulsar Actualizar y al emitir una orden al robot.
+@st.cache_data(ttl=35, show_spinner=False)
+def _sat_historial_control_cache():
+    return sat_cola.recientes(_abrir_spreadsheet(), maximo=20)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _sat_estado_control_cache(id_trabajo):
+    return sat_cola.consultar(_abrir_spreadsheet(), id_trabajo)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _sat_vista_control_cache(id_trabajo):
+    return sat_cola.consultar_vista(_abrir_spreadsheet(), id_trabajo)
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def _sat_archivos_control_cache(id_trabajo):
+    return sat_cola.consultar_archivos(_abrir_spreadsheet(), id_trabajo)
+
+
+def _sat_limpiar_cache_control():
+    _sat_historial_control_cache.clear()
+    _sat_estado_control_cache.clear()
+    _sat_vista_control_cache.clear()
+    _sat_archivos_control_cache.clear()
+
+
 with tab_sat:
     st.subheader("🧾 Facturación SAT")
     st.caption('Las claves y unidades fiscales se guardan en Google Sheets, pestaña "Sat". '
@@ -7007,19 +7036,19 @@ with tab_sat:
         if _acceder:
             if hmac.compare_digest(_pin_introducido, _pin_sat):
                 st.session_state["sat_puente_autorizado"] = True
-                st.rerun()
+                _sat_limpiar_cache_control(); st.rerun()
             else:
                 st.error("Clave de acceso incorrecta")
     else:
         if st.button("🔄 Consultar estado del robot", key="sat_control_remoto_refrescar", use_container_width=True):
-            st.rerun()
+            _sat_limpiar_cache_control(); st.rerun()
         try:
-            _historial_sat = sat_cola.recientes(_abrir_spreadsheet(), maximo=20)
+            _historial_sat = _sat_historial_control_cache()
         except Exception as _exc:
             _historial_sat = []
             st.warning(f"No se pudo consultar Sat_Cola: {_exc}")
         if not _historial_sat:
-            st.info("No hay solicitudes recientes. Crea una factura desde un ticket para comenzar.")
+            st.info("Sin solicitudes disponibles en este momento. Si hubo un error 429, espera un minuto y pulsa Consultar estado del robot.")
         else:
             _ids_sat = [r["id"] for r in _historial_sat]
             _id_act_sat = st.session_state.get("sat_puente_trabajo")
@@ -7035,7 +7064,7 @@ with tab_sat:
             )
             st.session_state["sat_puente_trabajo"] = _id_act_sat
             try:
-                _estado_sat = sat_cola.consultar(_abrir_spreadsheet(), _id_act_sat)
+                _estado_sat = _sat_estado_control_cache(_id_act_sat)
                 st.write(f"**Estado:** {_estado_sat['estado']}")
                 if _estado_sat["paso"]:
                     st.caption(f"Paso: {_estado_sat['paso']}")
@@ -7050,7 +7079,7 @@ with tab_sat:
                 if _estado_sat["estado"] in ("REVISION_MOVIL", "RESULTADO_SELLO", "FINALIZADO", "FINALIZADO_PDF_PENDIENTE", "CERRADO_SIN_XML"):
                     st.markdown("#### Vista del SAT para revisión desde teléfono")
                     try:
-                        _vista_sat = sat_cola.consultar_vista(_abrir_spreadsheet(), _id_act_sat)
+                        _vista_sat = _sat_vista_control_cache(_id_act_sat)
                     except Exception as exc:
                         st.warning(f"Todavía no se pudo consultar la vista previa: {exc}")
                     if _vista_sat:
@@ -7066,7 +7095,7 @@ with tab_sat:
                             disabled=bool(_estado_sat["comando"]),use_container_width=True):
                             try:
                                 sat_cola.enviar_comando(_abrir_spreadsheet(), _id_act_sat, "ACTUALIZAR_VISTA")
-                                st.rerun()
+                                _sat_limpiar_cache_control(); st.rerun()
                             except Exception as exc: st.error(str(exc))
                     if _estado_sat["estado"] == "REVISION_MOVIL":
                         st.markdown("#### Autorización exclusiva de timbrado")
@@ -7103,7 +7132,7 @@ with tab_sat:
                                                 sat_cola.derivar_clave_timbrado(_pin_timbrado),
                                                 _id_act_sat, _vista_sat["hash"]))
                                         st.success("Autorización enviada. El robot realizará un único intento de sellado.")
-                                        st.rerun()
+                                        _sat_limpiar_cache_control(); st.rerun()
                                     except Exception as exc:
                                         st.error(f"No se autorizó el timbrado: {exc}")
                     if _estado_sat["estado"] in ("RESULTADO_SELLO", "FINALIZADO", "FINALIZADO_PDF_PENDIENTE", "CERRADO_SIN_XML"):
@@ -7114,10 +7143,10 @@ with tab_sat:
                                     disabled=bool(_estado_sat["comando"]), use_container_width=True):
                                 try:
                                     sat_cola.enviar_comando(_abrir_spreadsheet(), _id_act_sat, "RECUPERAR_ARCHIVOS")
-                                    st.rerun()
+                                    _sat_limpiar_cache_control(); st.rerun()
                                 except Exception as exc: st.error(str(exc))
                         try:
-                            _archivos_sat = sat_cola.consultar_archivos(_abrir_spreadsheet(), _id_act_sat)
+                            _archivos_sat = _sat_archivos_control_cache(_id_act_sat)
                         except Exception as exc:
                             st.error(f"No pude consultar los documentos fiscales: {exc}")
                             _archivos_sat = {}
@@ -7204,7 +7233,7 @@ with tab_sat:
                         try:
                             sat_cola.enviar_respuesta(
                                 _abrir_spreadsheet(), _id_act_sat, _qid, _operacion_sat, _valor_sat)
-                            st.rerun()
+                            _sat_limpiar_cache_control(); st.rerun()
                         except Exception as _exc:
                             st.error(f"No se pudo enviar la respuesta: {_exc}")
                     st.caption("Si no aparece la pregunta siguiente, pulsa Consultar estado del robot.")
@@ -7228,7 +7257,7 @@ with tab_sat:
                                      disabled=bool(_estado_sat["comando"]), use_container_width=True):
                             try:
                                 sat_cola.enviar_comando(_abrir_spreadsheet(), _id_act_sat, _com_sat)
-                                st.rerun()
+                                _sat_limpiar_cache_control(); st.rerun()
                             except Exception as _exc:
                                 st.error(f"No se pudo enviar el comando: {_exc}")
                 if _estado_sat["estado"] == "PENDIENTE":
