@@ -6985,6 +6985,259 @@ with tab_sat:
     st.caption('Las claves y unidades fiscales se guardan en Google Sheets, pestaña "Sat". '
                'A = Producto, B = Clave SAT y C = Unidad. No se almacenan certificados en la app.')
 
+    # El panel vive FUERA de la selección del ticket: puede abrirse desde
+    # el teléfono, otra pestaña o después de un reinicio de sesión Streamlit.
+    st.markdown("### 🎛️ Control del robot SAT")
+    st.caption("Controla una captura en curso y responde preguntas desde esta página. "
+               "El navegador real del SAT sigue abierto en tu Mac.")
+    try:
+        _pin_sat = str(st.secrets.get("sat_access_pin", ""))
+    except Exception:
+        _pin_sat = ""
+    try:
+        _pin_timbrado = str(st.secrets.get("sat_timbrado_pin", ""))
+    except Exception:
+        _pin_timbrado = ""
+    if not _pin_sat:
+        st.error("Configura sat_access_pin en los Secrets de Streamlit para usar el robot.")
+    elif not st.session_state.get("sat_puente_autorizado", False):
+        with st.form("sat_acceso_control_remoto"):
+            _pin_introducido = st.text_input("Clave para controlar el robot SAT", type="password")
+            _acceder = st.form_submit_button("Desbloquear control SAT")
+        if _acceder:
+            if hmac.compare_digest(_pin_introducido, _pin_sat):
+                st.session_state["sat_puente_autorizado"] = True
+                st.rerun()
+            else:
+                st.error("Clave de acceso incorrecta")
+    else:
+        if st.button("🔄 Consultar estado del robot", key="sat_control_remoto_refrescar", use_container_width=True):
+            st.rerun()
+        try:
+            _historial_sat = sat_cola.recientes(_abrir_spreadsheet(), maximo=20)
+        except Exception as _exc:
+            _historial_sat = []
+            st.warning(f"No se pudo consultar Sat_Cola: {_exc}")
+        if not _historial_sat:
+            st.info("No hay solicitudes recientes. Crea una factura desde un ticket para comenzar.")
+        else:
+            _ids_sat = [r["id"] for r in _historial_sat]
+            _id_act_sat = st.session_state.get("sat_puente_trabajo")
+            if _id_act_sat not in _ids_sat:
+                _id_act_sat = _ids_sat[0]
+            _id_act_sat = st.selectbox(
+                "Factura que quieres controlar", _ids_sat,
+                index=_ids_sat.index(_id_act_sat),
+                format_func=lambda jid: next(
+                    (f"{h['folio'] or h['cliente'] or jid[:8]} · {h['estado']} · {h['creado']}"
+                     for h in _historial_sat if h["id"] == jid), jid),
+                key="sat_control_remoto_trabajo",
+            )
+            st.session_state["sat_puente_trabajo"] = _id_act_sat
+            try:
+                _estado_sat = sat_cola.consultar(_abrir_spreadsheet(), _id_act_sat)
+                st.write(f"**Estado:** {_estado_sat['estado']}")
+                if _estado_sat["paso"]:
+                    st.caption(f"Paso: {_estado_sat['paso']}")
+                if _estado_sat["mensaje"]:
+                    st.info(_estado_sat["mensaje"])
+                if _estado_sat["comando"]:
+                    st.caption(f"Esperando respuesta del agente: {_estado_sat['comando']}")
+
+                # La captura del SAT es distinta del ticket calculado localmente.
+                # La contraseña de timbrado se verifica EXCLUSIVAMENTE en Streamlit.
+                _vista_sat = None
+                if _estado_sat["estado"] in ("REVISION_MOVIL", "RESULTADO_SELLO", "FINALIZADO", "FINALIZADO_PDF_PENDIENTE", "CERRADO_SIN_XML"):
+                    st.markdown("#### Vista del SAT para revisión desde teléfono")
+                    try:
+                        _vista_sat = sat_cola.consultar_vista(_abrir_spreadsheet(), _id_act_sat)
+                    except Exception as exc:
+                        st.warning(f"Todavía no se pudo consultar la vista previa: {exc}")
+                    if _vista_sat:
+                        st.caption("Captura real del navegador SAT, obtenida: " + _vista_sat["fecha"])
+                        st.image(_vista_sat["jpeg"], caption="Pantalla del SAT. Amplía la imagen para revisar los datos.", use_container_width=True)
+                        with st.expander("Texto visible en el SAT", expanded=False):
+                            st.text(_vista_sat["texto"])
+                    else:
+                        st.warning("La vista SAT no está disponible. No se puede autorizar un timbrado sin revisarla.")
+                    if _estado_sat["estado"] in ("REVISION_MOVIL", "RESULTADO_SELLO"):
+                        if st.button("🔄 Actualizar captura real del SAT",
+                            key=f"sat_actualizar_vista_{_id_act_sat}",
+                            disabled=bool(_estado_sat["comando"]),use_container_width=True):
+                            try:
+                                sat_cola.enviar_comando(_abrir_spreadsheet(), _id_act_sat, "ACTUALIZAR_VISTA")
+                                st.rerun()
+                            except Exception as exc: st.error(str(exc))
+                    if _estado_sat["estado"] == "REVISION_MOVIL":
+                        st.markdown("#### Autorización exclusiva de timbrado")
+                        st.caption("Verifica RFC, razón social, CP, régimen fiscal, conceptos, impuestos y total. "
+                                   "La clave de timbrado es distinta de la clave para iniciar la captura. "
+                                   "La misma clave debe haberse configurado UNA VEZ en el agente de tu Mac.")
+                        if not _pin_timbrado:
+                            st.error("Falta sat_timbrado_pin en Streamlit Secrets. No se permite timbrar.")
+                        elif len(_pin_timbrado) < 16:
+                            st.error("sat_timbrado_pin debe tener al menos 16 caracteres.")
+                        elif hmac.compare_digest(_pin_timbrado, _pin_sat):
+                            st.error("La contraseña de timbrado NO puede ser igual a sat_access_pin.")
+                        elif _vista_sat:
+                            with st.form(f"sat_confirmar_timbrado_{_id_act_sat}", clear_on_submit=True):
+                                _comprobado = st.checkbox("Revisé la vista previa real del SAT y verifico que todos los datos son correctos")
+                                _clave_sellado = st.text_input("Segunda contraseña: autorización de timbrado", type="password")
+                                _confirmacion_sellado = st.text_input("Escribe TIMBRAR para confirmar")
+                                _autorizar = st.form_submit_button(
+                                    "🔐 Autorizar timbrado de esta factura", type="primary",
+                                    disabled=bool(_estado_sat["comando"]), use_container_width=True)
+                            if _autorizar:
+                                if not _comprobado:
+                                    st.error("Primero debes marcar que revisaste la factura.")
+                                elif not hmac.compare_digest(_clave_sellado, _pin_timbrado):
+                                    st.error("Contraseña exclusiva de timbrado incorrecta. No se envió ninguna orden.")
+                                elif _confirmacion_sellado.strip().upper() != "TIMBRAR":
+                                    st.error("Escribe TIMBRAR para autorizar la emisión.")
+                                else:
+                                    try:
+                                        sat_cola.enviar_comando(
+                                            _abrir_spreadsheet(), _id_act_sat, "TIMBRAR",
+                                            vista_hash=_vista_sat["hash"], confirmacion="TIMBRAR",
+                                            firma=sat_cola.firmar_timbrado(
+                                                sat_cola.derivar_clave_timbrado(_pin_timbrado),
+                                                _id_act_sat, _vista_sat["hash"]))
+                                        st.success("Autorización enviada. El robot realizará un único intento de sellado.")
+                                        st.rerun()
+                                    except Exception as exc:
+                                        st.error(f"No se autorizó el timbrado: {exc}")
+                    if _estado_sat["estado"] in ("RESULTADO_SELLO", "FINALIZADO", "FINALIZADO_PDF_PENDIENTE", "CERRADO_SIN_XML"):
+                        st.markdown("#### XML y PDF de la factura")
+                        if _estado_sat["estado"] == "RESULTADO_SELLO":
+                            if st.button("📥 Volver a intentar recuperar XML y PDF (sin volver a timbrar)",
+                                    key=f"sat_recuperar_docs_{_id_act_sat}",
+                                    disabled=bool(_estado_sat["comando"]), use_container_width=True):
+                                try:
+                                    sat_cola.enviar_comando(_abrir_spreadsheet(), _id_act_sat, "RECUPERAR_ARCHIVOS")
+                                    st.rerun()
+                                except Exception as exc: st.error(str(exc))
+                        try:
+                            _archivos_sat = sat_cola.consultar_archivos(_abrir_spreadsheet(), _id_act_sat)
+                        except Exception as exc:
+                            st.error(f"No pude consultar los documentos fiscales: {exc}")
+                            _archivos_sat = {}
+                        if "XML" in _archivos_sat:
+                            st.success("XML timbrado disponible. UUID: " + _archivos_sat["XML"]["uuid"])
+                        else:
+                            st.warning("No hay XML timbrado recuperado. No consideres confirmada la emisión.")
+                        _colxml, _colpdf = st.columns(2)
+                        for _col,_tipo,_mime in ((_colxml,"XML","application/xml"),(_colpdf,"PDF","application/pdf")):
+                            with _col:
+                                if _tipo in _archivos_sat:
+                                    _arc = _archivos_sat[_tipo]
+                                    st.download_button(
+                                        f"📥 Descargar {_tipo} oficial",
+                                        data=_arc["bytes"], file_name=_arc["nombre"],
+                                        mime=_mime, key=f"sat_desc_{_id_act_sat}_{_tipo}",
+                                        use_container_width=True)
+                                else:
+                                    st.info(f"{_tipo} todavía no disponible desde el SAT")
+                        st.caption("Los documentos descargados desde el SAT también se guardan automáticamente "
+                            "en una carpeta nueva del Escritorio del Mac, con nombre del cliente y fecha. "
+                            "Si facturas varias veces al mismo cliente en el día, se agrega (2), (3), etc. "
+                            "La transferencia a la app usa Sat_Archivos. No se generan comprobantes simulados.")
+
+                _preg_sat = _estado_sat.get("pregunta")
+                if _estado_sat["estado"] == "PREGUNTA_SAT" and _preg_sat:
+                    st.markdown(f"#### {_preg_sat['titulo']}")
+                    if _preg_sat.get("ayuda"):
+                        st.caption(_preg_sat["ayuda"])
+                    _op_sat = _preg_sat.get("opciones", [])
+                    _qid = _preg_sat["id"]
+                    _tipo = _preg_sat["tipo"]
+                    _bloqueado = bool(_estado_sat["comando"])
+                    _operacion_sat = None
+                    _valor_sat = ""
+                    with st.form(f"sat_responder_{_id_act_sat}_{_qid}"):
+                        if _tipo in ("seleccion", "autocompletar"):
+                            if _op_sat:
+                                _seleccion_sat = st.selectbox(
+                                    "Opciones que encontró el robot en el SAT", _op_sat)
+                                _elegir_sat = st.form_submit_button(
+                                    "✅ Elegir esta opción y continuar", disabled=_bloqueado,
+                                    use_container_width=True)
+                            else:
+                                st.warning("El SAT no mostró opciones con la búsqueda actual.")
+                                _elegir_sat = False
+                                _seleccion_sat = ""
+                            _buscar_sat = st.text_input(
+                                "Buscar otras opciones en el SAT", value="",
+                                placeholder="Por ejemplo: efectivo, Peso, RFC o Personas Morales")
+                            _hacer_busqueda = st.form_submit_button(
+                                "🔎 Buscar en el SAT", disabled=_bloqueado,
+                                use_container_width=True)
+                            # Receptor no registrado: elegir Otro en el SAT y
+                            # preguntar sus cuatro datos obligatorios después.
+                            if _preg_sat.get("campo") == "rfc":
+                                _seleccionar_otro_sat = st.form_submit_button(
+                                    "➕ No aparece mi cliente: elegir Otro",
+                                    disabled=_bloqueado, use_container_width=True)
+                            else:
+                                _seleccionar_otro_sat = False
+                            _enviar_directo_sat = False
+                            _directo_sat = ""
+                            if _hacer_busqueda:
+                                _operacion_sat, _valor_sat = "buscar", _buscar_sat
+                            elif _elegir_sat:
+                                _operacion_sat, _valor_sat = "seleccionar", _seleccion_sat
+                            elif _seleccionar_otro_sat:
+                                _operacion_sat, _valor_sat = "otro", "Otro"
+                        elif _tipo == "texto":
+                            _dato_sat = st.text_input(
+                                "Tu respuesta", placeholder="Escribe el dato solicitado",
+                                max_chars=40,
+                            )
+                            if st.form_submit_button("✅ Enviar y continuar", disabled=_bloqueado,
+                                                     use_container_width=True):
+                                _operacion_sat, _valor_sat = "escribir", _dato_sat
+                        else:
+                            st.error("El robot solicitó un tipo de dato no reconocido")
+                        if st.form_submit_button("⚠️ No encuentro la opción, pausar para revisar",
+                                                 disabled=_bloqueado, use_container_width=True):
+                            _operacion_sat, _valor_sat = "revisar", ""
+                    if _operacion_sat:
+                        try:
+                            sat_cola.enviar_respuesta(
+                                _abrir_spreadsheet(), _id_act_sat, _qid, _operacion_sat, _valor_sat)
+                            st.rerun()
+                        except Exception as _exc:
+                            st.error(f"No se pudo enviar la respuesta: {_exc}")
+                    st.caption("Si no aparece la pregunta siguiente, pulsa Consultar estado del robot.")
+                else:
+                    _controles_sat = {
+                        "DATOS_RECEPTOR": [
+                            ("CONTINUAR", "✅ Revisé los datos generales, capturar productos")],
+                        "ERROR_PAUSADO": [
+                            ("REINTENTAR", "🔁 Reintentar este paso"),
+                            ("OMITIR_PASO", "✅ Ya corregí este campo directamente en el SAT"),
+                            ("GUARDADO", "📋 Ya guardé este concepto")],
+                        "REVISION_MOVIL": [("CERRAR", "Cancelar y cerrar navegador sin timbrar")],
+                        "RESULTADO_SELLO": [("CERRAR", "Cerrar navegador después de revisar el resultado")],
+                        "REVISION_SAT": [("CERRAR", "Cerrar navegador después de revisar y timbrar")],
+                        "ERROR_GRAVE": [("CERRAR", "Cerrar navegador tras revisar error")],
+                    }
+                    for _com_sat, _etq_sat in _controles_sat.get(_estado_sat["estado"], []):
+                        if _com_sat == "GUARDADO" and "Concepto " not in _estado_sat.get("paso", ""):
+                            continue
+                        if st.button(_etq_sat, key=f"sat_control_{_id_act_sat}_{_com_sat}",
+                                     disabled=bool(_estado_sat["comando"]), use_container_width=True):
+                            try:
+                                sat_cola.enviar_comando(_abrir_spreadsheet(), _id_act_sat, _com_sat)
+                                st.rerun()
+                            except Exception as _exc:
+                                st.error(f"No se pudo enviar el comando: {_exc}")
+                if _estado_sat["estado"] == "PENDIENTE":
+                    st.caption("El robot aún no recoge el trabajo. Revisa que tu Mac y el agente estén activos.")
+            except Exception as _exc:
+                st.error(f"No se pudo controlar la factura: {_exc}")
+
+    st.divider()
+
     col_sync_sat, col_refresh_sat = st.columns(2)
     with col_sync_sat:
         sincronizar_sat = st.button("➕ Sincronizar productos nuevos en Sat", use_container_width=True,
@@ -7164,94 +7417,20 @@ with tab_sat:
                     st.caption("Al pulsar Iniciar, el agente de tu computadora abrirá el SAT. "
                                "Los certificados .cer/.key se leen únicamente desde tu disco; "
                                "no se suben a Streamlit ni a Google Sheets.")
-                    try:
-                        pin_esperado = str(st.secrets.get("sat_access_pin", ""))
-                    except Exception:
-                        pin_esperado = ""
-                    clave_autorizada = False
-                    if not pin_esperado:
-                        st.error("Para activar el robot remoto, configura sat_access_pin en los "
-                                 "Secrets de Streamlit. Esto impide que otro visitante inicie "
-                                 "facturas con tu e.firma.")
-                    elif st.session_state.get("sat_puente_autorizado", False):
-                        clave_autorizada = True
-                    else:
-                        with st.form("sat_desbloquear_robot"):
-                            clave_panel = st.text_input("Clave de autorización de facturación",
-                                                      type="password")
-                            desbloquear = st.form_submit_button("Desbloquear facturación")
-                        if desbloquear:
-                            if hmac.compare_digest(clave_panel, pin_esperado):
-                                st.session_state["sat_puente_autorizado"] = True
-                                st.rerun()
-                            else:
-                                st.error("Clave de autorización incorrecta")
-                    if clave_autorizada:
-                        id_trabajo_actual = st.session_state.get("sat_puente_trabajo")
-                        if st.button("▶ Iniciar captura en SAT desde esta app",
-                                     type="primary", use_container_width=True,
-                                     key=f"sat_enviar_{pedido_sat['_ui_id']}"):
-                            try:
-                                paquete = json.loads(contenido_sat.decode("utf-8"))
-                                id_trabajo_actual = sat_cola.solicitar(_abrir_spreadsheet(), paquete)
-                                st.session_state["sat_puente_trabajo"] = id_trabajo_actual
-                                st.success("Solicitud enviada. El navegador SAT se abrirá en "
-                                           "la computadora donde instalaste el agente.")
-                            except Exception as exc:
-                                st.error(f"No se pudo enviar el trabajo al robot: {exc}")
+                    if not st.session_state.get("sat_puente_autorizado", False):
+                        st.info("Desbloquea el panel Control del robot SAT que aparece arriba "
+                                "para iniciar la captura desde esta app.")
+                    elif st.button("▶ Iniciar captura en SAT desde esta app",
+                                   type="primary", use_container_width=True,
+                                   key=f"sat_enviar_{pedido_sat['_ui_id']}"):
                         try:
-                            historicos = sat_cola.recientes(_abrir_spreadsheet(), maximo=15)
-                            if historicos:
-                                opciones = [h["id"] for h in historicos]
-                                if id_trabajo_actual not in opciones:
-                                    id_trabajo_actual = opciones[0]
-                                id_trabajo_actual = st.selectbox(
-                                    "Solicitudes de facturación recientes", opciones,
-                                    index=opciones.index(id_trabajo_actual),
-                                    format_func=lambda jid: next(
-                                        (f"{h['folio'] or h['cliente']} · {h['estado']} · "
-                                         f"{h['creado']} ({jid[:8]})" for h in historicos if h['id'] == jid), jid),
-                                    key="sat_puente_selector_trabajo")
-                                st.session_state["sat_puente_trabajo"] = id_trabajo_actual
+                            paquete = json.loads(contenido_sat.decode("utf-8"))
+                            id_nuevo = sat_cola.solicitar(_abrir_spreadsheet(), paquete)
+                            st.session_state["sat_puente_trabajo"] = id_nuevo
+                            st.success("Solicitud enviada. En Control del robot SAT, arriba, "
+                                       "podrás responder las preguntas del portal SAT.")
                         except Exception as exc:
-                            st.warning(f"No se pudo consultar el historial SAT: {exc}")
-                        if id_trabajo_actual:
-                            try:
-                                actual = sat_cola.consultar(_abrir_spreadsheet(), id_trabajo_actual)
-                                st.write(f"**Estado del robot:** {actual['estado']}")
-                                if actual["paso"]:
-                                    st.caption(f"Paso: {actual['paso']}")
-                                if actual["mensaje"]:
-                                    st.info(actual["mensaje"])
-                                if actual["comando"]:
-                                    st.warning(f"Comando pendiente: {actual['comando']}")
-                                boton_ref = st.button("🔄 Actualizar estado del robot",
-                                                      key="sat_estado_refrescar", use_container_width=True)
-                                controles = {
-                                    "DATOS_RECEPTOR": [("CONTINUAR", "✅ Ya llené los datos del receptor, continuar")],
-                                    "ERROR_PAUSADO": [
-                                        ("REINTENTAR", "🔁 Reintentar este paso"),
-                                        ("OMITIR_PASO", "✅ Lo corregí manualmente, siguiente paso"),
-                                        ("GUARDADO", "📋 Ya guardé este concepto, siguiente producto")],
-                                    "REVISION_SAT": [("CERRAR", "Cerrar navegador tras revisar y timbrar")],
-                                    "ERROR_GRAVE": [("CERRAR", "Cerrar navegador tras revisar error")],
-                                }
-                                for comando, titulo in controles.get(actual["estado"], []):
-                                    if comando == "GUARDADO" and "Concepto " not in actual["paso"]:
-                                        continue
-                                    if st.button(titulo, key=f"sat_cmd_{id_trabajo_actual}_{comando}",
-                                                 disabled=bool(actual["comando"]), use_container_width=True):
-                                        try:
-                                            sat_cola.enviar_comando(
-                                                _abrir_spreadsheet(), id_trabajo_actual, comando)
-                                            st.rerun()
-                                        except Exception as exc:
-                                            st.error(f"No se pudo enviar el comando: {exc}")
-                                if actual["estado"] == "PENDIENTE":
-                                    st.caption("Comprueba que el agente esté instalado y encendido "
-                                               "en tu computadora. El navegador no se abre en Streamlit Cloud.")
-                            except Exception as exc:
-                                st.error(f"No se pudo consultar o controlar el robot: {exc}")
+                            st.error(f"No se pudo enviar el trabajo al robot: {exc}")
                     st.caption("La captura no equivale al timbrado. Revisa impuestos, importe, "
                                "datos del receptor y CFDI antes de emitirlo desde el portal SAT.")
                 except (ValueError, ArithmeticError) as exc:
