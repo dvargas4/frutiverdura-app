@@ -12,6 +12,9 @@ import zipfile
 import os
 from uuid import uuid4
 from copy import deepcopy
+import hmac
+import json
+import sat_cola
 
 # ============================
 # Configuración de página
@@ -2427,19 +2430,6 @@ with st.sidebar:
         f"Costo por unidad: {chr(65 + config_catalogo['costo'])} · "
         f"Venta por unidad: {chr(65 + config_catalogo['precio'])}")
     st.button("🔄 Cargar / Recargar catálogo", on_click=recargar_catalogo_activo)
-    with st.expander("⚙️ Activar piezas y costales en Google Sheets"):
-        st.caption("Agrega UNIDAD y GRAMOS_POR_UNIDAD al FINAL de PRECIOS, DOS V y NEGOCIOS, "
-                   "y columnas de cantidad al histórico. No mueve las columnas originales ni sus fórmulas. "
-                   "Las filas existentes continúan como kg; edita UNIDAD para poner pz o costal. "
-                   "El peso de cada pieza/costal es opcional, pero necesario para calcular kg de envío.")
-        if st.button("Preparar columnas en las 3 hojas", key="preparar_columnas_unidades"):
-            try:
-                ubicaciones = preparar_columnas_tres_catalogos()
-                st.success("Columnas creadas o verificadas: " + ", ".join(
-                    f"{hoja} (columnas {inds[0]} y {inds[1]})" for hoja, inds in ubicaciones.items()))
-                recargar_catalogo_activo()
-            except Exception as e:
-                st.error(f"No se pudo actualizar Google Sheets: {e}")
     if st.session_state.get("error_catalogo"):
         st.error(st.session_state["error_catalogo"])
         st.info("No se cargaron precios. Corrige la hoja seleccionada o sus permisos y vuelve a cargar.")
@@ -2517,9 +2507,9 @@ if (st.session_state.get("catalogo_cargado") != st.session_state["catalogo_activ
     st.warning("⚠️ Primero carga el catálogo desde el panel lateral.")
     st.stop()
 
-tab_pegar, tab_factura, tab_modificar, tab_resumen, tab_analisis, tab_mayoreo, tab_catalogo = st.tabs(
+tab_pegar, tab_factura, tab_modificar, tab_resumen, tab_analisis, tab_mayoreo, tab_catalogo, tab_sat = st.tabs(
     ["Tickets sin factura", "Factura", "✏️ Modificar", "📊 Resumen y Descarga",
-     "📈 Análisis de clientes", "🛒 Lista de compra", "🛍️ Catálogo"]
+     "📈 Análisis de clientes", "🛒 Lista de compra", "🛍️ Catálogo", "🧾 Facturación SAT"]
 )
 
 
@@ -6605,3 +6595,664 @@ with tab_catalogo:
                 if st.button("Limpiar catálogo generado"):
                     del st.session_state["catalogo_generado"]
                     st.rerun()
+
+
+# ============================================================
+# FACTURACIÓN SAT: hoja "Sat" del MISMO Google Sheets
+# A = Producto | B = Clave SAT | C = Unidad
+# No almacenamos e.firma, contraseña ni archivos de sello en la app.
+# ============================================================
+
+SAT_HOJA = "Sat"
+SAT_CABECERAS = ["Producto", "Clave SAT", "Unidad"]
+SAT_UNIDADES_VALIDAS = ("KGM", "H87")
+
+
+def _sat_normalizar_producto(nombre):
+    """Comparación sin diferencias por mayúsculas ni espacios repetidos."""
+    return " ".join(str(nombre).split()).casefold()
+
+
+def _sat_unidad_venta_a_sat(unidad_origen):
+    """El costal se factura como pieza, igual que pz."""
+    unidad = str(unidad_origen).strip().lower()
+    if unidad in ("g", "kg"):
+        return "KGM"
+    if unidad in ("pz", "costal"):
+        return "H87"
+    raise ValueError(f"Unidad de venta desconocida: {unidad_origen!r}")
+
+
+def _sat_decimal(valor):
+    from decimal import Decimal
+    dato = Decimal(str(valor))
+    if not dato.is_finite():
+        raise ValueError("Importe o cantidad no finita.")
+    return dato
+
+
+def _sat_parsear_registros(valores):
+    """Valida Sat!A:C sin adivinar claves, unidades o duplicados."""
+    encabezados = [str(v).strip().casefold() for v in (valores[0][:3] if valores else [])]
+    if encabezados != ["producto", "clave sat", "unidad"]:
+        raise ValueError('La hoja "Sat" debe tener A1=Producto, B1=Clave SAT y C1=Unidad. '
+                         "No se modificó ningún dato.")
+    import re
+    registros, nombres = [], set()
+    for fila_n, fila in enumerate(valores[1:], start=2):
+        columnas = list(fila[:3]) + [""] * max(0, 3 - len(fila))
+        producto, clave, unidad = (str(x).strip() for x in columnas[:3])
+        if not (producto or clave or unidad):
+            continue
+        if not producto:
+            raise ValueError(f"Sat!A{fila_n}: hay clave o unidad sin producto.")
+        normalizado = _sat_normalizar_producto(producto)
+        if normalizado in nombres:
+            raise ValueError(f"Sat!A{fila_n}: producto duplicado: {producto!r}.")
+        nombres.add(normalizado)
+        if clave and not re.fullmatch(r"[0-9]{8}", clave):
+            raise ValueError(f"Sat!B{fila_n}: {producto} tiene una clave inválida. "
+                             "Debe contener 8 dígitos o estar en blanco.")
+        if unidad and unidad.upper() not in SAT_UNIDADES_VALIDAS:
+            raise ValueError(f"Sat!C{fila_n}: {producto} tiene unidad {unidad!r}. "
+                             "Usa KGM o H87.")
+        registros.append({
+            "fila": fila_n, "producto": producto, "clave": clave,
+            "unidad": unidad.upper(), "normalizado": normalizado,
+        })
+    return registros
+
+
+def _sat_firma_hoja(valores):
+    """Detecta ediciones externas antes de modificar la base."""
+    import hashlib
+    import json
+    matriz = [list(fila[:3]) for fila in valores]
+    return hashlib.sha256(json.dumps(matriz, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _sat_leer_hoja_directo():
+    import gspread
+    ss = _abrir_spreadsheet()
+    try:
+        ws = ss.worksheet(SAT_HOJA)
+    except gspread.exceptions.WorksheetNotFound:
+        raise FileNotFoundError('Aún no existe la hoja "Sat". '
+                                'Pulsa "Crear y sincronizar hoja Sat".') from None
+    valores = ws.get_all_values(value_render_option="FORMATTED_VALUE")
+    registros = _sat_parsear_registros(valores)
+    return {"registros": registros, "firma": _sat_firma_hoja(valores)}
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def _sat_leer_base():
+    """Evita consultar Sheets en cada rerun de Streamlit."""
+    return _sat_leer_hoja_directo()
+
+
+def _sat_detectar_catalogo_para_base(ss):
+    """Importa únicamente NOMBRE y UNIDAD de los 3 catálogos, sin tocar precios."""
+    nuevos = {}
+    conflictos = {}
+    for modalidad, conf in CATALOGOS.items():
+        ws = ss.worksheet(conf["hoja"])
+        valores = ws.get_all_values(value_render_option="FORMATTED_VALUE")
+        encabezados = valores[0] if valores else []
+        col_unidad = _indice_encabezado(encabezados, {"UNIDAD", "UNIDAD_VENTA"})
+        for fila_n, fila in enumerate(valores[1:], start=2):
+            if len(fila) <= conf["producto"]:
+                continue
+            nombre = str(fila[conf["producto"]]).strip()
+            if not nombre:
+                continue
+            raw = (str(fila[col_unidad]).strip().casefold()
+                   if col_unidad is not None and len(fila) > col_unidad else "kg")
+            raw = {"": "kg", "g": "kg", "pieza": "pz", "piezas": "pz",
+                   "costales": "costal"}.get(raw, raw)
+            if raw not in UNIDADES_BASE:
+                raise ValueError(f"{conf['hoja']} fila {fila_n}: unidad {raw!r} inválida.")
+            unidad = "H87" if raw in ("pz", "costal") else "KGM"
+            key = _sat_normalizar_producto(nombre)
+            if key in nuevos and nuevos[key][1] != unidad:
+                conflictos.setdefault(key, set()).update((nuevos[key][1], unidad))
+            else:
+                nuevos.setdefault(key, (nombre, unidad))
+    return nuevos, conflictos
+
+
+def _sat_sincronizar_catalogos():
+    """Crea Sat si falta y agrega los productos nuevos, nunca pisa claves existentes."""
+    import gspread
+    ss = _abrir_spreadsheet()
+    nuevos, conflictos = _sat_detectar_catalogo_para_base(ss)
+    try:
+        ws = ss.worksheet(SAT_HOJA)
+        valores = ws.get_all_values(value_render_option="FORMATTED_VALUE")
+        if not valores or not any(str(v).strip() for v in valores[0]):
+            ws.update(range_name="A1:C1", values=[SAT_CABECERAS], value_input_option="RAW")
+            valores = [SAT_CABECERAS]
+        registros = _sat_parsear_registros(valores)
+        creada = False
+    except gspread.exceptions.WorksheetNotFound:
+        ws = ss.add_worksheet(title=SAT_HOJA, rows=1000, cols=3)
+        ws.update(range_name="A1:C1", values=[SAT_CABECERAS], value_input_option="RAW")
+        registros = []
+        creada = True
+    existentes = {r["normalizado"] for r in registros}
+    agregar = [[nombre, "", unidad] for key, (nombre, unidad) in nuevos.items()
+              if key not in existentes and key not in conflictos]
+    if agregar:
+        ws.append_rows(agregar, value_input_option="RAW", insert_data_option="INSERT_ROWS")
+    # En la columna B se preservan claves de ocho dígitos como TEXTO.
+    # El formato se aplica después de insertar, por si la hoja se amplió.
+    try:
+        ws.format("B:C", {"numberFormat": {"type": "TEXT"}})
+    except Exception:
+        # La escritura RAW ya preserva las claves como texto.
+        # No declarar fallo si los productos ya se insertaron.
+        pass
+    _sat_leer_base.clear()
+    return {"creada": creada, "agregados": len(agregar), "conflictos": {
+        nuevos[k][0]: sorted(v) for k, v in conflictos.items()
+    }}
+
+
+def _sat_guardar_cambios(registros_editados, base_original):
+    """Escribe exclusivamente B y C, si nadie editó la hoja desde su lectura."""
+    import re
+    datos_previos = base_original["registros"]
+    previos = {r["normalizado"]: r for r in datos_previos}
+    if len(registros_editados) != len(datos_previos):
+        raise ValueError("Cambió el número de productos. Actualiza desde Sheets.")
+    cambios = []
+    vistos = set()
+    for fila in registros_editados:
+        producto = str(fila["Producto"]).strip()
+        key = _sat_normalizar_producto(producto)
+        if key in vistos or key not in previos:
+            raise ValueError("Los nombres de producto no se pueden cambiar aquí. "
+                             "Actualiza desde Sheets.")
+        vistos.add(key)
+        clave = str(fila["Clave SAT"]).strip()
+        unidad = str(fila["Unidad"]).strip().upper()
+        if clave.casefold() == "nan":
+            clave = ""
+        if not (clave == "" or re.fullmatch(r"[0-9]{8}", clave)):
+            raise ValueError(f"{producto}: la clave SAT debe tener 8 dígitos o quedar vacía.")
+        if unidad not in SAT_UNIDADES_VALIDAS:
+            raise ValueError(f"{producto}: la unidad debe ser KGM o H87.")
+        anterior = previos[key]
+        if clave != anterior["clave"] or unidad != anterior["unidad"]:
+            cambios.append({"range": f"B{anterior['fila']}:C{anterior['fila']}",
+                            "values": [[clave, unidad]]})
+    if not cambios:
+        return 0
+    ss = _abrir_spreadsheet()
+    ws = ss.worksheet(SAT_HOJA)
+    valores_actuales = ws.get_all_values(value_render_option="FORMATTED_VALUE")
+    if _sat_firma_hoja(valores_actuales) != base_original["firma"]:
+        raise RuntimeError("Alguien cambió la hoja Sat desde que la abriste. "
+                           "Pulsa Actualizar desde Sheets y vuelve a revisar los cambios.")
+    # RAW asegura que no se conviertan las claves SAT a números.
+    ws.batch_update(cambios, value_input_option="RAW")
+    _sat_leer_base.clear()
+    return len(cambios)
+
+
+
+def _sat_pendientes_del_ticket(pedido, registros_sat):
+    """Pide claves solo para los productos del ticket, no para todo el catálogo."""
+    pendientes = {}
+    for linea in pedido.get("productos", []):
+        nombre = str(linea[0]).strip()
+        normalizado = _sat_normalizar_producto(nombre)
+        esperada = _sat_unidad_venta_a_sat(unidad_visual_linea(linea))
+        registro = registros_sat.get(normalizado)
+        if registro and registro["unidad"] and registro["unidad"] != esperada:
+            # La incongruencia no se corrige silenciosamente cambiando la base.
+            continue
+        if not registro or not registro["clave"] or not registro["unidad"]:
+            pendientes[normalizado] = {
+                "producto": nombre,
+                "unidad": esperada,
+                "clave_actual": str(registro["clave"]) if registro else "",
+            }
+    return list(pendientes.values())
+
+
+def _sat_guardar_claves_ticket(pendientes, claves_ingresadas):
+    """Guarda A=producto, B=clave, C=unidad directamente en la hoja Sat existente.
+
+    Vuelve a leer Sheets antes de escribir para no sobrescribir una clave que
+    otro usuario haya asignado desde que se abrió el formulario. La escritura
+    es repetible: si el primer intento sí se guardó, el segundo no duplica filas.
+    """
+    import re
+    datos = {}
+    for item in pendientes:
+        nombre = str(item["producto"]).strip()
+        k = _sat_normalizar_producto(nombre)
+        clave = str(claves_ingresadas.get(k, "")).strip()
+        unidad = str(item["unidad"]).upper().strip()
+        if not re.fullmatch(r"[0-9]{8}", clave):
+            raise ValueError(f"{nombre}: escribe los 8 dígitos de la clave SAT.")
+        if unidad not in SAT_UNIDADES_VALIDAS:
+            raise ValueError(f"{nombre}: unidad fiscal inválida: {unidad}.")
+        if k in datos:
+            raise ValueError(f"Producto repetido: {nombre}.")
+        datos[k] = {"producto": nombre, "clave": clave, "unidad": unidad}
+    if not datos:
+        return 0
+
+    ss = _abrir_spreadsheet()
+    # La hoja ya fue creada por el usuario: no crear otra ni tocar las de precios.
+    ws = ss.worksheet(SAT_HOJA)
+    valores = ws.get_all_values(value_render_option="FORMATTED_VALUE")
+    actuales = _sat_parsear_registros(valores)
+    indice = {r["normalizado"]: r for r in actuales}
+    actualizaciones, nuevos = [], []
+    for k, dato in datos.items():
+        anterior = indice.get(k)
+        if anterior:
+            if anterior["clave"] and anterior["clave"] != dato["clave"]:
+                raise RuntimeError(f"{dato['producto']}: otra persona registró la clave "
+                                   f"{anterior['clave']}. Actualiza y revisa antes de reemplazarla.")
+            if anterior["unidad"] and anterior["unidad"] != dato["unidad"]:
+                raise RuntimeError(f"{dato['producto']}: Sat indica {anterior['unidad']} y el ticket "
+                                   f"requiere {dato['unidad']}. Revisa la unidad en Sat.")
+            if anterior["clave"] != dato["clave"] or anterior["unidad"] != dato["unidad"]:
+                actualizaciones.append({"range": f"B{anterior['fila']}:C{anterior['fila']}",
+                                        "values": [[dato["clave"], dato["unidad"]]]})
+        else:
+            nuevos.append([dato["producto"], dato["clave"], dato["unidad"]])
+
+    if actualizaciones:
+        ws.batch_update(actualizaciones, value_input_option="RAW")
+    if nuevos:
+        ws.append_rows(nuevos, value_input_option="RAW", insert_data_option="INSERT_ROWS")
+
+    _sat_leer_base.clear()
+    confirmado = _sat_leer_hoja_directo()
+    mapa = {r["normalizado"]: r for r in confirmado["registros"]}
+    for k, dato in datos.items():
+        comprobado = mapa.get(k)
+        if not comprobado or (comprobado["clave"], comprobado["unidad"]) != (dato["clave"], dato["unidad"]):
+            raise RuntimeError(f"No se pudo verificar el registro de {dato['producto']} en Sat. "
+                               "Actualiza desde Sheets antes de intentar guardar otra vez.")
+    return len(actualizaciones) + len(nuevos)
+
+
+def _sat_datos_linea_ticket(linea):
+    """Cantidad, precio y gramos salen exclusivamente de la línea del ticket."""
+    from decimal import Decimal, ROUND_HALF_UP
+    origen = unidad_visual_linea(linea)
+    cantidad_original = _sat_decimal(cantidad_linea(linea))
+    gramos_ticket = _sat_decimal(linea[1])
+    if origen == "g":
+        cantidad_sat = gramos_ticket / Decimal("1000")
+    elif origen == "kg":
+        cantidad_sat = cantidad_original
+    elif origen in ("pz", "costal"):
+        cantidad_sat = cantidad_original
+    else:
+        raise ValueError(f"Unidad de ticket desconocida: {origen!r}")
+    if cantidad_sat <= 0:
+        raise ValueError(f"Cantidad inválida de {linea[0]} en el ticket.")
+    if origen in ("pz", "costal") and cantidad_sat != cantidad_sat.to_integral_value():
+        raise ValueError(f"{linea[0]}: piezas y costales deben ser enteros.")
+    importe = _sat_decimal(linea[3]).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if importe < 0:
+        raise ValueError(f"Importe negativo para {linea[0]}.")
+    precio = (importe / cantidad_sat).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    return {
+        "origen": origen,
+        "cantidad": cantidad_sat,
+        "gramos": gramos_ticket,
+        "importe": importe,
+        "precio_unitario": precio,
+        "unidad_esperada": _sat_unidad_venta_a_sat(origen),
+    }
+
+def _sat_exportar_pedido(pedido, registros_sat, retener_isr):
+    """El JSON toma claves y unidades de Sat!A:C, no del navegador."""
+    import json
+    import re
+    from decimal import Decimal, ROUND_HALF_UP
+
+    centavo = Decimal("0.01")
+    conceptos = []
+    for i, linea in enumerate(pedido["productos"], 1):
+        nombre = str(linea[0]).strip()
+        registro = registros_sat.get(_sat_normalizar_producto(nombre))
+        if not registro:
+            raise ValueError(f"{nombre}: no está registrado en la hoja Sat.")
+        clave = str(registro["clave"]).strip()
+        unidad_sat = str(registro["unidad"]).strip().upper()
+        if not re.fullmatch(r"[0-9]{8}", clave):
+            raise ValueError(f"{nombre}: falta una clave SAT de 8 dígitos en Sat!B.")
+        unidad_origen = unidad_visual_linea(linea)
+        unidad_esperada = _sat_unidad_venta_a_sat(unidad_origen)
+        if unidad_sat != unidad_esperada:
+            raise ValueError(f"{nombre}: la hoja Sat indica {unidad_sat or '(vacío)'}, "
+                             f"pero esta venta requiere {unidad_esperada}. Revisa Sat!C "
+                             "y la unidad del producto en el catálogo. No se exportó.")
+        datos_ticket = _sat_datos_linea_ticket(linea)
+        cantidad_sat = datos_ticket["cantidad"]
+        importe = datos_ticket["importe"]
+        valor_unitario = datos_ticket["precio_unitario"]
+        calculado = (valor_unitario * cantidad_sat).quantize(
+            centavo, rounding=ROUND_HALF_UP)
+        if abs(calculado - importe) > centavo:
+            raise ValueError(f"{nombre}: diferencia mayor a un centavo al calcular "
+                             "el valor unitario. Revisa el precio.")
+        fmt = lambda x: format(x, "f")
+        conceptos.append({
+            "numero": i,
+            "descripcion": (f"{nombre} (costal)" if unidad_origen == "costal" else nombre),
+            "clave_producto": clave,
+            "unidad": unidad_sat,
+            "cantidad": fmt(cantidad_sat),
+            "valor_unitario": fmt(valor_unitario),
+            "importe": fmt(importe),
+            "unidad_origen": unidad_origen,
+        })
+    suma = sum((_sat_decimal(x["importe"]) for x in conceptos), Decimal("0"))
+    total_pedido = _sat_decimal(pedido["nuevo_total"]).quantize(
+        centavo, rounding=ROUND_HALF_UP)
+    if suma != total_pedido:
+        raise ValueError(f"Diferencia con el ticket: conceptos ${suma} vs pedido ${total_pedido}. "
+                         "Revisa descuentos, envíos y cualquier modificación antes de facturar.")
+    paquete = {
+        "schema": "frutiverdura_sat_v1",
+        "pedido": {
+            "folio_remision": pedido.get("folio_remision", ""),
+            "cliente": pedido["cliente"],
+            "fecha_pedido": pedido.get("fecha_custom", ""),
+            "total_venta_antes_de_retenciones": format(total_pedido, "f"),
+        },
+        "impuestos": {
+            "objeto_imp": "02",
+            "iva_tasa": "0",
+            "retencion_isr_tasa": "1.25" if retener_isr else "0",
+        },
+        "conceptos": conceptos,
+    }
+    return json.dumps(paquete, indent=2, ensure_ascii=False).encode("utf-8")
+
+
+with tab_sat:
+    st.subheader("🧾 Facturación SAT")
+    st.caption('Las claves y unidades fiscales se guardan en Google Sheets, pestaña "Sat". '
+               'A = Producto, B = Clave SAT y C = Unidad. No se almacenan certificados en la app.')
+
+    col_sync_sat, col_refresh_sat = st.columns(2)
+    with col_sync_sat:
+        sincronizar_sat = st.button("➕ Sincronizar productos nuevos en Sat", use_container_width=True,
+                                   help="Agrega productos nuevos de los catálogos sin modificar las claves ya guardadas.")
+    with col_refresh_sat:
+        refrescar_sat = st.button("🔄 Actualizar desde Sheets", use_container_width=True)
+    if sincronizar_sat:
+        try:
+            with st.spinner('Sincronizando productos con la hoja Sat...'):
+                resultado_sync = _sat_sincronizar_catalogos()
+            st.session_state["sat_ultimo_sync"] = resultado_sync
+            st.rerun()
+        except Exception as exc:
+            st.error(f"No se pudo sincronizar la hoja Sat: {exc}")
+    if refrescar_sat:
+        _sat_leer_base.clear()
+        st.rerun()
+
+    resultado_sync = st.session_state.pop("sat_ultimo_sync", None)
+    if resultado_sync:
+        st.success(f'Hoja Sat sincronizada. Productos agregados: {resultado_sync["agregados"]}. '
+                   'Las claves existentes se conservaron.')
+        if resultado_sync["conflictos"]:
+            st.warning('Hay productos con el mismo nombre, pero distinta unidad entre catálogos. '
+                       'No se agregaron automáticamente: ' + ', '.join(resultado_sync['conflictos']))
+            st.caption('Distingue esos productos por presentación en el catálogo para asignarles '
+                       'claves y unidades sin confundir KGM con H87.')
+
+    try:
+        sat_base = _sat_leer_base()
+        sat_registros = {r["normalizado"]: r for r in sat_base["registros"]}
+        sat_listo = True
+    except Exception as exc:
+        # Fallar cerrado: no exportar con datos fiscales desactualizados o inventados.
+        sat_base, sat_registros, sat_listo = None, {}, False
+        st.warning(f"La base Sat no está disponible: {exc}")
+        st.info('Comprueba que exista la hoja "Sat" en el mismo Google Sheets y usa Actualizar desde Sheets.')
+
+    if sat_listo:
+        total_sat = len(sat_base["registros"])
+        validados_sat = sum(1 for r in sat_base["registros"]
+                           if len(r["clave"]) == 8 and r["unidad"] in SAT_UNIDADES_VALIDAS)
+        st.caption(f"Base Sat: {total_sat} productos | {validados_sat} con clave y unidad | "
+                   f"{total_sat - validados_sat} pendientes")
+        with st.expander("✏️ Administrar claves y unidades de la hoja Sat", expanded=total_sat < 12):
+            st.caption('Los cambios se guardan **solo** al pulsar Guardar. '
+                       'KGM = kilogramo; H87 = pieza, incluyendo costales. '
+                       'La clave debe ser de 8 dígitos; puedes dejarla vacía hasta verificarla.')
+            tabla_base = pd.DataFrame([{
+                "Producto": r["producto"], "Clave SAT": r["clave"], "Unidad": r["unidad"]
+            } for r in sat_base["registros"]], columns=["Producto", "Clave SAT", "Unidad"])
+            editor_base = st.data_editor(
+                tabla_base, hide_index=True, use_container_width=True,
+                disabled=["Producto"], num_rows="fixed",
+                column_config={
+                    "Producto": st.column_config.TextColumn("Producto"),
+                    "Clave SAT": st.column_config.TextColumn("Clave SAT (8 dígitos)"),
+                    "Unidad": st.column_config.SelectboxColumn("Unidad", options=list(SAT_UNIDADES_VALIDAS)),
+                },
+                key=f"sat_base_editor_{sat_base['firma'][:16]}",
+            )
+            if st.button("💾 Guardar cambios en hoja Sat", type="primary", use_container_width=True):
+                try:
+                    with st.spinner('Guardando en Google Sheets...'):
+                        n_guardados = _sat_guardar_cambios(
+                            editor_base.to_dict(orient="records"), sat_base)
+                    st.session_state["sat_guardados_aviso"] = n_guardados
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"No se guardaron los cambios: {exc}")
+            if st.session_state.get("sat_guardados_aviso") is not None:
+                st.success(f"Registros actualizados en Sat: {st.session_state.pop('sat_guardados_aviso')}")
+
+        st.divider()
+        st.markdown("**Preparar un pedido para Playwright**")
+        st.caption("La facturación solo continúa cuando los productos tienen clave SAT y "
+                   "unidad compatible en la hoja Sat.")
+        facturables = [(i, p) for i, p in enumerate(st.session_state.pedidos)
+                      if p.get("tipo") == "factura" and p.get("productos")]
+        if not facturables:
+            st.info("Primero genera un pedido desde la pestaña Factura.")
+        else:
+            indices = [i for i, _ in facturables]
+            indice_pedido_sat = st.selectbox(
+                "Selecciona el pedido a facturar", indices,
+                format_func=lambda i: (
+                    f"{st.session_state.pedidos[i].get('folio_remision','Pedido '+str(i+1))} · "
+                    f"{st.session_state.pedidos[i]['cliente']} · "
+                    f"${st.session_state.pedidos[i]['nuevo_total']:,.2f}"
+                ), key="sat_indice_pedido",
+            )
+            pedido_sat = st.session_state.pedidos[indice_pedido_sat]
+            pedido_sat.setdefault("_ui_id", uuid4().hex)
+            st.write(f"**Cliente:** {pedido_sat['cliente']}")
+            st.write(f"**Venta base para facturar:** ${pedido_sat['nuevo_total']:,.2f}")
+            st.info("Forma de pago, método, moneda, RFC, CP y régimen del receptor "
+                    "se capturan manualmente durante la pausa del robot.")
+            tabla_factura = []
+            pendientes = []
+            for linea in pedido_sat["productos"]:
+                nombre = str(linea[0]).strip()
+                dato_ticket = _sat_datos_linea_ticket(linea)
+                esperada = dato_ticket["unidad_esperada"]
+                origen = dato_ticket["origen"]
+                reg = sat_registros.get(_sat_normalizar_producto(nombre))
+                clave = str(reg["clave"]) if reg else ""
+                unidad = str(reg["unidad"]) if reg else ""
+                if not reg:
+                    pendientes.append(f"{nombre}: no registrado en Sat")
+                elif len(clave) != 8:
+                    pendientes.append(f"{nombre}: clave SAT faltante")
+                if reg and not unidad:
+                    pendientes.append(f"{nombre}: unidad SAT faltante")
+                if reg and unidad not in ("", esperada):
+                    pendientes.append(f"{nombre}: unidad Sat {unidad} ≠ {esperada}")
+                tabla_factura.append({
+                    "Producto": nombre,
+                    "Gramos del ticket": float(dato_ticket["gramos"]) if origen in ("g", "kg") else None,
+                    "Cantidad SAT": float(dato_ticket["cantidad"]),
+                    "Unidad SAT": unidad or esperada,
+                    "Presentación": "Costal" if origen == "costal" else
+                                     ("Pieza" if origen == "pz" else "Peso"),
+                    "Precio unitario del ticket": float(dato_ticket["precio_unitario"]),
+                    "Importe del ticket": float(dato_ticket["importe"]),
+                    "Clave SAT": clave,
+                })
+            st.dataframe(pd.DataFrame(tabla_factura), hide_index=True, use_container_width=True)
+            st.caption("Cantidad en gramos y precio unitario calculados desde el ticket generado. "
+                       "No hay que volver a capturarlos ni editarlos para facturar.")
+
+            claves_faltantes = _sat_pendientes_del_ticket(pedido_sat, sat_registros)
+            if claves_faltantes:
+                st.warning(f"Faltan claves SAT de {len(claves_faltantes)} producto(s) de este ticket.")
+                st.markdown("**¿Cuál es la clave SAT de cada producto pendiente?** "
+                            "Las respuestas se guardarán directamente en Sat!A:C.")
+                with st.form(f"sat_faltantes_{pedido_sat['_ui_id']}_{sat_base['firma'][:12]}"):
+                    codigos = {}
+                    for item in claves_faltantes:
+                        key = _sat_normalizar_producto(item["producto"])
+                        codigos[key] = st.text_input(
+                            f"{item['producto']} · Unidad {item['unidad']}",
+                            value=item["clave_actual"], max_chars=8,
+                            placeholder="Clave oficial de 8 dígitos",
+                            key=f"sat_clave_pendiente_{pedido_sat['_ui_id']}_{key}")
+                    guardar_faltantes = st.form_submit_button(
+                        "💾 Registrar claves faltantes en hoja Sat", type="primary",
+                        use_container_width=True)
+                if guardar_faltantes:
+                    try:
+                        with st.spinner("Guardando y verificando claves en Google Sheets..."):
+                            guardados = _sat_guardar_claves_ticket(claves_faltantes, codigos)
+                        st.session_state["sat_aviso_claves_pedido"] = (
+                            f"Claves verificadas en hoja Sat: {len(claves_faltantes)} "
+                            f"({guardados} nuevos registros o cambios).")
+                        _sat_leer_base.clear()
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"No se guardaron las claves: {exc}")
+            if st.session_state.get("sat_aviso_claves_pedido"):
+                st.success(st.session_state.pop("sat_aviso_claves_pedido"))
+            if any("unidad Sat" in p for p in pendientes):
+                st.info("Si una unidad no coincide, corrígela en Administrar claves y unidades "
+                        "o en la columna C de Sat antes de facturar.")
+            aplicar_retencion_sat = st.checkbox(
+                "Aplicar retención ISR de 1.25% en los conceptos", value=False,
+                key=f"sat_retencion_{pedido_sat['_ui_id']}",
+                help="Solo cuando corresponda legalmente; no todas las operaciones llevan retención.")
+            st.warning("Configuración actual del robot: ObjetoImp 02 e IVA 0%, como el script original. "
+                       "Verifica la clasificación fiscal y las retenciones de CADA concepto antes de emitir el CFDI.")
+            if pendientes:
+                st.error("No se puede preparar la factura: " + " | ".join(sorted(set(pendientes))))
+            else:
+                try:
+                    contenido_sat = _sat_exportar_pedido(
+                        pedido_sat, sat_registros, aplicar_retencion_sat)
+                    st.markdown("**Iniciar captura desde la app**")
+                    st.caption("Al pulsar Iniciar, el agente de tu computadora abrirá el SAT. "
+                               "Los certificados .cer/.key se leen únicamente desde tu disco; "
+                               "no se suben a Streamlit ni a Google Sheets.")
+                    try:
+                        pin_esperado = str(st.secrets.get("sat_access_pin", ""))
+                    except Exception:
+                        pin_esperado = ""
+                    clave_autorizada = False
+                    if not pin_esperado:
+                        st.error("Para activar el robot remoto, configura sat_access_pin en los "
+                                 "Secrets de Streamlit. Esto impide que otro visitante inicie "
+                                 "facturas con tu e.firma.")
+                    elif st.session_state.get("sat_puente_autorizado", False):
+                        clave_autorizada = True
+                    else:
+                        with st.form("sat_desbloquear_robot"):
+                            clave_panel = st.text_input("Clave de autorización de facturación",
+                                                      type="password")
+                            desbloquear = st.form_submit_button("Desbloquear facturación")
+                        if desbloquear:
+                            if hmac.compare_digest(clave_panel, pin_esperado):
+                                st.session_state["sat_puente_autorizado"] = True
+                                st.rerun()
+                            else:
+                                st.error("Clave de autorización incorrecta")
+                    if clave_autorizada:
+                        id_trabajo_actual = st.session_state.get("sat_puente_trabajo")
+                        if st.button("▶ Iniciar captura en SAT desde esta app",
+                                     type="primary", use_container_width=True,
+                                     key=f"sat_enviar_{pedido_sat['_ui_id']}"):
+                            try:
+                                paquete = json.loads(contenido_sat.decode("utf-8"))
+                                id_trabajo_actual = sat_cola.solicitar(_abrir_spreadsheet(), paquete)
+                                st.session_state["sat_puente_trabajo"] = id_trabajo_actual
+                                st.success("Solicitud enviada. El navegador SAT se abrirá en "
+                                           "la computadora donde instalaste el agente.")
+                            except Exception as exc:
+                                st.error(f"No se pudo enviar el trabajo al robot: {exc}")
+                        try:
+                            historicos = sat_cola.recientes(_abrir_spreadsheet(), maximo=15)
+                            if historicos:
+                                opciones = [h["id"] for h in historicos]
+                                if id_trabajo_actual not in opciones:
+                                    id_trabajo_actual = opciones[0]
+                                id_trabajo_actual = st.selectbox(
+                                    "Solicitudes de facturación recientes", opciones,
+                                    index=opciones.index(id_trabajo_actual),
+                                    format_func=lambda jid: next(
+                                        (f"{h['folio'] or h['cliente']} · {h['estado']} · "
+                                         f"{h['creado']} ({jid[:8]})" for h in historicos if h['id'] == jid), jid),
+                                    key="sat_puente_selector_trabajo")
+                                st.session_state["sat_puente_trabajo"] = id_trabajo_actual
+                        except Exception as exc:
+                            st.warning(f"No se pudo consultar el historial SAT: {exc}")
+                        if id_trabajo_actual:
+                            try:
+                                actual = sat_cola.consultar(_abrir_spreadsheet(), id_trabajo_actual)
+                                st.write(f"**Estado del robot:** {actual['estado']}")
+                                if actual["paso"]:
+                                    st.caption(f"Paso: {actual['paso']}")
+                                if actual["mensaje"]:
+                                    st.info(actual["mensaje"])
+                                if actual["comando"]:
+                                    st.warning(f"Comando pendiente: {actual['comando']}")
+                                boton_ref = st.button("🔄 Actualizar estado del robot",
+                                                      key="sat_estado_refrescar", use_container_width=True)
+                                controles = {
+                                    "DATOS_RECEPTOR": [("CONTINUAR", "✅ Ya llené los datos del receptor, continuar")],
+                                    "ERROR_PAUSADO": [
+                                        ("REINTENTAR", "🔁 Reintentar este paso"),
+                                        ("OMITIR_PASO", "✅ Lo corregí manualmente, siguiente paso"),
+                                        ("GUARDADO", "📋 Ya guardé este concepto, siguiente producto")],
+                                    "REVISION_SAT": [("CERRAR", "Cerrar navegador tras revisar y timbrar")],
+                                    "ERROR_GRAVE": [("CERRAR", "Cerrar navegador tras revisar error")],
+                                }
+                                for comando, titulo in controles.get(actual["estado"], []):
+                                    if comando == "GUARDADO" and "Concepto " not in actual["paso"]:
+                                        continue
+                                    if st.button(titulo, key=f"sat_cmd_{id_trabajo_actual}_{comando}",
+                                                 disabled=bool(actual["comando"]), use_container_width=True):
+                                        try:
+                                            sat_cola.enviar_comando(
+                                                _abrir_spreadsheet(), id_trabajo_actual, comando)
+                                            st.rerun()
+                                        except Exception as exc:
+                                            st.error(f"No se pudo enviar el comando: {exc}")
+                                if actual["estado"] == "PENDIENTE":
+                                    st.caption("Comprueba que el agente esté instalado y encendido "
+                                               "en tu computadora. El navegador no se abre en Streamlit Cloud.")
+                            except Exception as exc:
+                                st.error(f"No se pudo consultar o controlar el robot: {exc}")
+                    st.caption("La captura no equivale al timbrado. Revisa impuestos, importe, "
+                               "datos del receptor y CFDI antes de emitirlo desde el portal SAT.")
+                except (ValueError, ArithmeticError) as exc:
+                    st.error(str(exc))
