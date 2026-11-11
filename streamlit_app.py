@@ -7098,6 +7098,11 @@ def _sat_vista_control_cache(id_trabajo):
     return sat_cola.consultar_vista(_abrir_spreadsheet(), id_trabajo)
 
 
+@st.cache_data(ttl=45, show_spinner=False)
+def _sat_pdf_previa_control_cache(id_trabajo):
+    return sat_cola.consultar_pdf_previa(_abrir_spreadsheet(), id_trabajo)
+
+
 @st.cache_data(ttl=90, show_spinner=False)
 def _sat_archivos_control_cache(id_trabajo):
     return sat_cola.consultar_archivos(_abrir_spreadsheet(), id_trabajo)
@@ -7107,6 +7112,7 @@ def _sat_limpiar_cache_control():
     _sat_historial_control_cache.clear()
     _sat_estado_control_cache.clear()
     _sat_vista_control_cache.clear()
+    _sat_pdf_previa_control_cache.clear()
     _sat_archivos_control_cache.clear()
 
 
@@ -7198,6 +7204,29 @@ with tab_sat:
                                 sat_cola.enviar_comando(_abrir_spreadsheet(), _id_act_sat, "ACTUALIZAR_VISTA")
                                 _sat_limpiar_cache_control(); st.rerun()
                             except Exception as exc: st.error(str(exc))
+                    # PDF original descargado al pulsar Vista Previa en el SAT.
+                    # Distinto del PDF oficial posterior al timbrado.
+                    _pdf_previa = None
+                    if _estado_sat["estado"] in ("REVISION_MOVIL", "RESULTADO_SELLO", "FINALIZADO", "FINALIZADO_PDF_PENDIENTE"):
+                        try:
+                            _pdf_previa = _sat_pdf_previa_control_cache(_id_act_sat)
+                        except Exception as exc:
+                            st.warning(f"No pude consultar el PDF de borrador: {exc}")
+                        if _pdf_previa:
+                            st.markdown("**PDF original de Vista Previa del SAT (sin timbrar)**")
+                            st.caption("Descargado por el robot. Si el SAT no indicó .pdf, se corrigió el nombre. No es el CFDI oficial emitido.")
+                            try:
+                                if hasattr(st, 'pdf'):
+                                    st.pdf(_pdf_previa['bytes'], height=650, key=f"pdf_previa_{_id_act_sat}")
+                            except Exception as exc:
+                                st.info('El visor PDF no está disponible aquí; abre el documento con el botón de descarga.')
+                            st.download_button(
+                                '📄 Abrir / descargar PDF de Vista Previa',
+                                data=_pdf_previa['bytes'], file_name='Vista_Previa_SAT.pdf',
+                                mime='application/pdf', key=f'pdf_sat_real_{_id_act_sat}',
+                                use_container_width=True)
+                        else:
+                            st.warning('El PDF original de Vista Previa aún no está disponible. No se habilita Sellar.')
                     if _estado_sat["estado"] == "REVISION_MOVIL":
                         st.markdown("#### 3. Sellar factura (solo después de Guardar y Vista Previa)")
                         st.caption("El robot pulsó Guardar y Vista Previa antes de habilitar Sellar. Verifica RFC, razón social, CP, régimen fiscal, conceptos, impuestos y total. "
@@ -7209,7 +7238,7 @@ with tab_sat:
                             st.error("sat_timbrado_pin debe tener al menos 16 caracteres.")
                         elif hmac.compare_digest(_pin_timbrado, _pin_sat):
                             st.error("La contraseña de timbrado NO puede ser igual a sat_access_pin.")
-                        elif _vista_sat:
+                        elif _vista_sat and _pdf_previa:
                             with st.form(f"sat_confirmar_timbrado_{_id_act_sat}", clear_on_submit=True):
                                 _comprobado = st.checkbox("Revisé la vista previa real del SAT y verifico que todos los datos son correctos")
                                 _clave_sellado = st.text_input("Segunda contraseña: autorización de timbrado", type="password")
@@ -7275,6 +7304,16 @@ with tab_sat:
                 _preg_sat = _estado_sat.get("pregunta")
                 if _estado_sat["estado"] == "PREGUNTA_SAT" and _preg_sat:
                     st.markdown(f"#### {_preg_sat['titulo']}")
+                    _concepto_pregunta = _preg_sat.get("concepto")
+                    if isinstance(_concepto_pregunta, dict) and _concepto_pregunta.get("descripcion"):
+                        st.info(
+                            f"**Producto del ticket ({_concepto_pregunta.get('indice', '?')}/"
+                            f"{_concepto_pregunta.get('total', '?')}):** "
+                            f"{_concepto_pregunta['descripcion']}  |  "
+                            f"**Cantidad:** {_concepto_pregunta.get('cantidad', '')} "
+                            f"{_concepto_pregunta.get('unidad', '')}  |  "
+                            f"**Clave SAT buscada:** {_concepto_pregunta.get('clave_producto', '')}"
+                        )
                     if _preg_sat.get("ayuda"):
                         st.caption(_preg_sat["ayuda"])
                     _op_sat = _preg_sat.get("opciones", [])
