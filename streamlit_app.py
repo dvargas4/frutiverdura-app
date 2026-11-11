@@ -3103,15 +3103,20 @@ def buscar_match_catalogo(descripcion, catalogo_keys, umbral=0.7):
     if bolsa_match:
         return bolsa_match
 
-    # 2. Intentar aliases manuales
-    destino_alias = detectar_alias(descripcion)
-    if destino_alias is not None:
-        # Un alias reconocido sin destino exige revisión, nunca otro producto.
-        return resolver_clave_catalogo(destino_alias, catalogo_keys)
-
+    # 2. Primero coincidencia exacta en el catálogo ACTIVO.
+    # Así un alias global no desvía "papa" si en DOS V existe "papa".
     exacto = resolver_clave_catalogo(descripcion, catalogo_keys)
     if exacto:
         return exacto
+
+    # 3. Alias común a PRECIOS, DOS V y NEGOCIOS, usado por ambos tickets.
+    destino_alias = detectar_alias(descripcion)
+    if destino_alias is not None:
+        destino = resolver_clave_catalogo(destino_alias, catalogo_keys)
+        if destino:
+            return destino
+        # No inventar un producto ni usar precios de OTRA hoja.
+        return None
 
     # 3. Si menciona empaque pero no había match específico, forzar revisión manual
     if tiene_indicador_empaque(descripcion):
@@ -3312,7 +3317,6 @@ Laura Canales
                 if cliente and productos_raw:
                     productos_match = []
                     for desc, gramos, origen_cantidad in productos_raw:
-                        match = buscar_match_catalogo(desc, catalogo_keys)
                         productos_match.append(construir_producto_preview(
                             desc, gramos, catalogo_keys, st.session_state.precios_dict,
                             origen_cantidad=origen_cantidad))
@@ -3331,7 +3335,6 @@ Laura Canales
                     lleva_envio = any(e in cliente.lower() for e in envios_set)
                     productos_match = []
                     for desc, gramos, origen_cantidad in productos_raw:
-                        match = buscar_match_catalogo(desc, catalogo_keys)
                         productos_match.append(construir_producto_preview(
                             desc, gramos, catalogo_keys, st.session_state.precios_dict,
                             origen_cantidad=origen_cantidad))
@@ -3692,7 +3695,6 @@ Laura Canales
                 if cliente and productos_raw:
                     productos_match = []
                     for desc, gramos, origen_cantidad in productos_raw:
-                        match = buscar_match_catalogo(desc, catalogo_keys)
                         productos_match.append(construir_producto_preview(
                             desc, gramos, catalogo_keys, st.session_state.precios_dict,
                             origen_cantidad=origen_cantidad))
@@ -3711,7 +3713,6 @@ Laura Canales
                     lleva_envio = any(e in cliente.lower() for e in envios_set)
                     productos_match = []
                     for desc, gramos, origen_cantidad in productos_raw:
-                        match = buscar_match_catalogo(desc, catalogo_keys)
                         productos_match.append(construir_producto_preview(
                             desc, gramos, catalogo_keys, st.session_state.precios_dict,
                             origen_cantidad=origen_cantidad))
@@ -4893,12 +4894,16 @@ PATRON_VINETA_COMPRA = r"^(?:(?:[*•\-]|\d+[.)](?=\s))\s*(?:\[\s*[xX]?\s*\]\s*)
 def nombre_producto_compra(descripcion, catalogo_keys):
     """Equivalencias confirmadas y plurales inequívocos, sin adivinar otra variedad."""
     limpio = normalizar_producto(descripcion).strip(" .,:;")
-    destino = detectar_alias(limpio)
-    if destino:
-        return resolver_clave_catalogo(destino, catalogo_keys) or normalizar_producto(destino)
     exacto = resolver_clave_catalogo(limpio, catalogo_keys)
     if exacto:
         return exacto
+    destino = detectar_alias(limpio)
+    if destino:
+        resuelto = resolver_clave_catalogo(destino, catalogo_keys)
+        if resuelto:
+            return resuelto
+        # Mantener descripción original para revisión en el catálogo activo.
+        return limpio
     def singular(palabra):
         if palabra.endswith("ces"):
             return palabra[:-3] + "z"
@@ -6603,6 +6608,98 @@ with tab_catalogo:
 # No almacenamos e.firma, contraseña ni archivos de sello en la app.
 # ============================================================
 
+# Base de datos fiscal, administrada por el usuario en el MISMO Sheets.
+# No guarda contraseñas, certificados ni otra información de e.firma.
+CLIENTES_FACTURA_HOJA = "Clientes_Factura"
+CLIENTES_FACTURA_CABECERAS = [
+    "Cliente", "RFC", "Nombre o Razón Social", "Código Postal", "Régimen Fiscal",
+    "Forma de Pago", "Método de Pago", "Moneda",
+]
+
+
+def _cf_normalizar(valor):
+    import unicodedata
+    v = unicodedata.normalize("NFKD", str(valor or "").casefold())
+    return " ".join("".join(c for c in v if not unicodedata.combining(c)).split())
+
+
+def _cf_parsear_filas(valores):
+    """La estructura se fija en A:H. Detecta registros incompletos sin inventar datos."""
+    import re
+    if not valores:
+        raise ValueError("Clientes_Factura no tiene encabezados.")
+    recibidos = [_cf_normalizar(v) for v in (list(valores[0][:8]) + [""]*8)[:8]]
+    requeridos = [_cf_normalizar(v) for v in CLIENTES_FACTURA_CABECERAS]
+    if recibidos != requeridos:
+        raise ValueError("Clientes_Factura requiere columnas A:H en este orden: " +
+                         ", ".join(CLIENTES_FACTURA_CABECERAS) +
+                         ". No se modificaron los datos existentes.")
+    lista = []
+    for nro, fila in enumerate(valores[1:], 2):
+        c = [str(v).strip() for v in (list(fila[:8]) + [""]*8)[:8]]
+        if not any(c):
+            continue
+        nombre, rfc, razon, cp, regimen, forma, metodo, moneda = c
+        # Puede haber nombres comerciales repetidos o distintos para el mismo RFC.
+        # La selección del receptor se hará por razón social + RFC, NO por el ticket.
+        if not nombre:
+            raise ValueError(f"Clientes_Factura!A{nro}: falta el nombre identificador del cliente.")
+        clave = _cf_normalizar(nombre)
+        errores = []
+        if not re.fullmatch(r"[A-ZÑ&]{3,4}[0-9]{6}[A-Z0-9]{3}", rfc.upper()):
+            errores.append("RFC incompleto o inválido")
+        if not razon:
+            errores.append("Nombre o razón social faltante")
+        if not re.fullmatch(r"[0-9]{5}", cp):
+            errores.append("Código postal: escribe cinco dígitos como TEXTO en Sheets")
+        if not regimen:
+            errores.append("Régimen fiscal faltante")
+        if not forma:
+            errores.append("Forma de pago faltante")
+        if not metodo:
+            errores.append("Método de pago faltante")
+        # Todos los CFDI se emitirán en MXN, sin enviar tipo de cambio.
+        if moneda and _cf_normalizar(moneda) not in ("mxn", "peso mexicano", "pesos mexicanos"):
+            errores.append("Moneda debe ser MXN o Peso Mexicano")
+        lista.append({
+            "cliente": nombre, "rfc": rfc.upper(), "nombre_razon_social": razon,
+            "codigo_postal": cp, "regimen_fiscal": regimen, "forma_pago": forma,
+            "metodo_pago": metodo, "moneda": "MXN", "fila": nro,
+            "errores": errores, "normalizado": clave,
+        })
+    return lista
+
+
+def _cf_leer_directo():
+    """Una sola lectura cacheada de la hoja que el usuario creó manualmente.
+
+    Nunca crea ni modifica Clientes_Factura. La lectura se guarda hasta 5 minutos.
+    """
+    import gspread
+    ss = _abrir_spreadsheet()
+    try:
+        ws = ss.worksheet(CLIENTES_FACTURA_HOJA)
+    except gspread.WorksheetNotFound:
+        raise FileNotFoundError('Crea manualmente la hoja Clientes_Factura con '
+                                'las columnas A:H indicadas. No se creó otra hoja.') from None
+    filas = ws.get_all_values(value_render_option="FORMATTED_VALUE")
+    return _cf_parsear_filas(filas)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cf_leer_base():
+    return _cf_leer_directo()
+
+
+def _cf_datos_para_robot(registro):
+    """Valores validados que viajarán una sola vez con los datos del ticket."""
+    if not registro or registro.get("errores"):
+        raise ValueError("Faltan datos fiscales válidos del cliente en Clientes_Factura")
+    return {campo: registro[campo] for campo in (
+        "cliente", "rfc", "nombre_razon_social", "codigo_postal", "regimen_fiscal",
+        "forma_pago", "metodo_pago", "moneda")}
+
+
 SAT_HOJA = "Sat"
 SAT_CABECERAS = ["Producto", "Clave SAT", "Unidad"]
 SAT_UNIDADES_VALIDAS = ("KGM", "H87")
@@ -7362,10 +7459,66 @@ with tab_sat:
             pedido_sat.setdefault("_ui_id", uuid4().hex)
             st.write(f"**Cliente:** {pedido_sat['cliente']}")
             st.write(f"**Venta base para facturar:** ${pedido_sat['nuevo_total']:,.2f}")
-            st.info("Forma de pago, método, moneda, RFC, CP y régimen del receptor "
-                    "se capturan manualmente durante la pausa del robot.")
+            st.markdown("#### Cliente fiscal (Google Sheets: Clientes_Factura)")
+            st.caption("El nombre del ticket puede ser diferente a la razón social fiscal. "
+                       "Elige siempre el RFC que recibirá esta factura. Los datos se cargan "
+                       "desde Sheets y el robot usa 'Otro' si no está en los receptores del SAT.")
+            _cf_actualizar = st.button("🔄 Actualizar Clientes_Factura desde Sheets",
+                                      key="sat_actualizar_clientes", use_container_width=True)
+            if _cf_actualizar:
+                _cf_leer_base.clear()
+                st.rerun()
+            registro_cliente_sat = None
+            error_cliente_sat = ""
+            try:
+                clientes_fiscales = _cf_leer_base()
+                if not clientes_fiscales:
+                    error_cliente_sat = ("La hoja Clientes_Factura está creada pero sin clientes. "
+                                         "Agrega una fila completa en Sheets y pulsa Actualizar.")
+                else:
+                    # Preguntar expresamente en CADA pedido, sin inferir por el nombre
+                    # del ticket. Las opciones identifican al receptor por RFC y razón social.
+                    opciones_fiscales = [None] + list(range(len(clientes_fiscales)))
+                    _cf_key = f"sat_cliente_fiscal_{pedido_sat['_ui_id']}"
+                    seleccionado_fiscal = st.selectbox(
+                        "¿A qué RFC deseas emitir esta factura?", opciones_fiscales,
+                        format_func=lambda i: (
+                            "Selecciona razón social y RFC (obligatorio)" if i is None else
+                            f"{clientes_fiscales[i]['nombre_razon_social']}  |  "
+                            f"{clientes_fiscales[i]['rfc']}  |  "
+                            f"{clientes_fiscales[i]['cliente']}"
+                        ),
+                        index=0, key=_cf_key,
+                        help="El nombre del ticket puede ser distinto al del receptor fiscal. "
+                             "Elige expresamente el RFC; la app no supone ninguno.",
+                    )
+                    registro_cliente_sat = (clientes_fiscales[seleccionado_fiscal]
+                                            if seleccionado_fiscal is not None else None)
+                    if registro_cliente_sat:
+                        st.dataframe(pd.DataFrame([{
+                            "RFC": registro_cliente_sat["rfc"],
+                            "Razón social": registro_cliente_sat["nombre_razon_social"],
+                            "Código postal": registro_cliente_sat["codigo_postal"],
+                            "Régimen fiscal": registro_cliente_sat["regimen_fiscal"],
+                            "Forma de pago": registro_cliente_sat["forma_pago"],
+                            "Método de pago": registro_cliente_sat["metodo_pago"],
+                            "Moneda": "MXN",
+                        }]), hide_index=True, use_container_width=True)
+                        if registro_cliente_sat["errores"]:
+                            error_cliente_sat = ("Clientes_Factura fila " +
+                                str(registro_cliente_sat["fila"]) + ": " +
+                                "; ".join(registro_cliente_sat["errores"]))
+                    else:
+                        error_cliente_sat = "Elige el cliente fiscal antes de iniciar la factura."
+            except Exception as exc:
+                error_cliente_sat = f"No pude leer Clientes_Factura: {exc}"
+            if error_cliente_sat:
+                st.warning(error_cliente_sat)
+            st.caption("Si el cliente es nuevo, registra RFC, nombre fiscal, CP, régimen, "
+                       "forma y método en la hoja Clientes_Factura. Moneda: MXN. "
+                       "Pulsa Actualizar y selecciónalo aquí.")
             tabla_factura = []
-            pendientes = []
+            pendientes = [error_cliente_sat] if error_cliente_sat else []
             for linea in pedido_sat["productos"]:
                 nombre = str(linea[0]).strip()
                 dato_ticket = _sat_datos_linea_ticket(linea)
@@ -7443,9 +7596,9 @@ with tab_sat:
                     contenido_sat = _sat_exportar_pedido(
                         pedido_sat, sat_registros, aplicar_retencion_sat)
                     st.markdown("**Iniciar captura desde la app**")
-                    st.caption("Al pulsar Iniciar, el agente de tu computadora abrirá el SAT. "
-                               "Los certificados .cer/.key se leen únicamente desde tu disco; "
-                               "no se suben a Streamlit ni a Google Sheets.")
+                    st.caption("Al iniciar, el agente tomará los datos del ticket y del "
+                               "cliente seleccionado, sin volver a consultar Clientes_Factura. "
+                               "Los certificados se leen solo desde tu Mac.")
                     if not st.session_state.get("sat_puente_autorizado", False):
                         st.info("Desbloquea el panel Control del robot SAT que aparece arriba "
                                 "para iniciar la captura desde esta app.")
@@ -7454,13 +7607,16 @@ with tab_sat:
                                    key=f"sat_enviar_{pedido_sat['_ui_id']}"):
                         try:
                             paquete = json.loads(contenido_sat.decode("utf-8"))
+                            paquete["receptor"] = _cf_datos_para_robot(registro_cliente_sat)
                             id_nuevo = sat_cola.solicitar(_abrir_spreadsheet(), paquete)
                             st.session_state["sat_puente_trabajo"] = id_nuevo
-                            st.success("Solicitud enviada. En Control del robot SAT, arriba, "
-                                       "podrás responder las preguntas del portal SAT.")
+                            st.success("Solicitud enviada. El robot llenará los datos fiscales "
+                                       "desde Clientes_Factura. Si el SAT cambia o falla, "
+                                       "podrás recuperarlo desde Control del robot SAT.")
                         except Exception as exc:
                             st.error(f"No se pudo enviar el trabajo al robot: {exc}")
-                    st.caption("La captura no equivale al timbrado. Revisa impuestos, importe, "
-                               "datos del receptor y CFDI antes de emitirlo desde el portal SAT.")
+                    st.caption("La captura no equivale al timbrado. El robot puede necesitar "
+                               "revisión si un dato guardado no coincide con las opciones del SAT. "
+                               "Revisa importe, impuestos y receptor antes de autorizar el CFDI.")
                 except (ValueError, ArithmeticError) as exc:
                     st.error(str(exc))
