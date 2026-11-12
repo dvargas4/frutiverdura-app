@@ -19,8 +19,8 @@ from typing import Any
 
 NOMBRE_HOJA = "Sat_Cola"
 CABECERAS = ["ID", "Creado UTC", "Estado", "Pedido comprimido", "Comando", "Mensaje", "Paso", "Actualizado UTC"]
-ESTADOS_CERRADOS = {"FINALIZADO", "CANCELADO", "FALLO_FINAL"}
-COMANDOS_PERMITIDOS = {"CONTINUAR", "REINTENTAR", "OMITIR_PASO", "GUARDADO", "CERRAR", "ACTUALIZAR_VISTA", "TIMBRAR", "RECUPERAR_ARCHIVOS"}
+ESTADOS_CERRADOS = {"FINALIZADO", "CANCELADO", "FALLO_FINAL", "CERRADO_SIN_BORRAR"}
+COMANDOS_PERMITIDOS = {"CONTINUAR", "REINTENTAR", "OMITIR_PASO", "GUARDADO", "CERRAR", "ACTUALIZAR_VISTA", "TIMBRAR", "RECUPERAR_ARCHIVOS", "REINTENTAR_BORRADO", "CERRAR_SIN_BORRAR"}
 HOJA_VISTAS = "Sat_Vistas"
 CABECERAS_VISTAS = ["Trabajo", "Version", "Parte", "Imagen JPEG base64", "Actualizado UTC", "Resumen"]
 CABECERAS_PREGUNTA = ["Pregunta SAT (JSON)", "Respuesta SAT (JSON)"]
@@ -230,7 +230,8 @@ def enviar_comando(ss, id_trabajo: str, comando: str, *, vista_hash: str = "", c
                   "REVISION_MOVIL": {"ACTUALIZAR_VISTA", "TIMBRAR", "CERRAR"},
                   "RESULTADO_SELLO": {"ACTUALIZAR_VISTA", "RECUPERAR_ARCHIVOS", "CERRAR"},
                   "REVISION_SAT": {"CERRAR"},
-                  "ERROR_GRAVE": {"CERRAR"}}).get(estado, set())
+                  "ERROR_GRAVE": {"CERRAR"},
+                  "CANCELACION_NO_CONFIRMADA": {"REINTENTAR_BORRADO", "CERRAR_SIN_BORRAR"}}).get(estado, set())
     if comando not in permitido:
         raise ValueError(f"No puede enviarse {comando} cuando el estado es {estado}")
     if fila[4]:
