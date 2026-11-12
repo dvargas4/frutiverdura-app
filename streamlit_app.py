@@ -7519,7 +7519,10 @@ with tab_sat:
                             ("REINTENTAR", "🔁 Reintentar este paso"),
                             ("OMITIR_PASO", "✅ Ya corregí este campo directamente en el SAT"),
                             ("GUARDADO", "📋 Ya guardé este concepto")],
-                        "REVISION_MOVIL": [("CERRAR", "Cancelar y cerrar navegador sin timbrar")],
+                        "REVISION_MOVIL": [("CERRAR", "🗑️ Cancelar: borrar borrador SAT y cerrar navegador")],
+                        "CANCELACION_NO_CONFIRMADA": [
+                            ("REINTENTAR_BORRADO", "🔁 Volver a comprobar y borrar el borrador SAT"),
+                            ("CERRAR_SIN_BORRAR", "Cerrar navegador SIN borrar el borrador del SAT")],
                         "RESULTADO_SELLO": [("CERRAR", "Cerrar navegador después de revisar el resultado")],
                         "REVISION_SAT": [("CERRAR", "Cerrar navegador después de revisar y timbrar")],
                         "ERROR_GRAVE": [("CERRAR", "Cerrar navegador tras revisar error")],
