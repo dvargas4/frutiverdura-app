@@ -30,6 +30,8 @@ st.set_page_config(
 # Constantes
 # ============================
 COSTO_ENVIO = 35
+# False conserva todo el código PDF/PNG sin mostrar botones de descarga de tickets.
+MOSTRAR_EXPORTACIONES_TICKETS = False
 UMBRAL_ENVIO_GRATIS_KG = 35
 DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 UTILIDAD_MINIMA_PCT = 0.25
@@ -1501,6 +1503,127 @@ def generar_zip_tickets_termicos(pedidos):
     return buf.getvalue()
 
 
+
+
+
+# ============================
+# Puente Bluefy MP210 (totalmente aislado de Google Sheets y Sat_Cola)
+# ============================
+# Sólo realiza un POST HTTPS cuando se genera o envía un ticket.
+# El receptor Bluefy consulta Apps Script cada 60 segundos; NO lee Google Sheets.
+
+
+def _bluefy_configuracion():
+    # El token privado no debe publicarse en el repositorio ni en el navegador.
+    try:
+        cfg = st.secrets.get("bluefy_bridge", {})
+        url = str(cfg.get("url", "")).strip()
+        token = str(cfg.get("token", "")).strip()
+    except Exception:
+        url, token = "", ""
+    if not url.startswith("https://script.google.com/macros/s/") or not url.endswith("/exec"):
+        raise ValueError("Falta configurar bluefy_bridge.url en Secrets de Streamlit.")
+    if len(token) < 32:
+        raise ValueError("Falta configurar bluefy_bridge.token (mínimo 32 caracteres).")
+    return url, token
+
+
+def _bluefy_trabajo_desde_pedido(pedido):
+    """Recoge sólo campos imprimibles, nunca costos internos ni datos SAT."""
+    emisor = dict(DOMICILIO_EMISOR_PREDETERMINADO)
+    emisor.update({k: v for k, v in st.session_state.get("emisor_remision", {}).items() if v})
+    emisor.update({k: v for k, v in (pedido.get("emisor_remision") or {}).items() if v})
+    if pedido.get("tipo") == "factura":
+        preparar_remision(pedido)
+    resumen = totales_pedido(pedido)
+    fecha = pedido.get("fecha_custom") or pedido.get("fecha_emision") or datetime.now(
+        pytz.timezone(ZONA_HORARIA)).strftime("%Y-%m-%d %H:%M")
+    productos = sorted(pedido.get("productos", []), key=lambda p: p[3], reverse=True)
+    return {
+        "version": 1,
+        "tipo": "remision" if pedido.get("tipo") == "factura" else "pedido",
+        "fecha": str(fecha),
+        "domicilio_emisor": str(emisor.get("domicilio", "")),
+        "lugar_emisor": str(emisor.get("lugar", "")),
+        "cp_emisor": str(emisor.get("cp", "")),
+        "cliente": str(pedido.get("cliente", "")),
+        "contacto": str(pedido.get("contacto", "")),
+        "telefono": str(pedido.get("telefono", "")),
+        "domicilio_entrega": str(pedido.get("domicilio_entrega", "")),
+        "folio_remision": str(pedido.get("folio_remision", "")),
+        "fecha_emision": str(pedido.get("fecha_emision", "")),
+        "estado_pago": str(pedido.get("estado_pago", "Por confirmar")),
+        "medio_pago": str(pedido.get("medio_pago", "")),
+        "cfdi_referencia": str(pedido.get("cfdi_referencia", "")),
+        "observaciones_remision": str(pedido.get("observaciones_remision", "")),
+        "productos": [
+            {
+                "nombre": str(linea[0]),
+                "cantidad": cantidad_etiqueta(linea, termico=True),
+                "venta": f"${float(linea[3]):,.2f}",
+                "precio_unitario": etiqueta_precio_unitario(linea),
+            } for linea in productos
+        ],
+        "total_productos": len(productos),
+        "subtotal": f"${resumen['subtotal_venta']:,.2f}",
+        "envio": f"${resumen['costo_envio']:,.2f}" if resumen['costo_envio'] > 0 else "",
+        "descuento": f"-${pedido.get('descuento', 0):,.2f}" if pedido.get('descuento', 0) > 0 else "",
+        "total": f"${resumen['nuevo_total']:,.2f}",
+    }
+
+
+def _bluefy_enviar_seleccionados(pedidos, indices):
+    """POST a Apps Script: cero lecturas/escrituras Google Sheets, cero reintentos automáticos."""
+    from urllib.parse import urlencode
+    from urllib.request import Request, urlopen
+    if not indices:
+        return 0, "Selecciona al menos un ticket."
+    url, token = _bluefy_configuracion()
+    registrados = st.session_state.setdefault("bluefy_ids_ya_enviados", {})
+    identificadores = st.session_state.setdefault("bluefy_ids_trabajo", {})
+    pendientes = []
+    versiones = []
+    for i in indices:
+        pedido = pedidos[i]
+        pedido.setdefault("_ui_id", uuid4().hex)
+        version = f"{pedido['_ui_id']}:{pedido.get('_ui_revision', 0)}"
+        if version in registrados:
+            continue
+        identificador = identificadores.setdefault(version, uuid4().hex)
+        pendientes.append({"id": identificador, "datos": _bluefy_trabajo_desde_pedido(pedido)})
+        versiones.append((version, identificador))
+    if not pendientes:
+        return 0, "Los tickets seleccionados ya se enviaron en esta sesión."
+    body = urlencode({
+        "accion": "encolar", "token": token,
+        "trabajos": json.dumps(pendientes, ensure_ascii=False, separators=(",", ":")),
+    }).encode("utf-8")
+    solicitud = Request(url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"}, method="POST")
+    # Una llamada HTTPS por lote, sin tocar ni consultar las hojas del agente SAT.
+    with urlopen(solicitud, timeout=20) as respuesta:
+        resultado = json.loads(respuesta.read().decode("utf-8"))
+    if not resultado.get("ok"):
+        raise RuntimeError(str(resultado.get("error", "El puente no confirmó el envío")))
+    for version, identificador in versiones:
+        registrados[version] = identificador
+    cantidad = int(resultado.get("agregados", 0))
+    return cantidad, "Recibido por el puente Bluefy. Se imprimirá cuando Bluefy esté abierto y conectado."
+
+
+def _bluefy_widget_envio(pedidos, indices):
+    st.markdown("**Imprimir en Bluefy (MP210)**")
+    st.caption("Selecciona tickets arriba. Se envían los datos, no PDF ni PNG. "
+               "El puente NO consulta Google Sheets ni el agente SAT.")
+    if st.button("🖨️ Enviar tickets seleccionados a Bluefy", type="primary",
+                 key="bluefy_enviar_tickets", use_container_width=True,
+                 disabled=not indices):
+        try:
+            n, mensaje = _bluefy_enviar_seleccionados(pedidos, indices)
+            (st.success if n else st.info)(f"{n} ticket(s). {mensaje}" if n else mensaje)
+        except Exception as e:
+            st.error("No se pudo confirmar el envío: " + str(e) +
+                     ". Comprueba el estado en Bluefy antes de reintentar. "
+                     "El identificador del ticket se conserva para evitar duplicados.")
 
 
 def seleccionar_tickets_impresos(pedidos):
@@ -4209,19 +4332,54 @@ with tab_modificar:
 # ============================
 with tab_resumen:
     pedidos = st.session_state.pedidos
+    # Al iniciar, registrar lo que ya existía para NO mandar tickets viejos.
+    for _ped in pedidos:
+        _ped.setdefault("_ui_id", uuid4().hex)
+    _ids_actuales = {p["_ui_id"] for p in pedidos}
+    if "bluefy_ids_vistos" not in st.session_state:
+        st.session_state["bluefy_ids_vistos"] = set(_ids_actuales)
+    try:
+        _bluefy_configuracion()
+        _puente_bluefy_configurado = True
+    except ValueError:
+        _puente_bluefy_configurado = False
+    auto_bluefy = st.checkbox(
+        "🖨️ Enviar automáticamente a Bluefy cada ticket nuevo",
+        value=_puente_bluefy_configurado,
+        key="bluefy_auto_modo",
+        help="Solo trabajos nuevos; sin sondeos desde Streamlit ni consultas SAT.",
+    )
+    if not _puente_bluefy_configurado:
+        st.caption("Bluefy pendiente de configurar en Secrets. No se realizan consultas ni envíos.")
+    _ids_vistos = st.session_state["bluefy_ids_vistos"]
+    _nuevos = [i for i, p in enumerate(pedidos) if p["_ui_id"] not in _ids_vistos]
+    # Registrar ANTES del intento: un error de red no crea reintentos automáticos
+    # que saturen Sheets. El usuario puede reintentar manualmente desde Resumen.
+    _ids_vistos.update(_ids_actuales)
+    if _nuevos and auto_bluefy:
+        try:
+            _n, _mensaje = _bluefy_enviar_seleccionados(pedidos, _nuevos)
+            if _n:
+                st.success(f"🖨️ {_n} ticket(s) nuevo(s) enviados automáticamente a Bluefy.")
+        except Exception as _error_bluefy:
+            st.warning("El envío automático a Bluefy no se pudo confirmar. "
+                       "No se repetirá solo para evitar duplicados. "
+                       "Revisa Bluefy antes de reenviarlo manualmente. "
+                       + str(_error_bluefy))
     if not pedidos:
         st.info("Aún no hay tickets generados.")
     else:
         st.divider()
         st.subheader("📥 Descargar")
 
-        # ZIP con todos los PNGs
+        # Conserva ZIP/PNG, pero evita procesar imágenes mientras esté oculto.
         zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w") as zf:
-            for p in pedidos:
-                png = generar_ticket_png(p)
-                zf.writestr(f"{p['cliente'].replace(' ', '_')}.png", png)
-        zip_buf.seek(0)
+        if MOSTRAR_EXPORTACIONES_TICKETS:
+            with zipfile.ZipFile(zip_buf, "w") as zf:
+                for p in pedidos:
+                    png = generar_ticket_png(p)
+                    zf.writestr(f"{p['cliente'].replace(' ', '_')}.png", png)
+            zip_buf.seek(0)
 
         # ---- Gastos extra para el CSV (independiente de tickets/utilidad/análisis) ----
         st.divider()
@@ -4322,41 +4480,42 @@ with tab_resumen:
 
         st.divider()
         st.subheader("TICKET IMPRESO")
-        st.caption("Marca los clientes que quieres imprimir. Se genera una imagen por ticket seleccionado.")
+        st.caption("Marca los clientes que quieres imprimir directamente desde Bluefy.")
         indices_impresos = seleccionar_tickets_impresos(pedidos)
+        _bluefy_widget_envio(pedidos, indices_impresos)
 
-        st.divider()
-        descargar_tickets_impresos(pedidos, indices_impresos)
-        st.markdown("**Descargas habituales**")
-
-        col_zip, col_pdf, col_csv = st.columns(3)
-        with col_zip:
-            st.download_button(
-                "📦 Descargar ZIP con tickets",
-                data=zip_buf.getvalue(),
-                file_name="tickets_generados.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
-        with col_pdf:
-            st.download_button(
-                "📄 Descargar tickets en PDF",
-                data=generar_tickets_pdf(pedidos),
-                file_name="tickets_para_imprimir.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-                key="descargar_tickets_pdf",
-            )
-        st.caption("PDF en carta horizontal: dos recuadros del mismo tamaño por hoja, listos para recortar y engrapar. Cada recuadro indica Parte 1 de 2, Parte 2 de 2, etc. Datos completos al inicio y encabezado breve en continuaciones; márgenes de al menos 1 cm. "
-                   "Lee primero el recuadro izquierdo y después el derecho. Al imprimir, usa tamaño real (100%) y una página por hoja.")
-        with col_csv:
-            st.download_button(
-                "📄 Descargar CSV de pedidos",
-                data=csv_bytes,
-                file_name="pedidos_resumen.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+        # Funciones antiguas conservadas, pero ocultas temporalmente.
+        if MOSTRAR_EXPORTACIONES_TICKETS:
+            st.divider()
+            descargar_tickets_impresos(pedidos, indices_impresos)
+            st.markdown("**Descargas habituales**")
+            col_zip, col_pdf = st.columns(2)
+            with col_zip:
+                st.download_button(
+                    "📦 Descargar ZIP con tickets",
+                    data=zip_buf.getvalue(),
+                    file_name="tickets_generados.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            with col_pdf:
+                st.download_button(
+                    "📄 Descargar tickets en PDF",
+                    data=generar_tickets_pdf(pedidos),
+                    file_name="tickets_para_imprimir.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="descargar_tickets_pdf",
+                )
+            st.caption("PDF en carta horizontal: dos recuadros del mismo tamaño por hoja, listos para recortar y engrapar. Cada recuadro indica Parte 1 de 2, Parte 2 de 2, etc. Datos completos al inicio y encabezado breve en continuaciones; márgenes de al menos 1 cm. "
+                       "Lee primero el recuadro izquierdo y después el derecho. Al imprimir, usa tamaño real (100%) y una página por hoja.")
+        st.download_button(
+            "📄 Descargar CSV de pedidos",
+            data=csv_bytes,
+            file_name="pedidos_resumen.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
         st.divider()
         st.subheader("Resumen global de la sesión")
@@ -4439,20 +4598,21 @@ with tab_resumen:
                     cargar_historico.clear()
 
         st.divider()
-        with st.expander("Ver imágenes de los tickets", expanded=False):
-            cols_gal = st.columns(3)
-            for i, p in enumerate(pedidos):
-                with cols_gal[i % 3]:
-                    png = generar_ticket_png(p)
-                    st.image(png, caption=f"{p['cliente']} - ${p['nuevo_total']:,.2f}", use_container_width=True)
-                    st.download_button(
-                        "📄 Descargar este ticket en PDF",
-                        data=generar_tickets_pdf([p]),
-                        file_name=f"ticket_{i+1}.pdf",
-                        mime="application/pdf",
-                        key=f"pdf_ticket_galeria_{i}",
-                        use_container_width=True,
-                    )
+        if MOSTRAR_EXPORTACIONES_TICKETS:
+            with st.expander("Ver imágenes de los tickets", expanded=False):
+                cols_gal = st.columns(3)
+                for i, p in enumerate(pedidos):
+                    with cols_gal[i % 3]:
+                        png = generar_ticket_png(p)
+                        st.image(png, caption=f"{p['cliente']} - ${p['nuevo_total']:,.2f}", use_container_width=True)
+                        st.download_button(
+                            "📄 Descargar este ticket en PDF",
+                            data=generar_tickets_pdf([p]),
+                            file_name=f"ticket_{i+1}.pdf",
+                            mime="application/pdf",
+                            key=f"pdf_ticket_galeria_{i}",
+                            use_container_width=True,
+                        )
 
 
 # ============================
