@@ -30,8 +30,10 @@ st.set_page_config(
 # Constantes
 # ============================
 COSTO_ENVIO = 35
-# False conserva todo el código PDF/PNG sin mostrar botones de descarga de tickets.
-MOSTRAR_EXPORTACIONES_TICKETS = False
+# Descargas normales: ZIP/PNG y PDF con columnas COSTO, PRODUCTO y VENTA.
+MOSTRAR_EXPORTACIONES_TICKETS = True
+# La impresión térmica por Print Fast queda oculta, sin eliminar su código.
+MOSTRAR_DESCARGAS_PRINT_FAST = False
 UMBRAL_ENVIO_GRATIS_KG = 35
 DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 UTILIDAD_MINIMA_PCT = 0.25
@@ -1523,8 +1525,8 @@ def _bluefy_configuracion():
         url, token = "", ""
     if not url.startswith("https://script.google.com/macros/s/") or not url.endswith("/exec"):
         raise ValueError("Falta configurar bluefy_bridge.url en Secrets de Streamlit.")
-    if len(token) < 32:
-        raise ValueError("Falta configurar bluefy_bridge.token (mínimo 32 caracteres).")
+    if len(token) != 4 or not token.isascii() or not token.isdigit():
+        raise ValueError("Configura bluefy_bridge.token con exactamente 4 números (0000 a 9999).")
     return url, token
 
 
@@ -4332,40 +4334,8 @@ with tab_modificar:
 # ============================
 with tab_resumen:
     pedidos = st.session_state.pedidos
-    # Al iniciar, registrar lo que ya existía para NO mandar tickets viejos.
-    for _ped in pedidos:
-        _ped.setdefault("_ui_id", uuid4().hex)
-    _ids_actuales = {p["_ui_id"] for p in pedidos}
-    if "bluefy_ids_vistos" not in st.session_state:
-        st.session_state["bluefy_ids_vistos"] = set(_ids_actuales)
-    try:
-        _bluefy_configuracion()
-        _puente_bluefy_configurado = True
-    except ValueError:
-        _puente_bluefy_configurado = False
-    auto_bluefy = st.checkbox(
-        "🖨️ Enviar automáticamente a Bluefy cada ticket nuevo",
-        value=_puente_bluefy_configurado,
-        key="bluefy_auto_modo",
-        help="Solo trabajos nuevos; sin sondeos desde Streamlit ni consultas SAT.",
-    )
-    if not _puente_bluefy_configurado:
-        st.caption("Bluefy pendiente de configurar en Secrets. No se realizan consultas ni envíos.")
-    _ids_vistos = st.session_state["bluefy_ids_vistos"]
-    _nuevos = [i for i, p in enumerate(pedidos) if p["_ui_id"] not in _ids_vistos]
-    # Registrar ANTES del intento: un error de red no crea reintentos automáticos
-    # que saturen Sheets. El usuario puede reintentar manualmente desde Resumen.
-    _ids_vistos.update(_ids_actuales)
-    if _nuevos and auto_bluefy:
-        try:
-            _n, _mensaje = _bluefy_enviar_seleccionados(pedidos, _nuevos)
-            if _n:
-                st.success(f"🖨️ {_n} ticket(s) nuevo(s) enviados automáticamente a Bluefy.")
-        except Exception as _error_bluefy:
-            st.warning("El envío automático a Bluefy no se pudo confirmar. "
-                       "No se repetirá solo para evitar duplicados. "
-                       "Revisa Bluefy antes de reenviarlo manualmente. "
-                       + str(_error_bluefy))
+    # El envío a Bluefy es exclusivamente MANUAL: se seleccionan tickets abajo.
+    # No hay casilla ni envío automático al generar nuevos pedidos.
     if not pedidos:
         st.info("Aún no hay tickets generados.")
     else:
@@ -4484,11 +4454,15 @@ with tab_resumen:
         indices_impresos = seleccionar_tickets_impresos(pedidos)
         _bluefy_widget_envio(pedidos, indices_impresos)
 
-        # Funciones antiguas conservadas, pero ocultas temporalmente.
-        if MOSTRAR_EXPORTACIONES_TICKETS:
+        # Exportaciones de 58 mm para Print Fast: conservar funciones, ocultar UI.
+        if MOSTRAR_DESCARGAS_PRINT_FAST:
             st.divider()
             descargar_tickets_impresos(pedidos, indices_impresos)
-            st.markdown("**Descargas habituales**")
+
+        # Descargas normales: preservar el ZIP y PDF originales con costos.
+        if MOSTRAR_EXPORTACIONES_TICKETS:
+            st.divider()
+            st.markdown("**Descargas habituales (incluyen costos)**")
             col_zip, col_pdf = st.columns(2)
             with col_zip:
                 st.download_button(
